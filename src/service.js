@@ -307,7 +307,7 @@ export class Dispatcher {
       };
     });
     if (!apply || running.length === 0) return { applied: false, observations };
-    if (observations.some((item) => item.phase === "EXECUTOR" && item.executor_alive)) {
+    if (observations.some((item) => item.executor_alive)) {
       return { applied: false, refused: "LIVE_EXECUTOR", observations };
     }
 
@@ -319,7 +319,7 @@ export class Dispatcher {
           (SELECT COUNT(*) FROM attempts x WHERE x.job_id = a.job_id) AS attempt_count
           FROM attempts a JOIN jobs j ON j.id = a.job_id
           WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all();
-        if (candidates.some((attempt) => attempt.terminal_state === null && isProcessAlive(attempt.executor_pid))) {
+        if (candidates.some((attempt) => isProcessAlive(attempt.executor_pid))) {
           const refusal = new Error("live executor appeared during reconciliation");
           refusal.code = "LIVE_EXECUTOR";
           throw refusal;

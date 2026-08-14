@@ -89,7 +89,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
-| ATT-007–ATT-009 | `runJob` immediate claim transaction, lifecycle-active predicate | invalid invocation, live executor, blocked validation tests |
+| ATT-007–ATT-009 | `runJob` immediate claim transaction, lifecycle-active predicate | invalid invocation, live executor, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |

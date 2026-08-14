@@ -108,8 +108,12 @@ export class OpenCodeBackend {
 
 function defaultOpenCodeLaunch() {
   if (process.platform !== "win32") return { executable: "opencode", prefixArgs: [] };
-  const entry = process.env.OPENCODE_NODE_ENTRY
-    ?? path.join(process.env.APPDATA ?? "", "npm", "node_modules", "opencode-ai", "bin", "opencode");
+  const configuredEntry = process.env.OPENCODE_NODE_ENTRY;
+  if (!configuredEntry && !process.env.APPDATA) {
+    throw new Error("APPDATA is unavailable; set OPENCODE_NODE_ENTRY or pass an executable explicitly");
+  }
+  const entry = configuredEntry
+    ?? path.join(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode");
   if (!fs.existsSync(entry)) {
     throw new Error("OpenCode Node entry was not found; set OPENCODE_NODE_ENTRY or pass an executable explicitly");
   }

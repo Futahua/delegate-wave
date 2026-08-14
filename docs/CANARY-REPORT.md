@@ -83,3 +83,11 @@ The resulting scheduler treats both executor-running and validation-pending atte
 The Windows explicit-executable override was also made lazy and receives a platform-independent test. Repository-local Git identity is now `Futahua <226466458+Futahua@users.noreply.github.com>` for future commits. Existing draft-branch history was not rewritten or force-pushed.
 
 Total reported OpenCode Go cost for all successful canary, self-dogfood, and review-fix work through this report is `$0.0086655940`.
+
+## Independent final audit
+
+A fresh disposable clone was reviewed read-only by `opencode-go/deepseek-v4-flash` as job `job_4f650a88-3799-47d2-9458-08cdc0fdc7f4`, session `ses_00126fd65ffe0wPsik6DcHXUu7`. The audit cost `$0.0067927608`, modified no files, and found no blocking defect.
+
+Its non-blocking findings were closed directly: reconciliation now conservatively refuses epoch movement for a live recorded PID in either lifecycle phase; the lifecycle-active predicate has an independent defense-in-depth test; interrupted validation recovery asserts epoch advancement and the retryable `PENDING` branch; and the Windows default-launch test skips machines without that exact global OpenCode installation while explicit overrides remain portable.
+
+The full regression suite now passes 16 tests. Total reported OpenCode Go cost through the independent audit is `$0.0154583548`.

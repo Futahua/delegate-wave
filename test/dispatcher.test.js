@@ -171,6 +171,29 @@ test("reconciliation refuses a live executor without advancing the epoch", async
   assert.equal(result.attempts[0].terminal_state, "SUCCEEDED");
 });
 
+test("reconciliation refuses any live recorded PID during validation without advancing the epoch", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "validation pid fence" });
+  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
+    backend, executor_pid, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?, ?)`).run(
+    "attempt-live-validation-pid", job.id, process.pid, repo, new Date().toISOString(),
+  );
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  const result = await service.reconcile({ apply: true });
+  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  assert.equal(result.applied, false);
+  assert.equal(result.refused, "LIVE_EXECUTOR");
+  assert.equal(result.observations[0].phase, "VALIDATION");
+  assert.equal(epochAfter, epochBefore);
+  assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
+});
+
 test("invalid job invocation does not consume a scheduler epoch", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: new FakeBackend() });
@@ -225,7 +248,13 @@ test("missing executables reject cleanly instead of crashing the process", async
   );
 });
 
-test("Windows OpenCode launch bypasses command shims", { skip: process.platform !== "win32" }, () => {
+const installedWindowsOpenCodeEntry = process.env.APPDATA
+  ? path.join(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode")
+  : null;
+
+test("Windows OpenCode launch bypasses command shims", {
+  skip: process.platform !== "win32" || !installedWindowsOpenCodeEntry || !fs.existsSync(installedWindowsOpenCodeEntry),
+}, () => {
   const backend = new OpenCodeBackend();
   assert.equal(backend.executable, process.execPath);
   assert.match(backend.prefixArgs[0], /opencode-ai[\\/]bin[\\/]opencode$/);
@@ -295,12 +324,32 @@ test("a blocked validation fences a concurrent claim without epoch movement, the
   assert.equal(result.attempts[0].validation_state, "PASSED");
 });
 
+test("the lifecycle-active attempt predicate independently fences a claim", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const first = await service.createJob({ projectId: project.id, goal: "inconsistent validation state" });
+  const second = await service.createJob({ projectId: project.id, goal: "must remain fenced" });
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
+    backend, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?)`).run(
+    "attempt-defense-in-depth", first.id, repo, new Date().toISOString(),
+  );
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  await assert.rejects(service.runJob(second.id), /live attempt/);
+  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  assert.equal(epochAfter, epochBefore);
+  assert.equal(service.getJob(second.id).status, "PENDING");
+});
+
 test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING validation attempt", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: new FakeBackend() });
   t.after(async () => { service.close(); await cleanup(); });
   const project = await service.addProject({ name: "Fixture", repoPath: repo });
-  const job = await service.createJob({ projectId: project.id, goal: "interrupted validation", maxAttempts: 1 });
+  const job = await service.createJob({ projectId: project.id, goal: "interrupted validation", maxAttempts: 2 });
   service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
   service.db.prepare(`INSERT INTO attempts(
     id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
@@ -313,11 +362,13 @@ test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING val
   assert.equal(preview.observations[0].phase, "VALIDATION");
   assert.equal(preview.observations[0].proposed, "VALIDATION_INTERRUPTED");
   assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
+  const epochBefore = Number(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
   const result = await service.reconcile({ apply: true });
   assert.equal(result.applied, true);
+  assert.equal(result.scheduler_epoch, epochBefore + 1);
   assert.equal(result.results[0].action, "VALIDATION_INTERRUPTED");
   const state = service.status(job.id);
-  assert.equal(state.job.status, "NEEDS_ATTENTION");
+  assert.equal(state.job.status, "PENDING");
   assert.equal(state.attempts[0].terminal_state, "SUCCEEDED");
   assert.equal(state.attempts[0].validation_state, "FAILED");
   assert.equal(state.attempts[0].quarantined, 1);
