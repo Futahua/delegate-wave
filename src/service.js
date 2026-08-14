@@ -829,10 +829,18 @@ export class Dispatcher {
       expires_at: row.expires_at,
     }));
 
+    // A proposal still awaits approval only if nothing has successfully integrated it. The stored
+    // state column lags the integration records -- integrationStatus already derives around that --
+    // so filtering on the column alone would ask the operator to approve work that already landed.
     const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, j.goal, p.name AS project
       FROM integration_proposals ip
       JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
-      WHERE ip.state = 'OPEN' ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
+      WHERE ip.state = 'OPEN'
+        AND NOT EXISTS (
+          SELECT 1 FROM integration_records r
+          WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
+        )
+      ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
       .map((row) => ({
         decision: "approve to integrate, or roll back later",
         proposal: row.id,

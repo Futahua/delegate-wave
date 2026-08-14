@@ -150,3 +150,23 @@ test("the briefing carries no transcripts, worktree paths, or raw artifacts", as
   // It also has to stay small enough to read at a glance.
   assert.ok(Buffer.byteLength(serialized, "utf8") < 4096, "the status must fit on a screen");
 });
+
+test("an already-integrated proposal stops asking for a decision", async (t) => {
+  // The stored state column lags the integration records, so filtering on it alone would ask the
+  // operator to approve work that already landed -- and asking for a decision that has been made is
+  // exactly how a status surface loses trust.
+  const { service, repo } = await fixture(t);
+  const project = await service.addProject({ name: "Landed", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce output.txt" });
+  await service.runJob(job.id, { model: "opencode-go/deepseek-v4-flash" });
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+
+  assert.equal(service.briefing().needs_your_decision.length, 1, "before approval it needs a decision");
+
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+
+  const after = service.briefing();
+  assert.deepEqual(after.needs_your_decision, [], "after integration it needs nothing");
+  assert.equal(after.done.length, 1);
+});
