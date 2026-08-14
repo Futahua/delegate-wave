@@ -60,12 +60,24 @@ test("successful worker produces a validated candidate commit", async (t) => {
 
 test("child processes exclude the Control API authority token unless explicitly supplied", async (t) => {
   const original = process.env.DELEGATE_WAVE_CONTROL_TOKEN;
+  const originalObserver = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+  const originalHermes = process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
   process.env.DELEGATE_WAVE_CONTROL_TOKEN = "must-not-inherit";
+  process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = "must-not-inherit-observer";
+  process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = "must-not-inherit-hermes";
   t.after(() => {
     if (original === undefined) delete process.env.DELEGATE_WAVE_CONTROL_TOKEN;
     else process.env.DELEGATE_WAVE_CONTROL_TOKEN = original;
+    if (originalObserver === undefined) delete process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+    else process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = originalObserver;
+    if (originalHermes === undefined) delete process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
+    else process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = originalHermes;
   });
-  const script = "process.stdout.write(process.env.DELEGATE_WAVE_CONTROL_TOKEN || 'absent')";
+  const script = `process.stdout.write([
+    process.env.DELEGATE_WAVE_CONTROL_TOKEN,
+    process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN,
+    process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN,
+  ].filter(Boolean).join(',') || 'absent')`;
   const scrubbed = await runProcess(process.execPath, ["-e", script]);
   assert.equal(scrubbed.stdout, "absent");
   const explicit = await runProcess(process.execPath, ["-e", script], {

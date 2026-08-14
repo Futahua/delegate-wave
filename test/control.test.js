@@ -43,11 +43,13 @@ async function fixture(t, overrides = {}, root = null) {
   const dataRoot = root || path.join(temp, "data");
   const dispatcher = fakeDispatcher(dataRoot, overrides);
   const token = `token-${crypto.randomUUID()}`;
+  const observerToken = `observer-${crypto.randomUUID()}`;
   const service = new ControlService({ dispatcher, pendingWaitMs: 2000 });
   const server = createControlServer({
     service,
     token,
     principalId: "john",
+    observerToken,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -62,7 +64,10 @@ async function fixture(t, overrides = {}, root = null) {
     if (temp) fs.rmSync(temp, { recursive: true, force: true });
   };
   if (t) t.after(close);
-  return { root: dataRoot, dispatcher, service, server, token, url, client: new ControlClient({ baseUrl: url, token }), close };
+  return {
+    root: dataRoot, dispatcher, service, server, token, observerToken, url,
+    client: new ControlClient({ baseUrl: url, token }), close,
+  };
 }
 
 test("duplicate and concurrent request IDs produce one durable side effect", async (t) => {
@@ -290,6 +295,32 @@ test("malformed, unknown, and identity-spoofing requests do not dispatch", async
     (error) => error.code === "IDENTITY_SPOOFING",
   );
   assert.equal(calls, 0);
+});
+
+test("Hermes observer credential can query but cannot mutate", async (t) => {
+  let calls = 0;
+  const f = await fixture(t, { createJob: () => { calls += 1; return { id: "forbidden" }; } });
+  const observer = new ControlClient({ baseUrl: f.url, token: f.observerToken });
+  assert.deepEqual(await observer.get("/v1/projects"), []);
+  await assert.rejects(
+    observer.post("/v1/jobs", { projectId: "p", goal: "no", mode: "write", maxAttempts: 1 }, requestId()),
+    (error) => error.code === "READ_ONLY_CREDENTIAL",
+  );
+  assert.equal(calls, 0);
+  assert.equal(f.dispatcher.db.prepare("SELECT COUNT(*) AS count FROM control_request_intents").get().count, 0);
+});
+
+test("observer and operator credentials must be distinct", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-token-scope-"));
+  const dispatcher = fakeDispatcher(path.join(temp, "data"));
+  try {
+    assert.throws(() => createControlServer({
+      service: new ControlService({ dispatcher }), token: "same", observerToken: "same", principalId: "john",
+    }), /must be distinct/);
+  } finally {
+    dispatcher.db.close();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 });
 
 test("approval identity comes only from the authenticated server context", async (t) => {

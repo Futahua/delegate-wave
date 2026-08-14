@@ -11,7 +11,7 @@ import { ControlService } from "./service.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
-function authorized(header, token) {
+function tokenMatches(header, token) {
   if (!token || typeof header !== "string" || !header.startsWith("Bearer ")) return false;
   const supplied = Buffer.from(header.slice(7));
   const expected = Buffer.from(token);
@@ -42,21 +42,35 @@ function send(res, status, payload) {
   res.end(body);
 }
 
-export function createControlServer({ service, token, principalId, originChannel = "local-cli" }) {
+export function createControlServer({
+  service, token, principalId, originChannel = "local-cli",
+  observerToken = null, observerPrincipalId = "hermes", observerOriginChannel = "hermes-mcp",
+}) {
   if (!token) throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required");
   if (!principalId) throw new Error("Control server principal identity is required");
+  if (observerToken && observerToken === token) throw new Error("Observer and operator control tokens must be distinct");
   return http.createServer(async (req, res) => {
     try {
-      if (!authorized(req.headers.authorization, token)) throw new ControlError("UNAUTHORIZED", "Invalid control token", 401);
+      const identity = tokenMatches(req.headers.authorization, token)
+        ? { principalId, originChannel, readOnly: false }
+        : (observerToken && tokenMatches(req.headers.authorization, observerToken)
+          ? { principalId: observerPrincipalId, originChannel: observerOriginChannel, readOnly: true }
+          : null);
+      if (!identity) throw new ControlError("UNAUTHORIZED", "Invalid control token", 401);
       const url = new URL(req.url, "http://localhost");
       const route = matchRoute(req.method, url.pathname);
+      if (identity.readOnly && route.mutation) {
+        throw new ControlError("READ_ONLY_CREDENTIAL", "Observer credential cannot invoke mutations", 403);
+      }
       const body = route.method === "POST" ? await readJson(req) : {};
       const args = { ...body, ...route.params };
       if (route.method === "GET") {
         for (const [key, value] of url.searchParams) args[key] = value;
       }
       const result = await service.execute(route.command, args, {
-        requestId: req.headers["x-request-id"], principalId, originChannel,
+        requestId: req.headers["x-request-id"],
+        principalId: identity.principalId,
+        originChannel: identity.originChannel,
       });
       send(res, 200, { ok: true, result });
     } catch (error) {
@@ -75,12 +89,14 @@ export async function startControlServer({
   port = Number(process.env.DELEGATE_WAVE_CONTROL_PORT || 47321),
   token = process.env.DELEGATE_WAVE_CONTROL_TOKEN,
   principalId = process.env.DELEGATE_WAVE_CONTROL_PRINCIPAL || os.userInfo().username,
+  observerToken = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN || null,
+  observerPrincipalId = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL || "hermes",
   backend = new OpenCodeBackend({ attach: process.env.DELEGATE_WAVE_OPENCODE_ATTACH }),
 } = {}) {
   initializeDataRoot(root);
   const dispatcher = new Dispatcher({ root, backend });
   const service = new ControlService({ dispatcher });
-  const server = createControlServer({ service, token, principalId });
+  const server = createControlServer({ service, token, principalId, observerToken, observerPrincipalId });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
