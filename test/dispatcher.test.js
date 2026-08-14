@@ -6,7 +6,9 @@ import test from "node:test";
 import { initializeDataRoot, openDatabase, SCHEMA_VERSION } from "../src/db.js";
 import { managedPaths } from "../src/paths.js";
 import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
-import { Dispatcher, isProcessAlive } from "../src/service.js";
+import {
+  DEFAULT_WORKER_MODEL, Dispatcher, ESCALATION_MODEL, isProcessAlive, REVIEW_MODEL,
+} from "../src/service.js";
 import { runProcess } from "../src/process.js";
 
 async function command(name, args, cwd) {
@@ -601,4 +603,64 @@ test("a fresh database is created at the current schema version", async (t) => {
   t.after(() => { db.close(); fs.rmSync(temp, { recursive: true, force: true }); });
   assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
   assert.equal(SCHEMA_VERSION, "10");
+});
+
+test("a job without --model resolves to DeepSeek Flash and persists the resolved model", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-default-model-"));
+  const root = path.join(temp, "data");
+  const repo = path.join(temp, "repo");
+  fs.mkdirSync(repo);
+  for (const args of [["init", "-b", "main"], ["config", "user.name", "T"], ["config", "user.email", "t@e.invalid"]]) {
+    await runProcess("git", ["-C", repo, ...args]);
+  }
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  await runProcess("git", ["-C", repo, "add", "."]);
+  await runProcess("git", ["-C", repo, "commit", "-m", "initial"]);
+  await runProcess("git", ["-C", repo, "branch", "integration"]);
+  initializeDataRoot(root);
+
+  const seen = [];
+  const backend = new FakeBackend(async ({ worktreePath, model }) => {
+    seen.push(model);
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => {
+    service.close();
+    const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+    for (const worktree of listed.stdout.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter((worktree) => path.resolve(worktree) !== path.resolve(repo))) {
+      await runProcess("git", ["-C", repo, "worktree", "unlock", worktree]);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    }
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+
+  const project = await service.addProject({ name: "Routing", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+
+  assert.deepEqual(seen, [DEFAULT_WORKER_MODEL]);
+  assert.equal(DEFAULT_WORKER_MODEL, "opencode-go/deepseek-v4-flash");
+  assert.equal(result.attempts.at(-1).model, DEFAULT_WORKER_MODEL, "the resolved model must be persisted");
+});
+
+test("the OpenCode backend refuses to run without an explicit model", async () => {
+  const backend = new OpenCodeBackend({ executable: "opencode" });
+  await assert.rejects(
+    backend.run({
+      attemptId: "a1", worktreePath: ".", goal: "g", model: null,
+      artifactDir: path.join(os.tmpdir(), `dw-nomodel-${Date.now()}`), mode: "write",
+    }),
+    /requires an explicit --model/,
+  );
+});
+
+test("explicit review and escalation lanes stay distinct from the default", () => {
+  assert.equal(REVIEW_MODEL, "opencode-go/gpt-5.6-luna");
+  assert.equal(ESCALATION_MODEL, "opencode-go/deepseek-v4-pro");
+  assert.equal(new Set([DEFAULT_WORKER_MODEL, REVIEW_MODEL, ESCALATION_MODEL]).size, 3);
 });

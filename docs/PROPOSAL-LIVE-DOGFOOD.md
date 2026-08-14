@@ -107,3 +107,34 @@ every state transition performed by the operator credential
 - Nothing surfaces that a proposal is awaiting a decision except explicitly running
   `proposal list`; there is no attention-style prompt.
 - The expiry is one hour from creation. A proposal left overnight will need to be re-proposed.
+
+## Deterministic worker routing
+
+The attempt-1 failure was fixed by making routing explicit at the dispatcher rather than by
+configuring the executor's ambient provider. No Google or Gemini credential was added.
+
+`runJob()` resolves the model before the attempt row is written, so the resolved provider/model is
+persisted as evidence, and `OpenCodeBackend` now throws rather than omitting `--model` -- omitting it
+is what let OpenCode fall back to its own default provider.
+
+```text
+default bulk implementation and ordinary investigation  opencode-go/deepseek-v4-flash
+focused review and debugging                            opencode-go/gpt-5.6-luna     (explicit)
+hard implementation escalation                          opencode-go/deepseek-v4-pro  (explicit)
+```
+
+Live proof on the supervised installation, with no Google credential present:
+
+```text
+Hermes propose_work -> wprop_85a37ef9 (no model named anywhere)
+operator authorize  -> job_b3e6b78e
+job run             -> NO --model flag supplied
+  resolved model    opencode-go/deepseek-v4-flash
+  attempt           SUCCEEDED in 12.1 s
+  validation        PASSED
+  ProviderAuthError occurrences in executor events: 0
+integration         INTEGRATED (7a923a9)
+```
+
+The equivalent run before this change failed in 2.3 s with
+`ProviderAuthError: Google Generative AI API key is missing`.
