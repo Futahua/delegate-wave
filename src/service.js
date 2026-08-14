@@ -121,6 +121,14 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all();
   }
 
+  attention() {
+    const jobs = this.db.prepare(`SELECT * FROM jobs
+      WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+      ORDER BY updated_at`).all();
+    const unresolvedIntegrations = this.doctor().unresolved_integrations;
+    return { jobs, unresolved_integrations: unresolvedIntegrations };
+  }
+
   async runJob(jobId, { model = null } = {}) {
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);

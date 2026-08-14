@@ -17,6 +17,15 @@ No npm dependencies are required.
 ```powershell
 cd 'D:\Letters\MatTroiSeConMoc\delegate-wave'
 npm link
+$env:DELEGATE_WAVE_CONTROL_TOKEN = '<generate-a-local-secret>'
+$env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
+delegate-wave serve
+```
+
+Keep that foreground server running. In another terminal, set the same token and use the CLI:
+
+```powershell
+$env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
 delegate-wave init
 
 delegate-wave project add `
@@ -32,7 +41,7 @@ delegate-wave job run --job <job-id> --model <provider/model>
 delegate-wave job status --job <job-id>
 
 delegate-wave integration propose --job <job-id>
-delegate-wave approval grant --proposal <proposal-id> --principal <id> --origin <channel> [--maximum-cost <amount>]
+delegate-wave approval grant --proposal <proposal-id> [--maximum-cost <amount>]
 delegate-wave integration run --proposal <proposal-id>
 
 delegate-wave doctor
@@ -40,13 +49,15 @@ delegate-wave reconcile          # preview only
 delegate-wave reconcile --apply  # fence and orphan dead executors
 ```
 
-The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it for testing with `DELEGATE_WAVE_DATA_ROOT`.
+Mutating commands accept `--request-id <id>` for exact transport retries; otherwise the CLI generates one. The server—not CLI arguments—binds approval identity and the `local-cli` origin. The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it on the server for testing with `DELEGATE_WAVE_DATA_ROOT`.
 
 ## Current safety boundary
 
 The OpenCode worker receives runtime permissions that allow reading and editing only inside its attempt worktree. Shell commands, external directories, web access, skills, questions, and subagents are denied. Validation commands are registered by the human when adding the project and are run by the dispatcher after the worker exits.
 
 Attempts are isolated as locked, detached Git worktrees. Failed attempts are marked quarantined in SQLite and retained for inspection. Two failures stop the job at `NEEDS_ATTENTION` by default.
+
+The CLI is now strictly a Control API client. It does not open SQLite, instantiate the dispatcher, or execute a worker itself. If the local server is unavailable it fails closed. Mutating requests have durable immutable intent/result receipts, so duplicate, concurrent, disconnected, and post-restart retries cannot silently repeat a side effect.
 
 `doctor` checks SQLite integrity, missing repositories, lifecycle-active attempts, and integration operations without immutable terminal records. An unresolved integration makes health false. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch only after proving that recorded scheduler, executor, and validator processes are dead; an uncertain executor or validator start fails closed for operator attention.
 
@@ -55,9 +66,9 @@ Attempts are isolated as locked, detached Git worktrees. Failed attempts are mar
 - automatic integration (approved integration is intentionally explicit)
 - semantic escalation across jobs
 - persistent OpenCode server lifecycle
-- Control API, MCP, Hermes, or T3 adapters
+- MCP, Hermes, or T3 adapters
 - policy receipts and capability management
 
 Those remain outside the trusted bootstrap rather than being represented as finished.
 
-The implemented normative rules and traceability table are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md).
+The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), and [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).
