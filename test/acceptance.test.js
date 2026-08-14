@@ -222,3 +222,72 @@ test("the same idempotency key returns one proposal identity", async (t) => {
   assert.equal(first.id, second.id);
   assert.equal((await f.operator.get("/v1/work/proposals")).length, 1);
 });
+
+test("a failed decision write leaves no job and the proposal stays authorizable", async (t) => {
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "Atomic", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "atomic work", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  const realPrepare = f.dispatcher.db.prepare.bind(f.dispatcher.db);
+  f.dispatcher.db.prepare = (sql) => (sql.includes("work_proposal_decisions") && sql.includes("INSERT"))
+    ? { run: () => { throw new Error("injected decision failure"); } }
+    : realPrepare(sql);
+  await assert.rejects(
+    f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId()),
+    (error) => /injected decision failure/.test(error.message),
+  );
+  f.dispatcher.db.prepare = realPrepare;
+
+  // The job must have rolled back with the decision, or the orphan would move the state version and
+  // strand the proposal permanently.
+  assert.deepEqual(await f.operator.get("/v1/jobs"), []);
+  assert.equal((await f.operator.get(`/v1/work/proposals/${proposal.id}`)).state, "PENDING");
+
+  const recovered = await f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId());
+  assert.equal(recovered.state, "AUTHORIZED");
+  assert.equal((await f.operator.get("/v1/jobs")).length, 1);
+});
+
+test("concurrent authorizations of one proposal create exactly one job", async (t) => {
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "Race", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "only once", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  // Distinct request IDs, so Control API request idempotency cannot be what saves this.
+  const settled = await Promise.allSettled([
+    f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId()),
+    f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId()),
+  ]);
+  const won = settled.filter((outcome) => outcome.status === "fulfilled");
+  assert.ok(won.length >= 1, "at least one authorization must succeed");
+  const jobs = await f.operator.get("/v1/jobs");
+  assert.equal(jobs.length, 1, "a concurrent authorization must not create a second job");
+  const decisions = f.dispatcher.db.prepare(
+    "SELECT COUNT(*) AS count FROM work_proposal_decisions WHERE proposal_id = ?",
+  ).get(proposal.id).count;
+  assert.equal(decisions, 1);
+  for (const outcome of won) assert.equal(outcome.value.decision.job_id, jobs[0].id);
+});
+
+test("concurrent identical proposals return one proposal identity", async (t) => {
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "IdemRace", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  const body = { projectId: project.id, goal: "same", idempotencyKey: `k-${crypto.randomUUID()}` };
+  const settled = await Promise.allSettled([
+    f.proposer.post("/v1/work/proposals", body, requestId()),
+    f.proposer.post("/v1/work/proposals", body, requestId()),
+  ]);
+  assert.deepEqual(settled.map((outcome) => outcome.status), ["fulfilled", "fulfilled"]);
+  assert.equal(settled[0].value.id, settled[1].value.id);
+  assert.equal((await f.operator.get("/v1/work/proposals")).length, 1);
+});

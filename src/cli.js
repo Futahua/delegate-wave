@@ -115,8 +115,17 @@ async function main() {
       && !process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN
       && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
       const { DpapiSecretStore } = await import("./supervisor.js");
-      const observer = await new DpapiSecretStore().load("observer");
-      process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+      const store = new DpapiSecretStore();
+      // Cutover by record presence: once a proposal credential is deliberately provisioned, Hermes
+      // gains read + propose. Until then it stays read-only. Exactly one record is ever decrypted,
+      // and the operator record is never among them.
+      if (store.hasRecord("proposer")) {
+        const proposer = await store.load("proposer");
+        process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = proposer.DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN;
+      } else {
+        const observer = await store.load("observer");
+        process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+      }
     }
     const { runMcpStdio } = await import("./mcp/server.js");
     runMcpStdio();

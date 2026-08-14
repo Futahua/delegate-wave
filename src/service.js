@@ -106,22 +106,26 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM projects ORDER BY created_at").all();
   }
 
+  // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
+  // job creation can be committed atomically together with whatever authorized it.
+  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }) {
+    const jobId = id("job");
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO jobs(
+      id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
+      jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
+    );
+    recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
+    return this.getJob(jobId);
+  }
+
   async createJob({ projectId, goal, mode = "write", maxAttempts = 2 }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
-    const jobId = id("job");
-    const timestamp = now();
-    return transaction(this.db, () => {
-      this.db.prepare(`INSERT INTO jobs(
-        id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
-        jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
-      );
-      recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
-      return this.getJob(jobId);
-    });
+    return transaction(this.db, () => this.insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }));
   }
 
   // --- Proposal-only work authority -------------------------------------------------------------
@@ -172,17 +176,19 @@ export class Dispatcher {
       projectId, goal: goal.trim(), mode, maximumCost, expectedStateVersion: stateVersion,
     });
 
-    const existing = this.db.prepare("SELECT * FROM work_proposals WHERE idempotency_key = ?").get(idempotencyKey);
-    if (existing) {
-      if (existing.action_digest !== actionDigest) {
-        throw new Error(`idempotency_key ${idempotencyKey} was already used for a different proposal`);
-      }
-      return this.getWorkProposal(existing.id);
-    }
-
     const proposalId = id("wprop");
     const timestamp = now();
+    // Lookup and insert share one BEGIN IMMEDIATE so two simultaneous identical requests both
+    // resolve to the same proposal identity, rather than one winning and the other seeing a
+    // uniqueness error.
     return transaction(this.db, () => {
+      const existing = this.db.prepare("SELECT * FROM work_proposals WHERE idempotency_key = ?").get(idempotencyKey);
+      if (existing) {
+        if (existing.action_digest !== actionDigest) {
+          throw new Error(`idempotency_key ${idempotencyKey} was already used for a different proposal`);
+        }
+        return this.getWorkProposal(existing.id);
+      }
       this.db.prepare(`INSERT INTO work_proposals(
         id, project_id, goal, mode, action_digest, expected_state_version, maximum_cost,
         expires_at, idempotency_key, origin_principal, origin_channel, created_at
@@ -214,22 +220,14 @@ export class Dispatcher {
 
   // The human gate. Turns one exact proposal into one job, under operator identity, and refuses
   // anything the proposal did not already bound.
-  async authorizeWorkProposal({ proposalId, principal, origin, maxAttempts = 2 }) {
-    const proposal = this.getWorkProposal(proposalId);
-    if (!proposal) throw new Error(`Unknown work proposal: ${proposalId}`);
-    if (!principal || !origin) throw new Error("Authorizing identity is required");
-    if (proposal.decision) {
-      // Idempotent: re-authorizing returns the same job rather than creating a second one.
-      if (proposal.decision.decision === "AUTHORIZED") return this.getWorkProposal(proposalId);
-      throw new Error(`Work proposal ${proposalId} was already rejected`);
-    }
+  assertAuthorizable(proposal) {
     if (Date.parse(proposal.expires_at) <= Date.now()) {
-      throw new Error(`Work proposal ${proposalId} expired at ${proposal.expires_at}`);
+      throw new Error(`Work proposal ${proposal.id} expired at ${proposal.expires_at}`);
     }
     const currentVersion = this.projectStateVersion(proposal.project_id);
     if (proposal.expected_state_version !== currentVersion) {
       throw new Error(
-        `Work proposal ${proposalId} expected state version ${proposal.expected_state_version} `
+        `Work proposal ${proposal.id} expected state version ${proposal.expected_state_version} `
         + `but the project is at ${currentVersion}`,
       );
     }
@@ -239,13 +237,43 @@ export class Dispatcher {
       maximumCost: proposal.maximum_cost, expectedStateVersion: proposal.expected_state_version,
     });
     if (expected !== proposal.action_digest) {
-      throw new Error(`Work proposal ${proposalId} action digest does not match its stored intent`);
+      throw new Error(`Work proposal ${proposal.id} action digest does not match its stored intent`);
     }
+  }
 
-    const job = await this.createJob({
-      projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts,
-    });
+  // The job and the decision that authorizes it MUST commit together. If they did not, a failure
+  // between them would leave a durable unauthorized job, and that orphan would move
+  // projectStateVersion() so the proposal could never be authorized again -- permanently stranded,
+  // not merely uncommitted. Git I/O happens before the transaction; every check is then re-run
+  // inside it so a concurrent authorization cannot interleave.
+  async authorizeWorkProposal({ proposalId, principal, origin, maxAttempts = 2 }) {
+    const preliminary = this.getWorkProposal(proposalId);
+    if (!preliminary) throw new Error(`Unknown work proposal: ${proposalId}`);
+    if (!principal || !origin) throw new Error("Authorizing identity is required");
+    if (preliminary.decision) {
+      if (preliminary.decision.decision === "AUTHORIZED") return preliminary;
+      throw new Error(`Work proposal ${proposalId} was already rejected`);
+    }
+    this.assertAuthorizable(preliminary);
+
+    const project = this.getProject(preliminary.project_id);
+    if (!project) throw new Error(`Unknown project: ${preliminary.project_id}`);
+    // Async Git resolution must happen outside the transaction.
+    const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
+
     return transaction(this.db, () => {
+      // Re-read under BEGIN IMMEDIATE: a concurrent request may have decided this proposal since
+      // the checks above. The loser returns the winner's job rather than creating a second one.
+      const proposal = this.getWorkProposal(proposalId);
+      if (proposal.decision) {
+        if (proposal.decision.decision === "AUTHORIZED") return this.getWorkProposal(proposalId);
+        throw new Error(`Work proposal ${proposalId} was already rejected`);
+      }
+      this.assertAuthorizable(proposal);
+
+      const job = this.insertJobRow({
+        projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
+      });
       this.db.prepare(`INSERT INTO work_proposal_decisions(
         proposal_id, decision, job_id, decided_by, decided_origin, action_digest, created_at
       ) VALUES (?, 'AUTHORIZED', ?, ?, ?, ?, ?)`).run(

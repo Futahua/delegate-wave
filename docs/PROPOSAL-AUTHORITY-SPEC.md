@@ -65,6 +65,23 @@ own recorded intent.
 **PROP-011** Authorization MUST be idempotent: re-authorizing an already-authorized proposal MUST
 return the same job rather than create a second one. A rejected proposal MUST NOT later become work.
 
+**PROP-012** The job and the decision that authorizes it MUST commit in one transaction. A failure
+between them would leave a durable unauthorized job, and because an orphan job moves the project
+state version, the proposal could never be authorized again. Asynchronous work such as resolving the
+Git base revision MUST happen before the transaction; every expiry, state-version, and digest check
+MUST then be re-run inside it, so two concurrent authorizations produce exactly one decision and
+exactly one job.
+
+**PROP-013** Idempotency lookups MUST occur inside the same transaction as the insert they guard, so
+two simultaneous identical proposals both return the same proposal identity rather than one
+receiving a uniqueness error.
+
+**PROP-014** The MCP process MUST select its credential by record presence: when a proposal record
+exists it MUST load only that record; otherwise it MUST load only the observer record. It MUST NOT
+decrypt the operator record in either case. This makes the optional-role cutover explicit -- an
+installation gains proposal authority exactly when a proposal credential is deliberately
+provisioned, and older installations remain read-only.
+
 ## Traceability
 
 | Normative rule | Enforced by | Tested by |
@@ -79,6 +96,9 @@ return the same job rather than create a second one. A rejected proposal MUST NO
 | PROP-009 | `operate` scope on authorize/reject routes | acceptance test proves Hermes cannot authorize |
 | PROP-010 | expiry, state-version, and digest re-derivation checks | expired and superseded proposal tests |
 | PROP-011 | decision row keyed by proposal id | idempotent-authorization and rejected-proposal tests |
+| PROP-012 | single transaction around job insert and decision insert | failed-decision-write rollback test; concurrent-authorization test |
+| PROP-013 | idempotency lookup inside `BEGIN IMMEDIATE` | concurrent identical proposal test |
+| PROP-014 | `hasRecord`-driven credential selection in the MCP path | proposer-preferred and observer-fallback startup tests; live `delegate-wave mcp` propose test |
 
 ## Deferred
 

@@ -510,3 +510,50 @@ test("supervisor has no scheduler, storage, Control API, or MCP authority import
   assert.doesNotMatch(source, /from ["']\.\/(?:service|db|backend|control|mcp)/);
   assert.equal(path.basename(sourcePath), "supervisor.js");
 });
+
+test("clean MCP startup prefers the proposer record and decrypts only it", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-mcp-proposer-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({
+    ...configuredEnvironment,
+    DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "proposer-secret-must-not-leak",
+  });
+  const records = JSON.parse(fs.readFileSync(store.path, "utf8")).records;
+  assert.deepEqual(Object.keys(records).sort(), ["observer", "operator", "proposer"]);
+
+  // Mirrors the clean-MCP path in cli.js once a proposal credential is provisioned.
+  assert.equal(store.hasRecord("proposer"), true);
+  const environment = {};
+  const proposer = await store.load("proposer");
+  environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = proposer.DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN;
+
+  assert.equal(environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN, "proposer-secret-must-not-leak");
+  assert.deepEqual(processRunner.decrypted, [records.proposer]);
+  assert.equal(processRunner.decrypted.includes(records.operator), false);
+  assert.equal(processRunner.decrypted.includes(records.observer), false);
+});
+
+test("an installation without a proposer record keeps Hermes read-only", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-mcp-no-proposer-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+
+  assert.equal(store.hasRecord("proposer"), false);
+  const observer = await store.load("observer");
+  assert.equal(observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN, "observer-secret-must-not-leak");
+  const records = JSON.parse(fs.readFileSync(store.path, "utf8")).records;
+  assert.equal(processRunner.decrypted.includes(records.operator), false);
+});
+
+test("provisioning still succeeds without the optional proposer credential", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-optional-role-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner: recordingDpapiRunner() });
+  const result = await store.provision({ ...configuredEnvironment });
+  assert.equal(result.provisioned, true);
+  assert.deepEqual(store.missingRequiredRecords(), []);
+});
