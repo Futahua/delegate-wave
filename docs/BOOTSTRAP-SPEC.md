@@ -81,9 +81,23 @@ using an unpriced dimension MUST yield a null reference cost. A reference cost M
 reported cost.
 
 **WRK-009** A usage-capture failure MUST NOT fail the attempt, and MUST NOT be silent. It MUST leave
-a durable record, and measurement health MUST be checkable: every attempt that started an executor
-must carry either a usage receipt or an explicit capture-failure record. A cost-per-validated-
-candidate result MUST NOT be accepted over a dataset that fails that check.
+a durable record.
+
+Measurement health MUST distinguish two questions over the attempts that reached executor intent.
+A dataset is *accounted* when every such attempt has either a usage receipt or an explicit
+capture-failure record, so nothing vanished silently. A dataset is *healthy* only when every such
+attempt has an actual usage receipt. A recorded capture failure therefore leaves a dataset accounted
+but NOT healthy, because that attempt has no defensible cost.
+
+A cost-per-validated-candidate result MUST NOT be accepted over a dataset that is not healthy.
+Attempts that never reached executor intent MUST be excluded from this coverage, since they invoked
+no backend and consumed no provider usage.
+
+**WRK-010** A backend is untrusted for measurement exactly as it is untrusted for success. The
+finalizer MUST validate a backend-supplied observation before it can become a receipt, rejecting
+non-integral or negative dimensions, a positive step count under `UNKNOWN`, and a reported cost whose
+provenance disagrees with it. An invalid observation MUST become a visible capture failure rather
+than a plausible but corrupt receipt.
 
 **WRK-004** Every executor attempt MUST have a dispatcher-resolved, provider-qualified model
 persisted before the attempt launches. An execution backend MUST fail closed rather than fall back to
@@ -145,7 +159,8 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | WRK-006 | receipts live in their own table and are never read by acceptance logic | failed-attempt test asserting the attempt stays FAILED; idempotent re-record test |
 | WRK-007 | `parseOpenCodeUsage` status states with null numeric fields under UNKNOWN, enforced by a schema CHECK | UNKNOWN/PARTIAL/COMPLETE parser tests; missing-artifact test; live historical normalization |
 | WRK-008 | `pricing.js` pinned append-only bases; separate reported and reference columns with cost provenance | separate-facts receipt test; unknown-model, unknown-basis, and unpriced-cache-write null tests; published-rate check; superseded-basis test |
-| WRK-009 | `recordAttemptUsage` emits `USAGE_RECEIPT_FAILED`; `usageCoverage` reports attempts with no evidence | capture-failure visibility test; coverage-gap test |
+| WRK-009 | `recordAttemptUsage` emits `USAGE_RECEIPT_FAILED`; `usageCoverage` separates accounted from healthy and scopes to `EXECUTOR_INTENDED` | capture-failure invalidates health test; unexplained-gap test; pre-executor-attempt exclusion test |
+| WRK-010 | `assertValidObservation` runs in the finalizer before any receipt is written | finalizer rejection test; invalid-backend-observation dispatcher test; conflicting-duplicate-id test |
 | VAL-004 | absence of integration command | interface conformance review |
 | VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 

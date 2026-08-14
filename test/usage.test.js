@@ -255,3 +255,51 @@ test("reference cost matches DeepSeek published rates for a known observation", 
   assert.ok(Math.abs(reference_cost_usd - expected) < 1e-12);
   assert.ok(Math.abs(reference_cost_usd - 0.000814873) < 1e-9, "matches the hand-checked figure");
 });
+
+test("the finalizer rejects observations SQLite alone would accept", () => {
+  const valid = {
+    status: USAGE_COMPLETE,
+    input_tokens: 100, output_tokens: 10, reasoning_tokens: 0,
+    cache_read_tokens: 0, cache_write_tokens: 0,
+    provider_steps: 1, reported_cost_usd: 0.001, reported_cost_source: COST_SOURCE_EXECUTOR,
+    malformed_events: 0,
+  };
+  const finalize = (observation) => finalizeUsageReceipt({
+    attemptId: "a", backend: "TestBackend", model: "deepseek-v4-flash", observation,
+  });
+  assert.ok(finalize(valid).reference_cost_usd > 0);
+
+  // Cost and provenance are one fact.
+  assert.throws(() => finalize({ ...valid, reported_cost_source: null }), /must agree/);
+  assert.throws(() => finalize({ ...valid, reported_cost_usd: null }), /must agree/);
+  // Fractional token counts pass INTEGER affinity but are not observations.
+  assert.throws(() => finalize({ ...valid, input_tokens: 1.5 }), /non-negative integer/);
+  assert.throws(() => finalize({ ...valid, provider_steps: 0 }), /positive integer/);
+  assert.throws(() => finalize({ ...valid, input_tokens: -1 }), /non-negative integer/);
+  assert.throws(() => finalize({ ...valid, reported_cost_usd: -0.5 }), /non-negative number/);
+  assert.throws(() => finalize({ ...valid, status: "GUESSED" }), /unknown status/);
+  // An UNKNOWN observation may not smuggle numbers through.
+  assert.throws(
+    () => finalize({ ...valid, status: USAGE_UNKNOWN }),
+    /set under UNKNOWN/,
+  );
+});
+
+test("duplicate step ids with conflicting usage degrade the observation", () => {
+  const one = JSON.stringify({
+    type: "step_finish",
+    part: { id: "prt_x", type: "step_finish", tokens: tokens(1000, 50, 5, 4000), cost: 0.0001 },
+  });
+  const conflicting = JSON.stringify({
+    type: "step_finish",
+    part: { id: "prt_x", type: "step_finish", tokens: tokens(9999, 50, 5, 4000), cost: 0.0001 },
+  });
+  const usage = parseOpenCodeUsage([one, conflicting].join("\n"));
+  assert.equal(usage.status, USAGE_PARTIAL, "an inconsistent audit stream is not an ordinary replay");
+  assert.equal(usage.provider_steps, 1);
+  assert.equal(usage.input_tokens, 1000);
+  assert.equal(usage.malformed_events, 1);
+
+  // An identical replay stays COMPLETE.
+  assert.equal(parseOpenCodeUsage([one, one].join("\n")).status, USAGE_COMPLETE);
+});

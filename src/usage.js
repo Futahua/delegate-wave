@@ -53,7 +53,7 @@ export function parseOpenCodeUsage(text) {
   const lines = String(text ?? "").split(/\r?\n/);
   let malformed = 0;
   const steps = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const line of lines) {
     if (!line.trim()) continue;
     let event;
@@ -65,11 +65,17 @@ export function parseOpenCodeUsage(text) {
     }
     if (event?.type !== "step_finish") continue;
     const step = event.part ?? event;
-    // Deduplicate by stable identity so a replayed or duplicated artifact cannot double-count.
+    // Deduplicate by stable identity so a replayed or duplicated artifact cannot double-count. Two
+    // events sharing an id but reporting different usage are an inconsistent audit stream rather
+    // than an ordinary replay, so they degrade the observation instead of silently keeping the first.
     const identity = step?.id ?? event?.id ?? null;
     if (identity !== null) {
-      if (seen.has(identity)) continue;
-      seen.add(identity);
+      const previous = seen.get(identity);
+      if (previous !== undefined) {
+        if (previous !== JSON.stringify(step?.tokens ?? null)) malformed += 1;
+        continue;
+      }
+      seen.set(identity, JSON.stringify(step?.tokens ?? null));
     }
     steps.push(step);
   }
@@ -156,6 +162,55 @@ export function observeOpenCodeArtifact(artifactPath) {
   }
 }
 
+const TOKEN_FIELDS = Object.freeze([
+  "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
+]);
+
+// Validates a backend-supplied observation before it can become a receipt.
+//
+// The finalizer is the mechanical boundary, not just the pricing step: a backend is untrusted for
+// measurement exactly as it is untrusted for success. Throwing here routes the failure through the
+// dispatcher's USAGE_RECEIPT_FAILED path, so an invalid observation becomes visible missing evidence
+// rather than a plausible but corrupt receipt.
+export function assertValidObservation(observed) {
+  const fail = (reason) => { throw new Error(`Invalid usage observation: ${reason}`); };
+  if (!observed || typeof observed !== "object") fail("not an object");
+  if (![USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN].includes(observed.status)) {
+    fail(`unknown status ${observed.status}`);
+  }
+
+  const wholeNonNegative = (value) => Number.isInteger(value) && value >= 0;
+  const costOk = (value) => value === null || value === undefined
+    || (Number.isFinite(value) && value >= 0);
+
+  if (observed.status === USAGE_UNKNOWN) {
+    for (const field of TOKEN_FIELDS) {
+      if (observed[field] !== null && observed[field] !== undefined) fail(`${field} set under UNKNOWN`);
+    }
+    if (observed.provider_steps) fail("provider_steps set under UNKNOWN");
+    if (observed.reported_cost_usd !== null && observed.reported_cost_usd !== undefined) {
+      fail("reported_cost_usd set under UNKNOWN");
+    }
+  } else {
+    for (const field of TOKEN_FIELDS) {
+      if (!wholeNonNegative(observed[field])) fail(`${field} must be a non-negative integer`);
+    }
+    if (!wholeNonNegative(observed.provider_steps) || observed.provider_steps < 1) {
+      fail("provider_steps must be a positive integer");
+    }
+  }
+
+  if (!costOk(observed.reported_cost_usd)) fail("reported_cost_usd must be a non-negative number");
+  if (observed.malformed_events !== undefined && !wholeNonNegative(observed.malformed_events)) {
+    fail("malformed_events must be a non-negative integer");
+  }
+
+  // Cost and its provenance are one fact: neither is meaningful without the other.
+  const hasCost = observed.reported_cost_usd !== null && observed.reported_cost_usd !== undefined;
+  const hasSource = observed.reported_cost_source !== null && observed.reported_cost_source !== undefined;
+  if (hasCost !== hasSource) fail("reported_cost_usd and reported_cost_source must agree");
+}
+
 // The single place a receipt is finalized, for every backend.
 //
 // Pricing is applied here rather than in any backend: an executor must never compute delegate-wave's
@@ -165,6 +220,7 @@ export function finalizeUsageReceipt({
   attemptId, backend, model, observation, basisId, now = new Date().toISOString(),
 }) {
   const observed = observation ?? unknownObservation();
+  assertValidObservation(observed);
   const priced = observed.status === USAGE_UNKNOWN
     ? { reference_cost_usd: null, pricing_basis_id: null }
     : referenceCostUsd(observed, { model, ...(basisId ? { basisId } : {}) });

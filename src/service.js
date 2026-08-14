@@ -679,22 +679,50 @@ export class Dispatcher {
     }
   }
 
-  // Measurement health for an experiment dataset. Every attempt that started an executor must carry
-  // either a usage receipt or an explicit capture-failure record; otherwise a cost-per-validated-
-  // candidate result computed over it would silently omit attempts.
+  // Measurement health for an experiment dataset.
+  //
+  // Two distinct questions, deliberately not collapsed:
+  //
+  //   accounted  every eligible attempt is explained -- it has a receipt, or a durable record saying
+  //              why it has none. Nothing vanished silently.
+  //   healthy    every eligible attempt has actual usage evidence. A known capture failure is
+  //              accounted for but leaves the dataset unusable for cost per validated candidate,
+  //              because one attempt has no defensible cost.
+  //
+  // Eligibility is attempts that reached EXECUTOR_INTENDED. An attempt that failed during worktree
+  // setup never invoked a backend and consumed no provider usage, so requiring evidence from it
+  // would report a gap that cannot exist.
   usageCoverage({ jobIds = null } = {}) {
-    const attempts = jobIds?.length
-      ? this.db.prepare(`SELECT id FROM attempts WHERE job_id IN (${jobIds.map(() => "?").join(",")})`).all(...jobIds)
-      : this.db.prepare("SELECT id FROM attempts").all();
-    const missing = [];
-    for (const { id } of attempts) {
-      if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(id)) continue;
+    const eligible = jobIds?.length
+      ? this.db.prepare(`SELECT DISTINCT a.id FROM attempts a
+          JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'
+          WHERE a.job_id IN (${jobIds.map(() => "?").join(",")})`).all(...jobIds)
+      : this.db.prepare(`SELECT DISTINCT a.id FROM attempts a
+          JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'`).all();
+
+    const receipts = [];
+    const captureFailures = [];
+    const missingEvidence = [];
+    for (const { id } of eligible) {
+      if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(id)) {
+        receipts.push(id);
+        continue;
+      }
       const failed = this.db.prepare(
         "SELECT 1 FROM events WHERE kind = 'USAGE_RECEIPT_FAILED' AND entity_id = ?",
       ).get(id);
-      if (!failed) missing.push(id);
+      if (failed) captureFailures.push(id);
+      else missingEvidence.push(id);
     }
-    return { attempts: attempts.length, missing_receipts: missing, healthy: missing.length === 0 };
+
+    return {
+      attempts: eligible.length,
+      receipts: receipts.length,
+      capture_failures: captureFailures,
+      missing_evidence: missingEvidence,
+      accounted: missingEvidence.length === 0,
+      healthy: missingEvidence.length === 0 && captureFailures.length === 0,
+    };
   }
 
   getAttemptUsage(attemptId) {
