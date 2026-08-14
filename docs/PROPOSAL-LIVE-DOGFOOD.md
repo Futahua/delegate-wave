@@ -173,3 +173,17 @@ The same probe run against the pre-fix scrubber would have reported the proposer
 
 `proposal show|authorize|reject` now take `--proposal`, matching `integration` and `approval`.
 `--id` is still accepted so existing invocations keep working.
+
+## Note on concurrent MCP requests
+
+A live check appeared to show a freshly created proposal missing from the overview count. It was not
+a defect, and an earlier note in this repository explained it incorrectly as database connection
+staleness. The MCP adapter holds no database connection; it reaches the Control API over HTTP.
+
+The real mechanism is that `runMcpStdio()` attaches an async `line` handler without serializing
+requests, so JSON-RPC requests written to stdin before the previous one settles may execute
+concurrently. Sending `propose_work` and `get_overview` in one batch can therefore let the overview
+request race the proposal it was meant to observe.
+
+That is acceptable behaviour for independent JSON-RPC calls and is left unchanged. It only means a
+live check must await the proposal response before reading a count that depends on it.

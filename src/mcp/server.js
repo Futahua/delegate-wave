@@ -30,7 +30,9 @@ const TOOLS = Object.freeze([
   },
   {
     name: "get_attention_needed",
-    description: "List jobs and integration operations that need human attention.",
+    description:
+      "List work needing human attention: jobs, unresolved integration operations, and work "
+      + "proposals awaiting an operator decision.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
