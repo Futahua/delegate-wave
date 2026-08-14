@@ -25,6 +25,14 @@ async function cli(root, args) {
   });
 }
 
+async function waitForFile(filename, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filename)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${filename}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 async function fixture(t) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-integration-"));
   const root = path.join(temp, "data");
@@ -516,16 +524,35 @@ test("concurrent CLI integrations create one operation and preserve the second a
     name: "Fixture",
     repoPath: repo,
     branch: "integration",
-    validation: ['node -e "setTimeout(() => {}, 1200)"'],
+    validation: [],
   });
-  const { proposal } = await readyProposal(service, project.id, service.backend);
+  const job = await service.createJob({ projectId: project.id, goal: "concurrent integration" });
+  assert.equal((await service.runJob(job.id)).job.status, "READY_FOR_INTEGRATION");
+  const validationStarted = path.join(root, "integration-validation-started");
+  const validationRelease = path.join(root, "integration-validation-release");
+  const blocker = path.join(root, "blocking-validation.cjs");
+  fs.writeFileSync(blocker, [
+    "const fs = require('node:fs');",
+    "fs.writeFileSync(process.argv[2], 'started');",
+    "const view = new Int32Array(new SharedArrayBuffer(4));",
+    "while (!fs.existsSync(process.argv[3])) Atomics.wait(view, 0, 0, 20);",
+  ].join("\n"));
+  const quote = (value) => JSON.stringify(value.replaceAll("\\", "/"));
+  const validationCommand = `node ${quote(blocker)} ${quote(validationStarted)} ${quote(validationRelease)}`;
+  service.db.prepare("UPDATE projects SET validation_json = ? WHERE id = ?")
+    .run(JSON.stringify([validationCommand]), project.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
   service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
   service.grantApproval({ proposalId: proposal.id, principal: "human-2", origin: "terminal" });
   const args = ["integration", "run", "--proposal", proposal.id];
-  const results = await Promise.all([cli(root, args), cli(root, args)]);
-  assert.equal(results.filter((result) => result.exitCode === 0).length, 1);
-  assert.equal(results.filter((result) => result.exitCode !== 0).length, 1);
-  assert.match(results.find((result) => result.exitCode !== 0).stderr, /is unresolved/);
+  const firstPromise = cli(root, args);
+  await waitForFile(validationStarted);
+  const second = await cli(root, args);
+  fs.writeFileSync(validationRelease, "release");
+  const first = await firstPromise;
+  assert.notEqual(second.exitCode, 0);
+  assert.match(second.stderr, /(is unresolved|stuck without a terminal outcome)/);
+  assert.equal(first.exitCode, 0, first.stderr);
   const status = service.integrationStatus(proposal.id);
   assert.equal(status.operations.length, 1);
   assert.equal(status.operations[0].state, "SUCCEEDED");
