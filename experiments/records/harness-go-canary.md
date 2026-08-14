@@ -70,13 +70,52 @@ This must be resolved before `executor-ab-go-v1` is frozen, because the experime
 `usageCoverage().healthy === true`, which requires a `COMPLETE` receipt with a non-null reference
 cost. Options, in order of preference:
 
-1. enable whatever persistence setting records model-request events in the session stream;
-2. use the JSON-RPC stdio surface, which streams durable session events, rather than scraping a
-   session directory;
-3. have the backend observe usage from its own transport.
+1. the JSON-RPC stdio surface, which streams durable session events including the model call's usage
+   on `assistant/message`, so delegate-wave records raw frames and normalizes them itself;
+2. enabling whatever persistence setting records model-request events in the session directory;
+3. having the backend observe usage from its own transport.
 
-Option 3 is least attractive: it puts measurement inside the executor rather than delegate-wave, and
-the usage contract deliberately keeps backends supplying neutral observations only.
+Option 1 is preferred: delegate-wave owns capture, validation, normalization, pricing and measurement
+health, while Harness only reports provider facts. Option 3 is least attractive, since it puts
+measurement inside the executor and the usage contract deliberately keeps backends supplying neutral
+observations only.
+
+The JSON-RPC surface has no per-prompt result object -- `session/prompt` only acknowledges admission
+-- which suits one prompt per attempt: persist frames until the root session emits its durable
+`turn/end`, map that reason to an executor outcome, then shut the process down. The same stream
+carries both lifecycle and usage evidence without Harness becoming authoritative for job success.
+
+## Token accounting: the two arms use different conventions
+
+Verified empirically on this route rather than taken from documentation.
+
+```text
+OpenCode step_finish   output 78, reasoning 17, and total = input + output + reasoning + cache
+                       so the two figures are DISJOINT
+
+Go wire response       completion_tokens 40, reasoning_tokens 21, ~100 chars of visible content
+                       so reasoning is a SUBSET of completion
+```
+
+Harness follows the wire convention. A backend mapping `output_tokens = completion_tokens` while also
+reporting `reasoning_tokens` would price every reasoning token twice, silently inflating the Harness
+arm's cost -- an error that would have looked like a real efficiency difference.
+
+The receipt's five dimensions are therefore defined as disjoint, with `output_tokens` meaning
+non-reasoning output (WRK-011). A subset-style report is converted by the adapter; pricing stays
+backend-independent, and a test proves the same real usage costs the same from either arm.
+
+## Read isolation is not yet sufficient for the experiment
+
+The restricted profile removes shell, skills and questions, but stock `headless` uses `fs-local`, and
+Harness's filesystem sandbox restricts writes while reads pass through in every mode.
+
+The trusted verifiers deliberately live outside the worker repository. A Harness worker running as
+the same Windows user could read them by absolute path, which would recreate the verifier-leak
+problem PR #13 eliminated and hand the Harness arm a capability the OpenCode arm does not have.
+
+A delegate-wave-owned, symlink-aware read/write fence confined to the attempt worktree is required
+before the corpus is exposed to Harness. Stock `dsh-fs-sandbox` is not sufficient.
 
 ## Not yet done
 
