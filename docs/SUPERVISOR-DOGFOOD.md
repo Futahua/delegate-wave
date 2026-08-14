@@ -46,3 +46,53 @@ This proves task import, explicit start, forced-process recovery, credential-fre
 post-recovery API health in the current Windows environment. The accepted task also contains an
 interactive-user logon trigger, but this dogfood did not reboot or log off the user's machine. Actual
 next-logon behavior remains an operator observation rather than a performed destructive test.
+
+## Review hardening: explicit stop
+
+Review identified that `/End` alone left the one-minute trigger enabled. The lifecycle commands now
+use this ordering:
+
+```text
+stop  = disable, then end
+start = enable, then run
+```
+
+The live task was explicitly stopped at PID 44216. After 70 seconds there was still no listener on
+port 47321, and Task Scheduler reported both task status and scheduled state as `Disabled`. Starting
+it again re-enabled the task before requesting the run.
+
+## Review hardening: protected credential startup
+
+Review also identified that persistent Windows user-environment values are plaintext under
+`HKCU\Environment`, allowing repository-controlled validation to bypass inherited-environment
+scrubbing by reading the registry directly.
+
+The live installation was migrated to a current-user DPAPI-protected bundle at:
+
+```text
+D:\AssistantSystem\delegate-wave\config\control-secrets.dpapi
+```
+
+Acceptance checks established:
+
+```text
+persistent Control/Hermes user-environment values = absent
+protected bundle contains a configured plaintext secret = false
+protected bundle contains a Control credential name = false
+task action = node ...\src\cli.js supervisor run
+clean operator CLI process can decrypt and call doctor = true
+post-migration doctor healthy = true
+```
+
+The DPAPI change closes plaintext registry persistence; it does not claim to isolate arbitrary code
+running as the same Windows user. That stronger boundary remains an execution-class requirement.
+
+During the post-migration restart, `/End` returned before the previous process had released port
+47321. An immediate `/Run` therefore exited with `EADDRINUSE` even though the periodic trigger would
+eventually recover it. The supervisor now writes a process-only PID receipt and waits for that exact
+PID to die before `stop` reports success. The receipt is synchronization evidence only; it never
+causes a delegate-wave job/attempt lifecycle transition.
+
+The corrected live sequence recorded PID 38648, confirmed the PID receipt matched the listener,
+performed an immediate stop followed by start, and returned healthy on replacement PID 38736 with no
+manual delay or `EADDRINUSE` failure.

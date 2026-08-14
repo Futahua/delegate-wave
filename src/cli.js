@@ -84,6 +84,12 @@ async function main() {
     const { WindowsSupervisor } = await import("./supervisor.js");
     const supervisor = new WindowsSupervisor();
     const action = positional[1];
+    if (action === "run") {
+      Object.assign(process.env, await supervisor.runtimeEnvironment());
+      supervisor.recordRuntimePid();
+      await serve();
+      return;
+    }
     if (!["install", "status", "start", "stop", "uninstall"].includes(action)) {
       throw new Error("Unknown supervisor command; use install, status, start, stop, or uninstall");
     }
@@ -91,9 +97,21 @@ async function main() {
     return;
   }
   if (positional[0] === "mcp") {
+    if (process.platform === "win32"
+      && !process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN
+      && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
+      const { DpapiSecretStore } = await import("./supervisor.js");
+      const protectedEnvironment = await new DpapiSecretStore().load();
+      process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = protectedEnvironment.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+    }
     const { runMcpStdio } = await import("./mcp/server.js");
     runMcpStdio();
     return;
+  }
+  if (process.platform === "win32" && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
+    const { DpapiSecretStore } = await import("./supervisor.js");
+    const protectedEnvironment = await new DpapiSecretStore().load();
+    process.env.DELEGATE_WAVE_CONTROL_TOKEN = protectedEnvironment.DELEGATE_WAVE_CONTROL_TOKEN;
   }
   const client = new ControlClient();
   const [resource, action] = positional;

@@ -7,8 +7,9 @@ authorize or reconstruct domain state.
 
 ## Task boundary
 
-**SUP-001** The Windows supervisor MUST run the existing `delegate-wave serve` entry point. It MUST
-NOT instantiate a second scheduler implementation.
+**SUP-001** The Windows supervisor MUST load protected credentials and run the existing
+`delegate-wave serve` entry point in the same process. It MUST NOT instantiate a second scheduler
+implementation.
 
 **SUP-002** The task MUST run at interactive user logon with `InteractiveToken` and
 `LeastPrivilege`. It MUST NOT request elevation.
@@ -19,11 +20,13 @@ independent one-minute trigger. The periodic trigger MUST be harmless while the 
 MUST recover externally terminated instances that Windows does not classify for restart-on-failure.
 
 **SUP-004** Task metadata, arguments, and temporary installation files MUST NOT contain Control API
-credentials or credential environment-variable names. Credentials MUST come from the Windows user
-environment at process creation.
+credentials or credential environment-variable names. Persistent Windows user-environment variables
+MUST NOT contain Control authority credentials after provisioning.
 
-**SUP-005** Installation MUST fail before creating the task when the operator credential is absent
-from the installing user's environment.
+**SUP-005** Initial installation MUST encrypt Control credentials with Windows DPAPI scoped to the
+current user before deleting their persistent user-environment values. Later installation MAY reuse
+the existing protected bundle. Decryption MUST occur only inside the supervisor/operator/MCP process
+that requires the corresponding credential.
 
 ## Authority and recovery
 
@@ -39,16 +42,26 @@ consult an LLM.
 **SUP-009** Removing the Windows task MUST NOT delete or mutate the managed data root, repositories,
 worktrees, artifacts, or audit history.
 
+**SUP-010** `supervisor stop` MUST disable future triggers before ending the current task instance.
+`supervisor start` MUST enable the task before requesting a run. Unexpected death recovery MUST NOT
+override an explicit operator stop. Stop MUST wait for the exact recorded task-process PID to exit
+before reporting success, so an immediate start cannot race the old listener.
+
+**SUP-011** DPAPI protection MUST NOT be represented as isolation from hostile code running as the
+same Windows user. Untrusted validation requires a separate OS identity, container, or VM boundary.
+
 ## Traceability
 
 | Normative rule | Enforced by | Tested by |
 |---|---|---|
 | SUP-001–003 | fixed task action and XML settings | task-definition conformance test; live restart dogfood |
-| SUP-004–005 | generated XML and pre-install credential check | secret-free XML/install and missing-token tests |
+| SUP-004–005 | generated XML, DPAPI store, and user-environment cleanup | secret-free XML and DPAPI provision/load tests |
 | SUP-006 | CLI-only dynamic supervisor module; absent API/MCP routes | lifecycle command test and existing route allowlist tests |
 | SUP-007–009 | supervisor has no dispatcher/storage imports or cleanup actions | static implementation review; live state comparison |
+| SUP-010 | disable/end and enable/run ordering plus task-process PID receipt | lifecycle/PID-wait tests and live stop/start dogfood |
+| SUP-011 | explicit documented execution-class limit | specification and operator-document review |
 
 ## Deferred
 
 Windows service accounts, system-boot execution without an interactive login, remote supervision,
-credential provisioning, and multi-user process ownership are outside this slice.
+Credential Manager integration, and multi-user process ownership are outside this slice.
