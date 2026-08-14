@@ -82,6 +82,28 @@ Remote review found two additional blockers, now fixed locally:
    Control/Hermes registry environment values, and changes the task action to `supervisor run`.
    Clean CLI and MCP processes load only their required protected credential.
 
+A second review round found two more defects, now fixed locally:
+
+3. The protected store held a single bundle, so `load()` decrypted both tokens and the Hermes MCP
+   process received the operator credential in memory even though only the observer token reached
+   `process.env`. Operator and observer are now independent DPAPI records and `load(role)` unseals
+   exactly one; a regression proves the operator decrypt path is never invoked during MCP startup.
+4. `uninstall` deleted the task without stopping the API. Deleting a scheduled task does not
+   interrupt a program already started from it, so uninstall could leave an orphan on 47321. Uninstall
+   now runs the shared disable/end/wait-for-PID sequence before `/Delete`, and fails without deleting
+   the task if the recorded PID does not exit. Credentials are still retained per SUP-009.
+
+5. The scoped-record change needed a migration path for the already-provisioned legacy store.
+   `supervisor migrate-secrets` decrypts the legacy bundle once inside the entitled supervisor
+   process, re-protects each role independently, replaces the store atomically, and discards the
+   combined plaintext. `supervisor run` completes a pending migration at startup so the logon task
+   cannot fail on a stale format. A scoped `load()` never migrates implicitly, which is what keeps
+   the operator credential away from the Hermes MCP process.
+
+The live store was migrated and the API restarted on the new code: PID 38736 stopped cleanly, PID
+42664 took over, and both the clean operator CLI and the clean Hermes MCP verified healthy against
+it. The task remains enabled with both triggers active.
+
 DPAPI is protection at rest, not a sandbox against arbitrary code running as the same Windows user.
 Truly untrusted validation still needs a separate OS identity, container, or VM.
 
@@ -114,7 +136,7 @@ router yet; use explicit routing and measure real jobs.
 
 1. Finish PR #8:
    - run the complete deterministic suite;
-   - repeat secret-registry/bundle/task-XML checks;
+   - repeat secret-registry/scoped-record/task-XML checks;
    - update the dogfood record with the two review fixes;
    - commit and push the new head for remote review;
    - merge only after the user reports no blocker.

@@ -96,3 +96,75 @@ causes a delegate-wave job/attempt lifecycle transition.
 The corrected live sequence recorded PID 38648, confirmed the PID receipt matched the listener,
 performed an immediate stop followed by start, and returned healthy on replacement PID 38736 with no
 manual delay or `EADDRINUSE` failure.
+
+## Second review round: scoped decryption and non-orphaning uninstall
+
+Review found that the first protected-credential migration preserved at-rest protection but defeated
+the credential separation established in PR #5. The store held one bundle carrying both tokens, and
+`load()` decrypted the whole bundle and returned every value. Although the MCP startup path assigned
+only the observer token into `process.env`, the Hermes Node process had already received the
+decrypted operator token in memory.
+
+The store now protects each role as an independent DPAPI record, and `load(role)` unseals exactly one
+of them:
+
+```text
+ordinary CLI  -> operator record only
+Hermes MCP    -> observer record only
+supervisor    -> operator and observer, each by a separate scoped load
+```
+
+The deterministic regression instruments the ciphertext handles and asserts the operator decrypt path
+is never invoked during clean MCP startup, and that the observer result contains no operator value.
+
+Review also found that `uninstall()` deleted the task without stopping the running API. Microsoft
+documents that deleting a scheduled task does not interrupt a program already started from that task,
+so a running API could have kept listening on 47321 as an unmanaged orphan while the supervisor
+reported success. Uninstall now runs the shared stop sequence — disable, `/End`, wait for the recorded
+runtime PID — before `/Delete`, and fails without deleting the task if that PID does not exit.
+
+Per SUP-009, uninstall still does not remove the protected credential store; purging credentials is
+left as a separate explicit operation.
+
+These two fixes are deterministic and covered by the suite; no additional model call was used.
+
+## Legacy store migration and live recovery
+
+The scoped-record change was initially left without a migration path, which put the live machine one
+restart away from a rejected credential store. The correct resolution is an explicit one-time
+migration: the supervisor process — already entitled to every role — decrypts the legacy bundle once,
+immediately re-protects each role independently, atomically replaces the store, and discards the
+combined plaintext. This never exposes the operator token to MCP.
+
+`load()` deliberately does not migrate. It fails closed with a directive to run
+`supervisor migrate-secrets`, because a lazy migration inside `load()` would let the Hermes MCP
+process decrypt the combined bundle. A regression asserts that a legacy store refuses an observer
+load without decrypting anything and without mutating the store.
+
+Live migration of `D:\AssistantSystem\delegate-wave\config\control-secrets.dpapi`:
+
+```text
+pre-migration format = legacy bare base64 blob, 629 bytes
+migrate-secrets -> { migrated: true, roles: [operator, observer] }
+post-migration store = {version: 1, records: {operator, observer}}, 994 bytes
+operator and observer ciphertexts distinct = true
+observer load returns only DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = true
+observer value equals operator value = false
+```
+
+The migration rewrote only the credential file, so the running API was never interrupted by it. The
+restart was then performed against the already-migrated store:
+
+```text
+stopped PID 38736, listener count on 47321 = 0
+started replacement PID 42664, PID receipt matched the listener
+clean operator CLI doctor on new process = healthy
+clean Hermes MCP get_overview on new process = 15 projects, bounded result
+task enabled = true, state = running, logon and time triggers enabled
+```
+
+The decryptable legacy backup taken before migration was removed once migration was verified, since
+a combined bundle is the artifact this change exists to eliminate.
+
+The actual next-logon trigger remains unobserved by deliberate choice; the machine was not rebooted
+or logged off.

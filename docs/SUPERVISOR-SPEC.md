@@ -25,8 +25,25 @@ MUST NOT contain Control authority credentials after provisioning.
 
 **SUP-005** Initial installation MUST encrypt Control credentials with Windows DPAPI scoped to the
 current user before deleting their persistent user-environment values. Later installation MAY reuse
-the existing protected bundle. Decryption MUST occur only inside the supervisor/operator/MCP process
+the existing protected store. Decryption MUST occur only inside the supervisor/operator/MCP process
 that requires the corresponding credential.
+
+**SUP-005a** The operator and observer credentials MUST be protected as independent DPAPI records,
+never as one bundle decrypted whole. A load MUST be scoped to a single role and MUST NOT return, or
+even decrypt, another role's credential. Consequently:
+
+```text
+ordinary CLI  -> operator record only
+Hermes MCP    -> observer record only
+supervisor    -> operator and observer, each by a separate scoped load
+```
+
+**SUP-005b** Upgrading a legacy combined bundle to scoped records MUST be an explicit operation
+performed only by a process already entitled to every role (`supervisor migrate-secrets`, or the
+supervised runtime at startup). A scoped load MUST NOT migrate implicitly: lazy migration inside
+`load()` would let the Hermes MCP process decrypt the combined bundle and thereby the operator
+credential. Migration MUST re-protect each role independently, replace the store only after every
+role re-protects successfully, and discard the combined plaintext before returning.
 
 ## Authority and recovery
 
@@ -40,7 +57,13 @@ job, attempt, validation, approval, or integration lifecycle transition.
 consult an LLM.
 
 **SUP-009** Removing the Windows task MUST NOT delete or mutate the managed data root, repositories,
-worktrees, artifacts, or audit history.
+worktrees, artifacts, or audit history. The protected credential store is retained; purging
+credentials is a separate explicit operation.
+
+**SUP-009a** Deleting a scheduled task does not interrupt a program already started from it, so
+`supervisor uninstall` MUST perform the full stop sequence — disable, end, wait for the recorded
+runtime PID to exit — before deleting the task. If the recorded runtime does not exit, uninstall MUST
+fail without deleting the task rather than abandon an unmanaged process holding the API port.
 
 **SUP-010** `supervisor stop` MUST disable future triggers before ending the current task instance.
 `supervisor start` MUST enable the task before requesting a run. Unexpected death recovery MUST NOT

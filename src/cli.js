@@ -39,7 +39,8 @@ Commands:
   supervisor status
   supervisor start
   supervisor stop
-  supervisor uninstall
+  supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
+  supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
@@ -85,13 +86,22 @@ async function main() {
     const supervisor = new WindowsSupervisor();
     const action = positional[1];
     if (action === "run") {
+      // The supervised runtime is entitled to every role, so it is a safe place to complete a
+      // pending legacy-store upgrade rather than fail the logon task on a stale format.
+      await supervisor.migrateSecrets();
       Object.assign(process.env, await supervisor.runtimeEnvironment());
       supervisor.recordRuntimePid();
       await serve();
       return;
     }
+    if (action === "migrate-secrets") {
+      print(await supervisor.migrateSecrets());
+      return;
+    }
     if (!["install", "status", "start", "stop", "uninstall"].includes(action)) {
-      throw new Error("Unknown supervisor command; use install, status, start, stop, or uninstall");
+      throw new Error(
+        "Unknown supervisor command; use install, status, start, stop, uninstall, or migrate-secrets",
+      );
     }
     print(await supervisor[action]());
     return;
@@ -101,8 +111,8 @@ async function main() {
       && !process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN
       && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
       const { DpapiSecretStore } = await import("./supervisor.js");
-      const protectedEnvironment = await new DpapiSecretStore().load();
-      process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = protectedEnvironment.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+      const observer = await new DpapiSecretStore().load("observer");
+      process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
     }
     const { runMcpStdio } = await import("./mcp/server.js");
     runMcpStdio();
@@ -110,8 +120,8 @@ async function main() {
   }
   if (process.platform === "win32" && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
     const { DpapiSecretStore } = await import("./supervisor.js");
-    const protectedEnvironment = await new DpapiSecretStore().load();
-    process.env.DELEGATE_WAVE_CONTROL_TOKEN = protectedEnvironment.DELEGATE_WAVE_CONTROL_TOKEN;
+    const operator = await new DpapiSecretStore().load("operator");
+    process.env.DELEGATE_WAVE_CONTROL_TOKEN = operator.DELEGATE_WAVE_CONTROL_TOKEN;
   }
   const client = new ControlClient();
   const [resource, action] = positional;

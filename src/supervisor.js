@@ -10,12 +10,24 @@ export const SUPERVISOR_TASK_NAME = "delegate-wave-control";
 export const PROTECTED_SECRET_FILE = "control-secrets.dpapi";
 export const RUNTIME_PID_FILE = "control-api.pid";
 
-const CONTROL_SECRET_NAMES = [
+const OPERATOR_SECRET_NAMES = [
   "DELEGATE_WAVE_CONTROL_TOKEN",
-  "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN",
   "DELEGATE_WAVE_CONTROL_PRINCIPAL",
+];
+
+const OBSERVER_SECRET_NAMES = [
+  "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN",
   "DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL",
 ];
+
+// Each record is protected as its own DPAPI blob so that a process may decrypt the credential it
+// needs without ever materializing the credential it must not hold (SUP-005).
+export const SECRET_RECORDS = {
+  operator: { names: OPERATOR_SECRET_NAMES, required: "DELEGATE_WAVE_CONTROL_TOKEN" },
+  observer: { names: OBSERVER_SECRET_NAMES, required: "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN" },
+};
+
+const CONTROL_SECRET_NAMES = [...OPERATOR_SECRET_NAMES, ...OBSERVER_SECRET_NAMES];
 
 const PERSISTENT_CONTROL_NAMES = [
   ...CONTROL_SECRET_NAMES,
@@ -179,31 +191,112 @@ export class DpapiSecretStore {
     return fs.existsSync(this.path);
   }
 
-  async provision(env = process.env) {
-    requireWindows(this.platform);
-    if (!env.DELEGATE_WAVE_CONTROL_TOKEN) {
-      if (this.exists()) return { provisioned: false, path: this.path };
-      throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required to create the protected supervisor credential bundle");
+  // A legacy store is a bare DPAPI base64 blob holding every credential in one payload. The scoped
+  // format is a JSON envelope of independently protected per-role blobs.
+  isLegacyFormat() {
+    if (!this.exists()) return false;
+    const raw = fs.readFileSync(this.path, "utf8").trim();
+    if (!raw.startsWith("{")) return true;
+    try {
+      const parsed = JSON.parse(raw);
+      return !(parsed && parsed.version === 1 && parsed.records);
+    } catch {
+      return true;
     }
+  }
 
-    const values = Object.fromEntries(CONTROL_SECRET_NAMES
-      .filter((name) => env[name])
-      .map((name) => [name, env[name]]));
-    const protectedResult = await this.processRunner("powershell.exe", [
-      "-NoProfile", "-NonInteractive", "-Command", PROTECT_SCRIPT,
-    ], { env: { DELEGATE_WAVE_SECRET_PAYLOAD: JSON.stringify(values) }, timeoutMs: 30_000 });
-    if (protectedResult.exitCode !== 0 || !protectedResult.stdout.trim()) {
-      throw new Error(`Unable to protect Control API credentials: ${protectedResult.stderr.trim() || "empty DPAPI result"}`);
+  readRecords() {
+    const parsed = JSON.parse(fs.readFileSync(this.path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || parsed.version !== 1 || !parsed.records) {
+      throw new Error(`Protected supervisor credential store is malformed: ${this.path}`);
     }
+    return parsed.records;
+  }
 
+  writeStore(records) {
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     const temporary = `${this.path}.${crypto.randomUUID()}.tmp`;
     try {
-      fs.writeFileSync(temporary, `${protectedResult.stdout.trim()}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      fs.writeFileSync(temporary, `${JSON.stringify({ version: 1, records }, null, 2)}\n`, {
+        encoding: "utf8", flag: "wx", mode: 0o600,
+      });
       fs.copyFileSync(temporary, this.path);
     } finally {
       fs.rmSync(temporary, { force: true });
     }
+  }
+
+  // One-time upgrade of a legacy combined bundle. This is the ONLY code path permitted to decrypt
+  // every credential at once, so it MUST be invoked explicitly and only by a process already
+  // entitled to all roles (the supervisor). It is deliberately NOT reachable from load(), because a
+  // lazy migration inside load() would let the Hermes MCP process decrypt the operator credential —
+  // exactly the exposure the scoped format exists to prevent.
+  async migrateLegacyStore() {
+    requireWindows(this.platform);
+    if (!this.exists()) throw new Error(`Protected supervisor credential store is missing: ${this.path}`);
+    if (!this.isLegacyFormat()) return { migrated: false, path: this.path };
+
+    const blob = fs.readFileSync(this.path, "utf8").trim();
+    const result = await this.processRunner("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command", UNPROTECT_SCRIPT,
+    ], { env: { DELEGATE_WAVE_SECRET_BLOB: blob }, timeoutMs: 30_000 });
+    if (result.exitCode !== 0) {
+      throw new Error(`Unable to decrypt the legacy credential bundle: ${result.stderr.trim()}`);
+    }
+
+    let combined = JSON.parse(result.stdout.trim());
+    try {
+      if (!combined.DELEGATE_WAVE_CONTROL_TOKEN) {
+        throw new Error("Legacy credential bundle has no operator token");
+      }
+      const records = {};
+      const roles = [];
+      for (const [role, record] of Object.entries(SECRET_RECORDS)) {
+        const values = Object.fromEntries(record.names
+          .filter((name) => combined[name])
+          .map((name) => [name, combined[name]]));
+        if (!values[record.required]) continue;
+        records[role] = await this.protect(values);
+        roles.push(role);
+      }
+      // Replace only after every role re-protected successfully, so a mid-migration failure leaves
+      // the readable legacy store intact rather than a partial one.
+      this.writeStore(records);
+      return { migrated: true, path: this.path, roles };
+    } finally {
+      // Discard the combined plaintext; it must not outlive the migration.
+      for (const name of Object.keys(combined)) delete combined[name];
+      combined = null;
+    }
+  }
+
+  async protect(values) {
+    const result = await this.processRunner("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command", PROTECT_SCRIPT,
+    ], { env: { DELEGATE_WAVE_SECRET_PAYLOAD: JSON.stringify(values) }, timeoutMs: 30_000 });
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      throw new Error(`Unable to protect Control API credentials: ${result.stderr.trim() || "empty DPAPI result"}`);
+    }
+    return result.stdout.trim();
+  }
+
+  async provision(env = process.env) {
+    requireWindows(this.platform);
+    if (!env.DELEGATE_WAVE_CONTROL_TOKEN) {
+      if (this.exists()) return { provisioned: false, path: this.path };
+      throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required to create the protected supervisor credential store");
+    }
+
+    const records = {};
+    for (const [role, record] of Object.entries(SECRET_RECORDS)) {
+      const values = Object.fromEntries(record.names
+        .filter((name) => env[name])
+        .map((name) => [name, env[name]]));
+      if (!values[record.required]) continue;
+      records[role] = await this.protect(values);
+    }
+
+    this.writeStore(records);
 
     const clearResult = await this.processRunner("powershell.exe", [
       "-NoProfile", "-NonInteractive", "-Command", CLEAR_USER_ENVIRONMENT_SCRIPT,
@@ -215,18 +308,31 @@ export class DpapiSecretStore {
     return { provisioned: true, path: this.path };
   }
 
-  async load() {
+  // Decrypts exactly one role's record. A process that loads the observer credential never holds
+  // ciphertext-to-plaintext authority over the operator credential.
+  async load(role) {
     requireWindows(this.platform);
-    if (!this.exists()) throw new Error(`Protected supervisor credential bundle is missing: ${this.path}`);
-    const blob = fs.readFileSync(this.path, "utf8").trim();
+    const record = SECRET_RECORDS[role];
+    if (!record) throw new Error(`Unknown protected credential role: ${role}`);
+    if (!this.exists()) throw new Error(`Protected supervisor credential store is missing: ${this.path}`);
+    // Fail closed with an actionable directive. Migration is never performed here: this call may be
+    // running inside the Hermes MCP process, which must never decrypt the combined legacy bundle.
+    if (this.isLegacyFormat()) {
+      throw new Error(
+        `Protected credential store at ${this.path} is in the legacy combined format. `
+        + "Run 'delegate-wave supervisor migrate-secrets' as the owning user to upgrade it to scoped records.",
+      );
+    }
+    const blob = this.readRecords()[role];
+    if (!blob) throw new Error(`Protected credential store has no ${role} record`);
     const result = await this.processRunner("powershell.exe", [
       "-NoProfile", "-NonInteractive", "-Command", UNPROTECT_SCRIPT,
     ], { env: { DELEGATE_WAVE_SECRET_BLOB: blob }, timeoutMs: 30_000 });
     if (result.exitCode !== 0) {
-      throw new Error(`Unable to decrypt Control API credentials: ${result.stderr.trim()}`);
+      throw new Error(`Unable to decrypt the ${role} Control API credential: ${result.stderr.trim()}`);
     }
     const values = JSON.parse(result.stdout.trim());
-    if (!values.DELEGATE_WAVE_CONTROL_TOKEN) throw new Error("Protected credential bundle has no operator token");
+    if (!values[record.required]) throw new Error(`Protected ${role} record has no ${record.required}`);
     return values;
   }
 }
@@ -240,6 +346,7 @@ export class WindowsSupervisor {
     secretStore = new DpapiSecretStore({ platform, root }),
     processProbe = defaultProcessProbe,
     delay = defaultDelay,
+    stopTimeoutMs = 15_000,
   } = {}) {
     this.platform = platform;
     this.runner = runner;
@@ -248,6 +355,7 @@ export class WindowsSupervisor {
     this.runtimePidPath = path.join(root, "state", RUNTIME_PID_FILE);
     this.processProbe = processProbe;
     this.delay = delay;
+    this.stopTimeoutMs = stopTimeoutMs;
   }
 
   async install(options = {}) {
@@ -288,13 +396,19 @@ export class WindowsSupervisor {
     return { started: true, task_name: SUPERVISOR_TASK_NAME };
   }
 
-  async stop() {
-    requireWindows(this.platform);
+  // Disable future triggers, end the current instance, then prove the recorded runtime is gone
+  // before the caller may treat the API as stopped (SUP-010).
+  async stopSupervisedRuntime() {
     const disabled = await this.runner(["/Change", "/TN", SUPERVISOR_TASK_NAME, "/DISABLE"]);
     if (disabled.exitCode !== 0) throw taskError("disable", disabled);
     const result = await this.runner(["/End", "/TN", SUPERVISOR_TASK_NAME]);
     if (result.exitCode !== 0) throw taskError("stop", result);
     await this.waitForRuntimeExit();
+  }
+
+  async stop() {
+    requireWindows(this.platform);
+    await this.stopSupervisedRuntime();
     return { stopped: true, task_name: SUPERVISOR_TASK_NAME };
   }
 
@@ -303,7 +417,7 @@ export class WindowsSupervisor {
     fs.writeFileSync(this.runtimePidPath, `${pid}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
-  async waitForRuntimeExit({ timeoutMs = 15_000 } = {}) {
+  async waitForRuntimeExit({ timeoutMs = this.stopTimeoutMs } = {}) {
     if (!fs.existsSync(this.runtimePidPath)) return;
     const pid = Number(fs.readFileSync(this.runtimePidPath, "utf8").trim());
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Supervisor runtime PID receipt is malformed");
@@ -314,15 +428,30 @@ export class WindowsSupervisor {
     }
   }
 
+  // Explicit, operator-invoked upgrade of a legacy combined bundle to scoped records.
+  async migrateSecrets() {
+    requireWindows(this.platform);
+    return this.secretStore.migrateLegacyStore();
+  }
+
+  // The supervised API serves both principals, so it is the one process entitled to decrypt both
+  // records. Each is still unsealed by a separate scoped call.
   async runtimeEnvironment() {
     requireWindows(this.platform);
-    const values = await this.secretStore.load();
+    const values = {
+      ...await this.secretStore.load("operator"),
+      ...await this.secretStore.load("observer"),
+    };
     delete values.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
     return values;
   }
 
+  // Deleting a scheduled task does not interrupt a program already started by it, so the running
+  // API must be stopped first or uninstall would leave an unmanaged orphan holding :47321.
+  // Credentials are deliberately retained; removal is a separate purge operation (SUP-009).
   async uninstall() {
     requireWindows(this.platform);
+    await this.stopSupervisedRuntime();
     const result = await this.runner(["/Delete", "/TN", SUPERVISOR_TASK_NAME, "/F"]);
     if (result.exitCode !== 0) throw taskError("uninstall", result);
     return { uninstalled: true, task_name: SUPERVISOR_TASK_NAME };

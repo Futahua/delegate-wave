@@ -59,35 +59,184 @@ test("protected store fails closed without a credential or existing bundle", asy
   await assert.rejects(store.provision({}), /CONTROL_TOKEN is required/);
 });
 
+// Records each role's plaintext under its own ciphertext handle so a decrypt of one role can never
+// return the other role's value.
+function recordingDpapiRunner() {
+  const sealed = new Map();
+  const decrypted = [];
+  let counter = 0;
+  const processRunner = async (_command, _args, options) => {
+    if (options.env?.DELEGATE_WAVE_SECRET_PAYLOAD) {
+      const handle = `ciphertext-${++counter}`;
+      sealed.set(handle, options.env.DELEGATE_WAVE_SECRET_PAYLOAD);
+      return { exitCode: 0, stdout: handle, stderr: "" };
+    }
+    if (options.env?.DELEGATE_WAVE_SECRET_BLOB) {
+      const handle = options.env.DELEGATE_WAVE_SECRET_BLOB;
+      assert.ok(sealed.has(handle), `unknown ciphertext handle ${handle}`);
+      decrypted.push(handle);
+      return { exitCode: 0, stdout: sealed.get(handle), stderr: "" };
+    }
+    processRunner.cleared = true;
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+  processRunner.cleared = false;
+  processRunner.sealed = sealed;
+  processRunner.decrypted = decrypted;
+  return processRunner;
+}
+
 test("DPAPI store writes only ciphertext, clears persistent variables, and restores exact values", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-secret-store-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  let protectedPayload;
-  let cleared = false;
-  const processRunner = async (_command, _args, options) => {
-    if (options.env?.DELEGATE_WAVE_SECRET_PAYLOAD) {
-      protectedPayload = options.env.DELEGATE_WAVE_SECRET_PAYLOAD;
-      return { exitCode: 0, stdout: "ciphertext-only", stderr: "" };
-    }
-    if (options.env?.DELEGATE_WAVE_SECRET_BLOB) {
-      assert.equal(options.env.DELEGATE_WAVE_SECRET_BLOB, "ciphertext-only");
-      return { exitCode: 0, stdout: protectedPayload, stderr: "" };
-    }
-    cleared = true;
-    return { exitCode: 0, stdout: "", stderr: "" };
-  };
+  const processRunner = recordingDpapiRunner();
   const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
   const environment = { ...configuredEnvironment };
   await store.provision(environment);
-  assert.equal(cleared, true);
+  assert.equal(processRunner.cleared, true);
   assert.equal("DELEGATE_WAVE_CONTROL_TOKEN" in environment, false);
   const stored = fs.readFileSync(path.join(root, "config", PROTECTED_SECRET_FILE), "utf8");
-  assert.equal(stored.trim(), "ciphertext-only");
   assert.doesNotMatch(stored, /operator-secret|observer-secret|DELEGATE_WAVE/);
-  assert.deepEqual(await store.load(), {
+  assert.deepEqual(Object.keys(JSON.parse(stored).records).sort(), ["observer", "operator"]);
+  assert.deepEqual(await store.load("operator"), {
     DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak",
+  });
+  assert.deepEqual(await store.load("observer"), {
     DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer-secret-must-not-leak",
   });
+});
+
+test("each role is a separate blob, so loading one never decrypts the other", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-secret-scope-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+
+  const records = JSON.parse(fs.readFileSync(path.join(root, "config", PROTECTED_SECRET_FILE), "utf8")).records;
+  assert.notEqual(records.operator, records.observer, "roles must not share one ciphertext");
+
+  const observer = await store.load("observer");
+  assert.deepEqual(processRunner.decrypted, [records.observer]);
+  assert.equal(JSON.stringify(observer).includes("operator-secret-must-not-leak"), false);
+  assert.equal("DELEGATE_WAVE_CONTROL_TOKEN" in observer, false);
+
+  await assert.rejects(store.load("proposal"), /Unknown protected credential role/);
+});
+
+test("MCP startup unseals only the observer record and never the operator record", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-mcp-scope-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+  const operatorBlob = JSON.parse(
+    fs.readFileSync(path.join(root, "config", PROTECTED_SECRET_FILE), "utf8"),
+  ).records.operator;
+
+  // Mirrors the clean-MCP path in cli.js.
+  const environment = {};
+  const observer = await store.load("observer");
+  environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+
+  assert.equal(environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN, "observer-secret-must-not-leak");
+  assert.equal(processRunner.decrypted.includes(operatorBlob), false,
+    "the operator decrypt path must never be invoked by the MCP process");
+  assert.equal("DELEGATE_WAVE_CONTROL_TOKEN" in environment, false);
+});
+
+// Seeds a store in the pre-migration format: one DPAPI blob carrying every credential.
+function seedLegacyStore(root, processRunner, values) {
+  const handle = `ciphertext-legacy`;
+  processRunner.sealed.set(handle, JSON.stringify(values));
+  const storePath = path.join(root, "config", PROTECTED_SECRET_FILE);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  fs.writeFileSync(storePath, `${handle}\n`, "utf8");
+  return storePath;
+}
+
+const legacyValues = {
+  DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak",
+  DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer-secret-must-not-leak",
+};
+
+test("legacy combined bundle migrates to independently protected scoped records", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-migrate-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, legacyValues);
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  assert.equal(store.isLegacyFormat(), true);
+  assert.deepEqual(await store.migrateLegacyStore(), {
+    migrated: true, path: storePath, roles: ["operator", "observer"],
+  });
+  assert.equal(store.isLegacyFormat(), false);
+
+  const stored = fs.readFileSync(storePath, "utf8");
+  assert.doesNotMatch(stored, /operator-secret|observer-secret|ciphertext-legacy/);
+  const records = JSON.parse(stored).records;
+  assert.notEqual(records.operator, records.observer);
+
+  assert.deepEqual(await store.load("operator"), {
+    DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak",
+  });
+  assert.deepEqual(await store.load("observer"), {
+    DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer-secret-must-not-leak",
+  });
+});
+
+test("migration is idempotent and leaves an already-scoped store untouched", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-migrate-twice-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, legacyValues);
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  await store.migrateLegacyStore();
+  const afterFirst = fs.readFileSync(storePath, "utf8");
+  assert.deepEqual(await store.migrateLegacyStore(), { migrated: false, path: storePath });
+  assert.equal(fs.readFileSync(storePath, "utf8"), afterFirst, "a second migration must not rewrite the store");
+});
+
+test("a legacy store never migrates via load, so MCP cannot decrypt the combined bundle", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-migrate-mcp-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, legacyValues);
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  await assert.rejects(store.load("observer"), /legacy combined format[\s\S]*migrate-secrets/);
+  assert.deepEqual(processRunner.decrypted, [], "the combined bundle must never be decrypted by a load");
+  assert.equal(store.isLegacyFormat(), true, "a refused load must not mutate the store");
+  assert.match(fs.readFileSync(storePath, "utf8"), /ciphertext-legacy/);
+
+  await assert.rejects(store.load("operator"), /legacy combined format/);
+  assert.deepEqual(processRunner.decrypted, []);
+});
+
+test("a failed re-protect leaves the readable legacy store in place", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-migrate-fail-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, legacyValues);
+  const failing = async (command, args, options) => {
+    if (options.env?.DELEGATE_WAVE_SECRET_PAYLOAD) return { exitCode: 1, stdout: "", stderr: "DPAPI unavailable" };
+    return processRunner(command, args, options);
+  };
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner: failing });
+
+  await assert.rejects(store.migrateLegacyStore(), /Unable to protect/);
+  assert.equal(store.isLegacyFormat(), true);
+  assert.match(fs.readFileSync(storePath, "utf8"), /ciphertext-legacy/);
+});
+
+test("supervisor migrate-secrets is explicit and refuses outside Windows", async () => {
+  const supervisor = new WindowsSupervisor({
+    platform: "linux", env: configuredEnvironment,
+    secretStore: { migrateLegacyStore: async () => assert.fail("must not run off Windows") },
+  });
+  await assert.rejects(supervisor.migrateSecrets(), /only on Windows/);
 });
 
 test("status and lifecycle commands use only the fixed task identity", async () => {
@@ -109,9 +258,52 @@ test("status and lifecycle commands use only the fixed task identity", async () 
     ["/Run", "/TN", SUPERVISOR_TASK_NAME],
     ["/Change", "/TN", SUPERVISOR_TASK_NAME, "/DISABLE"],
     ["/End", "/TN", SUPERVISOR_TASK_NAME],
+    ["/Change", "/TN", SUPERVISOR_TASK_NAME, "/DISABLE"],
+    ["/End", "/TN", SUPERVISOR_TASK_NAME],
     ["/Delete", "/TN", SUPERVISOR_TASK_NAME, "/F"],
   ]);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("uninstall stops the supervised runtime before deleting the task", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-uninstall-orphan-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls = [];
+  let alive = true;
+  let aliveAtDelete = null;
+  const supervisor = new WindowsSupervisor({
+    platform: "win32", root, env: configuredEnvironment,
+    runner: async (args) => {
+      calls.push(args[0]);
+      if (args[0] === "/End") alive = false;
+      if (args[0] === "/Delete") aliveAtDelete = alive;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    processProbe: () => alive,
+    delay: async () => {},
+  });
+  supervisor.recordRuntimePid(47321);
+
+  assert.deepEqual(await supervisor.uninstall(), { uninstalled: true, task_name: SUPERVISOR_TASK_NAME });
+  assert.deepEqual(calls, ["/Change", "/End", "/Delete"]);
+  assert.equal(aliveAtDelete, false, "the API must be dead before the task is deleted");
+});
+
+test("uninstall refuses to delete the task while the recorded API is still alive", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-uninstall-stuck-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls = [];
+  const supervisor = new WindowsSupervisor({
+    platform: "win32", root, env: configuredEnvironment,
+    runner: async (args) => { calls.push(args[0]); return { exitCode: 0, stdout: "", stderr: "" }; },
+    processProbe: () => true,
+    delay: async () => {},
+    stopTimeoutMs: 50,
+  });
+  supervisor.recordRuntimePid(47321);
+
+  await assert.rejects(supervisor.uninstall(), /PID 47321 did not exit/);
+  assert.equal(calls.includes("/Delete"), false, "an orphan API must not be abandoned by deleting the task");
 });
 
 test("stop waits for the exact recorded runtime PID to exit", async (t) => {
@@ -138,20 +330,25 @@ test("missing task is reported without guessing lifecycle state", async () => {
   assert.deepEqual(await supervisor.status(), { installed: false, task_name: SUPERVISOR_TASK_NAME });
 });
 
-test("supervisor runtime excludes the Hermes client-only credential", async () => {
+test("supervisor runtime loads both roles by scoped record and excludes the Hermes client credential", async () => {
+  const roles = [];
   const supervisor = new WindowsSupervisor({
     platform: "win32",
     env: configuredEnvironment,
-    secretStore: { load: async () => ({
-      DELEGATE_WAVE_CONTROL_TOKEN: "operator",
-      DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer",
-      DELEGATE_WAVE_HERMES_CONTROL_TOKEN: "observer",
-    }) },
+    secretStore: { load: async (role) => {
+      roles.push(role);
+      if (role === "operator") return { DELEGATE_WAVE_CONTROL_TOKEN: "operator" };
+      return {
+        DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer",
+        DELEGATE_WAVE_HERMES_CONTROL_TOKEN: "observer",
+      };
+    } },
   });
   assert.deepEqual(await supervisor.runtimeEnvironment(), {
     DELEGATE_WAVE_CONTROL_TOKEN: "operator",
     DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer",
   });
+  assert.deepEqual(roles, ["operator", "observer"]);
 });
 
 test("supervisor fails clearly outside Windows", async () => {
