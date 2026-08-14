@@ -28,6 +28,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **ATT-006** A job MUST stop at `NEEDS_ATTENTION` after its configured attempt limit is reached.
 
+**ATT-007** Bootstrap job claim, conflict detection, epoch acquisition, attempt creation, and job transition to `RUNNING` MUST occur in one immediate transaction.
+
 ## Filesystem and Git
 
 **FS-001** Filesystem location MUST NOT determine lifecycle state or authority.
@@ -66,6 +68,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **REC-004** A dead nonterminal attempt MAY be transitioned to `ORPHANED` without consulting a model.
 
+**REC-005** Applied reconciliation MUST NOT advance the scheduler epoch if any recorded executor is alive.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
@@ -73,13 +77,14 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | AUTH-001, TRUTH-001 | `Dispatcher`, SQLite transactions | all dispatcher tests |
 | AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | configuration review; live canary pending |
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
-| ATT-004 | `acceptAttemptEvent`, `recordExecutorPid` | stale epoch test |
+| ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
+| ATT-007 | `runJob` immediate claim transaction | invalid invocation and live executor tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| REC-001–REC-004 | `doctor`, `reconcile`, PID receipt | reconciliation test |
+| REC-001–REC-005 | `doctor`, `reconcile`, PID receipt | dead and live reconciliation tests |
 
 ## Known bootstrap limitations
 

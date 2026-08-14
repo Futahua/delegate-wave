@@ -139,3 +139,81 @@ test("reconciliation orphans a dead fenced attempt without consulting a model", 
   assert.equal(service.status(job.id).attempts[0].terminal_state, "ORPHANED");
   assert.equal(service.status(job.id).job.status, "PENDING");
 });
+
+test("reconciliation refuses a live executor without advancing the epoch", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  let releaseWorker;
+  let reportStarted;
+  const workerStarted = new Promise((resolve) => { reportStarted = resolve; });
+  const workerRelease = new Promise((resolve) => { releaseWorker = resolve; });
+  const backend = new FakeBackend(async ({ worktreePath, onSpawn }) => {
+    onSpawn(process.pid);
+    reportStarted();
+    await workerRelease;
+    fs.writeFileSync(path.join(worktreePath, "live.txt"), "completed\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "finish while reconcile inspects" });
+  const run = service.runJob(job.id);
+  await workerStarted;
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  const reconciliation = await service.reconcile({ apply: true });
+  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  assert.equal(reconciliation.applied, false);
+  assert.equal(reconciliation.refused, "LIVE_EXECUTOR");
+  assert.equal(epochAfter, epochBefore);
+  releaseWorker();
+  const result = await run;
+  assert.equal(result.job.status, "READY_FOR_INTEGRATION");
+  assert.equal(result.attempts[0].terminal_state, "SUCCEEDED");
+});
+
+test("invalid job invocation does not consume a scheduler epoch", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "cancelled" });
+  service.db.prepare("UPDATE jobs SET status = 'CANCELLED' WHERE id = ?").run(job.id);
+  const before = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  await assert.rejects(service.runJob(job.id), /CANCELLED/);
+  const after = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  assert.equal(after, before);
+});
+
+test("stale validation and failure callbacks leave authoritative state unchanged", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "stale callbacks" });
+  const attemptId = "attempt-stale-callbacks";
+  const artifactDir = path.join(root, "artifacts", attemptId);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
+    backend, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?)`).run(
+    attemptId, job.id, repo, new Date().toISOString(),
+  );
+  service.db.prepare("UPDATE metadata SET value = '2' WHERE key = 'scheduler_epoch'").run();
+  await assert.rejects(service.validate(attemptId, 1, repo, artifactDir, "exit 0"), /Stale/);
+  assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM validation_runs WHERE attempt_id = ?").get(attemptId).count, 0);
+  const failureApplied = await service.failAttempt({
+    attemptId,
+    jobId: job.id,
+    epoch: 1,
+    project,
+    worktreePath: repo,
+    error: new Error("stale failure"),
+  });
+  assert.equal(failureApplied, false);
+  const state = service.status(job.id);
+  assert.equal(state.job.status, "RUNNING");
+  assert.equal(state.attempts[0].validation_state, "PENDING");
+  assert.equal(state.attempts[0].quarantined, 0);
+});
