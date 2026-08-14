@@ -21,6 +21,10 @@ import { runShell } from "./process.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
+const OVERVIEW_PROJECT_LIMIT = 20;
+const OVERVIEW_ATTENTION_LIMIT = 20;
+const OVERVIEW_SUMMARY_LIMIT = 160;
+const OVERVIEW_BYTE_LIMIT = 3 * 1024;
 
 const lifecycleActive = (alias = "") => {
   const p = alias ? `${alias}.` : "";
@@ -57,6 +61,10 @@ function normalizeFailureSignature(text) {
       .replace(/\\/g, "/")
       .slice(-8000),
   ).digest("hex");
+}
+
+function compactOverviewText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, OVERVIEW_SUMMARY_LIMIT);
 }
 
 export class Dispatcher {
@@ -131,6 +139,108 @@ export class Dispatcher {
       ORDER BY updated_at`).all();
     const unresolvedIntegrations = this.doctor().unresolved_integrations;
     return { jobs, unresolved_integrations: unresolvedIntegrations };
+  }
+
+  overview() {
+    const doctor = this.doctor();
+    const projectTotal = this.db.prepare("SELECT COUNT(*) AS count FROM projects").get().count;
+    const jobTotals = this.db.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN status = 'NEEDS_ATTENTION' THEN 1 ELSE 0 END), 0) AS needs_attention,
+      COALESCE(SUM(CASE WHEN status = 'READY_FOR_INTEGRATION' THEN 1 ELSE 0 END), 0) AS ready_for_integration
+      FROM jobs`).get();
+    const unresolvedIntegrations = doctor.unresolved_integrations.length;
+    const activeAttempts = doctor.running_attempts.length;
+    const projects = this.db.prepare(`SELECT
+        p.id,
+        p.name,
+        p.integration_branch,
+        (SELECT j.id FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_id,
+        (SELECT j.status FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_status,
+        (SELECT j.updated_at FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_updated_at,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'NEEDS_ATTENTION') AS needs_attention,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'READY_FOR_INTEGRATION') AS ready_for_integration
+      FROM projects p
+      ORDER BY (needs_attention + ready_for_integration) DESC,
+        COALESCE(latest_job_updated_at, p.created_at) DESC,
+        p.id
+      LIMIT ?`).all(OVERVIEW_PROJECT_LIMIT).map((project) => ({
+      id: project.id,
+      name: project.name,
+      integration_branch: project.integration_branch,
+      latest_job: project.latest_job_id ? {
+        id: project.latest_job_id,
+        status: project.latest_job_status,
+        updated_at: project.latest_job_updated_at,
+      } : null,
+      needs_attention: project.needs_attention,
+      ready_for_integration: project.ready_for_integration,
+    }));
+    const attention = this.db.prepare(`SELECT kind, id, project_id, project_name, status, summary, updated_at
+      FROM (
+        SELECT
+          'integration' AS kind,
+          o.id AS id,
+          p.project_id AS project_id,
+          projects.name AS project_name,
+          'UNRESOLVED_INTEGRATION' AS status,
+          'Integration operation requires deterministic reconciliation' AS summary,
+          o.created_at AS updated_at,
+          0 AS priority
+        FROM integration_operations o
+        JOIN integration_proposals p ON p.id = o.proposal_id
+        JOIN projects ON projects.id = p.project_id
+        WHERE NOT EXISTS (
+          SELECT 1 FROM integration_records r
+          WHERE r.operation_id = o.id
+            AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
+        )
+        UNION ALL
+        SELECT
+          'job' AS kind,
+          j.id AS id,
+          j.project_id AS project_id,
+          p.name AS project_name,
+          j.status AS status,
+          substr(j.goal, 1, ?) AS summary,
+          j.updated_at AS updated_at,
+          CASE WHEN j.status = 'NEEDS_ATTENTION' THEN 1 ELSE 2 END AS priority
+        FROM jobs j JOIN projects p ON p.id = j.project_id
+        WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+      )
+      ORDER BY priority, updated_at DESC, id
+      LIMIT ?`).all(OVERVIEW_SUMMARY_LIMIT, OVERVIEW_ATTENTION_LIMIT).map((item) => ({
+      ...item,
+      summary: compactOverviewText(item.summary),
+    }));
+    const totalAttention = jobTotals.needs_attention + jobTotals.ready_for_integration + unresolvedIntegrations;
+    const overview = {
+      schema_version: 1,
+      health: {
+        healthy: doctor.healthy,
+        unresolved_integrations: unresolvedIntegrations,
+        active_attempts: activeAttempts,
+        missing_repositories: doctor.missing_repositories.length,
+      },
+      totals: {
+        projects: projectTotal,
+        jobs_needing_attention: jobTotals.needs_attention,
+        jobs_ready_for_integration: jobTotals.ready_for_integration,
+      },
+      projects,
+      attention,
+      truncated: projectTotal > projects.length || totalAttention > attention.length,
+    };
+    while (Buffer.byteLength(JSON.stringify(overview), "utf8") > OVERVIEW_BYTE_LIMIT) {
+      overview.truncated = true;
+      const nonActionable = overview.projects.findLastIndex(
+        (project) => project.needs_attention === 0 && project.ready_for_integration === 0,
+      );
+      if (nonActionable >= 0) overview.projects.splice(nonActionable, 1);
+      else if (overview.attention.length) overview.attention.pop();
+      else if (overview.projects.length) overview.projects.pop();
+      else throw new Error("Overview metadata exceeds its serialized size limit");
+    }
+    return overview;
   }
 
   async runJob(jobId, { model = null } = {}) {
