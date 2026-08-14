@@ -88,7 +88,10 @@ export class OpenCodeBackend {
       "--dir", worktreePath,
       "--title", `delegate-wave ${attemptId}`,
     ];
-    if (model) args.push("--model", model);
+    // Fail closed rather than omit the flag: without --model OpenCode falls back to its own ambient
+    // default provider, which is exactly the non-deterministic behaviour this dispatcher forbids.
+    if (!model) throw new Error("OpenCodeBackend requires an explicit --model; the dispatcher must resolve one");
+    args.push("--model", model);
     if (this.attach) args.push("--attach", this.attach);
     const result = await runProcess(this.executable, args, {
       cwd: worktreePath,

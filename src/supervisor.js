@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { dataRoot } from "./paths.js";
-import { runProcess } from "./process.js";
+import { CONTROL_AUTHORITY_NAMES, runProcess } from "./process.js";
 
 export const SUPERVISOR_TASK_NAME = "delegate-wave-control";
 export const PROTECTED_SECRET_FILE = "control-secrets.dpapi";
@@ -64,12 +64,26 @@ function collectRoleRecords(source, describe) {
   return collected;
 }
 
-const CONTROL_SECRET_NAMES = [...OPERATOR_SECRET_NAMES, ...OBSERVER_SECRET_NAMES];
+// Derived from SECRET_RECORDS, never hand-maintained: a declared role must automatically be covered
+// by provisioning, persistent-environment cleanup, and child-process scrubbing. Listing these names
+// separately is how the proposal credential initially escaped the child scrubber.
+const CONTROL_SECRET_NAMES = Object.values(SECRET_RECORDS).flatMap((record) => record.names);
 
 const PERSISTENT_CONTROL_NAMES = [
   ...CONTROL_SECRET_NAMES,
   "DELEGATE_WAVE_HERMES_CONTROL_TOKEN",
 ];
+
+// Fail at import if a declared credential role is not covered by the child-process scrub. A role
+// whose credential can be inherited by executors or validation commands violates CTL-AUTH-005, and
+// the failure must be impossible to introduce silently.
+const unscrubbed = PERSISTENT_CONTROL_NAMES.filter((name) => !CONTROL_AUTHORITY_NAMES.includes(name));
+if (unscrubbed.length) {
+  throw new Error(
+    `Control credential variables are not scrubbed from child processes: ${unscrubbed.join(", ")}. `
+    + "Add them to CONTROL_AUTHORITY_NAMES in process.js.",
+  );
+}
 
 const PROTECT_SCRIPT = `
 Add-Type -AssemblyName System.Security
@@ -85,18 +99,19 @@ $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $nu
 [Text.Encoding]::UTF8.GetString($bytes)
 `;
 
-const CLEAR_USER_ENVIRONMENT_SCRIPT = `
+// Generated from the same derived list, so a newly declared role cannot be left behind in
+// HKCU\Environment as plaintext.
+function clearUserEnvironmentScript(names = PERSISTENT_CONTROL_NAMES) {
+  const quoted = names.map((name) => `  '${name}'`).join(",\n");
+  return `
 $names = @(
-  'DELEGATE_WAVE_CONTROL_TOKEN',
-  'DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN',
-  'DELEGATE_WAVE_HERMES_CONTROL_TOKEN',
-  'DELEGATE_WAVE_CONTROL_PRINCIPAL',
-  'DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL'
+${quoted}
 )
 foreach ($name in $names) {
   [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::User)
 }
 `;
+}
 
 function xml(value) {
   return String(value)
@@ -366,13 +381,57 @@ export class DpapiSecretStore {
     this.writeStore(records);
 
     const clearResult = await this.processRunner("powershell.exe", [
-      "-NoProfile", "-NonInteractive", "-Command", CLEAR_USER_ENVIRONMENT_SCRIPT,
+      "-NoProfile", "-NonInteractive", "-Command", clearUserEnvironmentScript(),
     ], { timeoutMs: 30_000 });
     if (clearResult.exitCode !== 0) {
       throw new Error(`Protected credentials were written, but persistent user-environment cleanup failed: ${clearResult.stderr.trim()}`);
     }
     for (const name of PERSISTENT_CONTROL_NAMES) delete env[name];
     return { provisioned: true, path: this.path };
+  }
+
+  // Seals one new role into an existing scoped store. Other roles are copied as ciphertext, so this
+  // never decrypts a credential it is not adding -- adding the proposal role does not expose the
+  // operator or observer secrets.
+  async addRole(role, env = process.env) {
+    requireWindows(this.platform);
+    const record = SECRET_RECORDS[role];
+    if (!record) throw new Error(`Unknown protected credential role: ${role}`);
+    if (!this.exists()) throw new Error(`Protected supervisor credential store is missing: ${this.path}`);
+    if (this.isLegacyFormat()) {
+      throw new Error(
+        `Protected credential store at ${this.path} is in the legacy combined format. `
+        + "Run 'delegate-wave supervisor migrate-secrets' before adding a role.",
+      );
+    }
+
+    const values = Object.fromEntries(record.names
+      .filter((name) => env[name])
+      .map((name) => [name, env[name]]));
+    if (!values[record.token]) throw new Error(`${record.token} is required to add the ${role} credential`);
+
+    const records = { ...this.readRecords() };
+    const already = Boolean(records[role]);
+    if (!already) {
+      records[role] = await this.protect(values);
+      // Seal first: a failed protect or write must leave the previous store intact, so cleanup only
+      // runs once the credential is durably stored.
+      this.writeStore(records);
+    }
+
+    // Clear supplied credential material on both paths. A no-op add must not leave the plaintext
+    // sitting in the caller's environment or persisted in HKCU\Environment, which is exactly the
+    // plaintext persistence the DPAPI migration removed.
+    const clearResult = await this.processRunner("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command", clearUserEnvironmentScript(record.names),
+    ], { timeoutMs: 30_000 });
+    if (clearResult.exitCode !== 0) {
+      throw new Error(
+        `The ${role} credential is stored, but persistent user-environment cleanup failed: ${clearResult.stderr.trim()}`,
+      );
+    }
+    for (const name of record.names) delete env[name];
+    return { added: !already, role, path: this.path };
   }
 
   // Decrypts exactly one role's record. A process that loads the observer credential never holds
@@ -499,6 +558,14 @@ export class WindowsSupervisor {
   async migrateSecrets() {
     requireWindows(this.platform);
     return this.secretStore.migrateLegacyStore();
+  }
+
+  // Adds one role to an existing scoped store without requiring the other roles' plaintext, which
+  // only exists inside DPAPI after provisioning. Existing records are carried across as sealed
+  // ciphertext and are never decrypted.
+  async addSecretRole(role, env = process.env) {
+    requireWindows(this.platform);
+    return this.secretStore.addRole(role, env);
   }
 
   // The supervised API serves both principals, so it is the one process entitled to decrypt both

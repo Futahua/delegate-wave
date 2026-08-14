@@ -22,6 +22,14 @@ function required(options, name) {
   if (!options[name] || options[name] === true) throw new Error(`Missing --${name}`);
   return options[name];
 }
+
+// Proposal commands name their target with --proposal, matching `integration` and `approval`.
+// --id is still accepted so existing invocations and scripts keep working.
+function proposalOption(options) {
+  const value = options.proposal || options.id;
+  if (!value || value === true) throw new Error("Missing --proposal");
+  return value;
+}
 let activeRequestId = null;
 function requestId(options) {
   activeRequestId = options["request-id"] || `req_${crypto.randomUUID()}`;
@@ -41,10 +49,11 @@ Commands:
   supervisor stop
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
-  proposal list [--project ID]   list Hermes work proposals awaiting a decision
-  proposal show --id ID
-  proposal authorize --id ID     authorize one proposal into a job (operator only)
-  proposal reject --id ID
+  supervisor add-role --role proposer   seal one new credential role into the existing store
+  proposal list [--project ID]        list Hermes work proposals awaiting a decision
+  proposal show --proposal ID
+  proposal authorize --proposal ID    authorize one proposal into a job (operator only)
+  proposal reject --proposal ID
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
@@ -102,9 +111,13 @@ async function main() {
       print(await supervisor.migrateSecrets());
       return;
     }
+    if (action === "add-role") {
+      print(await supervisor.addSecretRole(required(options, "role")));
+      return;
+    }
     if (!["install", "status", "start", "stop", "uninstall"].includes(action)) {
       throw new Error(
-        "Unknown supervisor command; use install, status, start, stop, uninstall, or migrate-secrets",
+        "Unknown supervisor command; use install, status, start, stop, uninstall, migrate-secrets, or add-role",
       );
     }
     print(await supervisor[action]());
@@ -148,14 +161,14 @@ async function main() {
     const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";
     print(await client.get(`/v1/work/proposals${query}`));
   } else if (resource === "proposal" && action === "show") {
-    print(await client.get(`/v1/work/proposals/${encodeURIComponent(required(options, "id"))}`));
+    print(await client.get(`/v1/work/proposals/${encodeURIComponent(proposalOption(options))}`));
   } else if (resource === "proposal" && action === "authorize") {
     print(await client.post(
-      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/authorize`, {}, requestId(options),
+      `/v1/work/proposals/${encodeURIComponent(proposalOption(options))}/authorize`, {}, requestId(options),
     ));
   } else if (resource === "proposal" && action === "reject") {
     print(await client.post(
-      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/reject`, {}, requestId(options),
+      `/v1/work/proposals/${encodeURIComponent(proposalOption(options))}/reject`, {}, requestId(options),
     ));
   } else if (resource === "project" && action === "add") {
     print(await client.post("/v1/projects", {

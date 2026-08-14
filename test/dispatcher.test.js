@@ -6,8 +6,10 @@ import test from "node:test";
 import { initializeDataRoot, openDatabase, SCHEMA_VERSION } from "../src/db.js";
 import { managedPaths } from "../src/paths.js";
 import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
-import { Dispatcher, isProcessAlive } from "../src/service.js";
-import { runProcess } from "../src/process.js";
+import {
+  DEFAULT_WORKER_MODEL, Dispatcher, ESCALATION_MODEL, isProcessAlive, REVIEW_MODEL,
+} from "../src/service.js";
+import { CONTROL_AUTHORITY_NAMES, runProcess, runShell } from "../src/process.js";
 
 async function command(name, args, cwd) {
   const result = await runProcess(name, args, { cwd });
@@ -111,32 +113,72 @@ test("successful worker produces a validated candidate commit", async (t) => {
   assert.match(result.attempts[0].result_commit, /^[a-f0-9]{40,64}$/);
 });
 
-test("child processes exclude the Control API authority token unless explicitly supplied", async (t) => {
-  const original = process.env.DELEGATE_WAVE_CONTROL_TOKEN;
-  const originalObserver = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
-  const originalHermes = process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
-  process.env.DELEGATE_WAVE_CONTROL_TOKEN = "must-not-inherit";
-  process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = "must-not-inherit-observer";
-  process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = "must-not-inherit-hermes";
+test("child processes exclude every Control API authority credential unless explicitly supplied", async (t) => {
+  // Drives the full declared set rather than a hand-listed subset, so a newly declared credential
+  // role cannot quietly remain inheritable (CTL-AUTH-005).
+  const saved = new Map(CONTROL_AUTHORITY_NAMES.map((name) => [name, process.env[name]]));
+  for (const name of CONTROL_AUTHORITY_NAMES) process.env[name] = `must-not-inherit-${name}`;
   t.after(() => {
-    if (original === undefined) delete process.env.DELEGATE_WAVE_CONTROL_TOKEN;
-    else process.env.DELEGATE_WAVE_CONTROL_TOKEN = original;
-    if (originalObserver === undefined) delete process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
-    else process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = originalObserver;
-    if (originalHermes === undefined) delete process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
-    else process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = originalHermes;
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
-  const script = `process.stdout.write([
-    process.env.DELEGATE_WAVE_CONTROL_TOKEN,
-    process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN,
-    process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN,
-  ].filter(Boolean).join(',') || 'absent')`;
+
+  assert.ok(CONTROL_AUTHORITY_NAMES.includes("DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN"));
+  assert.ok(CONTROL_AUTHORITY_NAMES.includes("DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL"));
+
+  const script = `process.stdout.write(${JSON.stringify(CONTROL_AUTHORITY_NAMES)}
+    .map((name) => process.env[name]).filter(Boolean).join(',') || 'absent')`;
+
+  // A generic child, as used for Git commands and Git hooks.
   const scrubbed = await runProcess(process.execPath, ["-e", script]);
   assert.equal(scrubbed.stdout, "absent");
+
+  // A validation command, which runs repository-controlled content through the shell. Probe by
+  // environment name rather than by embedding a script, so quoting cannot mask a leak.
+  const validated = await runShell(
+    "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
+    + " { 'leaked' } else { 'absent' }",
+  );
+  assert.equal(validated.stdout.trim(), "absent");
+
+  // An explicitly launched Control API client may still receive exactly the credential it requires.
   const explicit = await runProcess(process.execPath, ["-e", script], {
     env: { DELEGATE_WAVE_CONTROL_TOKEN: "explicit-test-token" },
   });
   assert.equal(explicit.stdout, "explicit-test-token");
+});
+
+test("the executor backend receives no Control authority credential", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const saved = new Map(CONTROL_AUTHORITY_NAMES.map((name) => [name, process.env[name]]));
+  for (const name of CONTROL_AUTHORITY_NAMES) process.env[name] = `must-not-inherit-${name}`;
+
+  let observed = null;
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    // Spawn through the same helper the real executor uses, and report what it inherited.
+    const probe = await runProcess(process.execPath, ["-e",
+      `process.stdout.write(${JSON.stringify(CONTROL_AUTHORITY_NAMES)}
+        .map((name) => process.env[name]).filter(Boolean).join(',') || 'absent')`]);
+    observed = probe.stdout;
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    service.close();
+    await cleanup();
+  });
+
+  const project = await service.addProject({ name: "Scrub", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  await service.runJob(job.id);
+  assert.equal(observed, "absent", "an executor child must inherit no Control authority credential");
 });
 
 test("project and job rows roll back when their event receipt fails", async (t) => {
@@ -601,4 +643,64 @@ test("a fresh database is created at the current schema version", async (t) => {
   t.after(() => { db.close(); fs.rmSync(temp, { recursive: true, force: true }); });
   assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
   assert.equal(SCHEMA_VERSION, "10");
+});
+
+test("a job without --model resolves to DeepSeek Flash and persists the resolved model", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-default-model-"));
+  const root = path.join(temp, "data");
+  const repo = path.join(temp, "repo");
+  fs.mkdirSync(repo);
+  for (const args of [["init", "-b", "main"], ["config", "user.name", "T"], ["config", "user.email", "t@e.invalid"]]) {
+    await runProcess("git", ["-C", repo, ...args]);
+  }
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  await runProcess("git", ["-C", repo, "add", "."]);
+  await runProcess("git", ["-C", repo, "commit", "-m", "initial"]);
+  await runProcess("git", ["-C", repo, "branch", "integration"]);
+  initializeDataRoot(root);
+
+  const seen = [];
+  const backend = new FakeBackend(async ({ worktreePath, model }) => {
+    seen.push(model);
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => {
+    service.close();
+    const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+    for (const worktree of listed.stdout.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter((worktree) => path.resolve(worktree) !== path.resolve(repo))) {
+      await runProcess("git", ["-C", repo, "worktree", "unlock", worktree]);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    }
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+
+  const project = await service.addProject({ name: "Routing", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+
+  assert.deepEqual(seen, [DEFAULT_WORKER_MODEL]);
+  assert.equal(DEFAULT_WORKER_MODEL, "opencode-go/deepseek-v4-flash");
+  assert.equal(result.attempts.at(-1).model, DEFAULT_WORKER_MODEL, "the resolved model must be persisted");
+});
+
+test("the OpenCode backend refuses to run without an explicit model", async () => {
+  const backend = new OpenCodeBackend({ executable: "opencode" });
+  await assert.rejects(
+    backend.run({
+      attemptId: "a1", worktreePath: ".", goal: "g", model: null,
+      artifactDir: path.join(os.tmpdir(), `dw-nomodel-${Date.now()}`), mode: "write",
+    }),
+    /requires an explicit --model/,
+  );
+});
+
+test("explicit review and escalation lanes stay distinct from the default", () => {
+  assert.equal(REVIEW_MODEL, "opencode-go/gpt-5.6-luna");
+  assert.equal(ESCALATION_MODEL, "opencode-go/deepseek-v4-pro");
+  assert.equal(new Set([DEFAULT_WORKER_MODEL, REVIEW_MODEL, ESCALATION_MODEL]).size, 3);
 });

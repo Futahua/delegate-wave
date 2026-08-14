@@ -21,6 +21,17 @@ import { runShell } from "./process.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
+
+// Deterministic default worker. OpenCode's ambient provider selection is deliberately never used:
+// under the supervised task it resolved to Google and failed on a missing provider key, which cost
+// an attempt. Routing stays explicit rather than automatic.
+//
+//   default bulk implementation and ordinary investigation -> opencode-go/deepseek-v4-flash
+//   focused review and debugging                           -> opencode-go/gpt-5.6-luna  (explicit)
+//   hard implementation escalation                         -> opencode-go/deepseek-v4-pro (explicit)
+export const DEFAULT_WORKER_MODEL = "opencode-go/deepseek-v4-flash";
+export const REVIEW_MODEL = "opencode-go/gpt-5.6-luna";
+export const ESCALATION_MODEL = "opencode-go/deepseek-v4-pro";
 const OVERVIEW_PROJECT_LIMIT = 20;
 const OVERVIEW_ATTENTION_LIMIT = 20;
 const OVERVIEW_SUMMARY_LIMIT = 160;
@@ -428,7 +439,19 @@ export class Dispatcher {
     return overview;
   }
 
+  // Deterministic worker routing. A job that names no model resolves to the default here, before the
+  // attempt row is written, so the resolved provider/model is persisted as evidence and OpenCode is
+  // always given an explicit --model. The executor's ambient default provider is never reachable.
+  resolveModel(model = null) {
+    const resolved = model || DEFAULT_WORKER_MODEL;
+    if (typeof resolved !== "string" || !resolved.includes("/")) {
+      throw new Error(`Worker model must be a provider-qualified identifier, got: ${resolved}`);
+    }
+    return resolved;
+  }
+
   async runJob(jobId, { model = null } = {}) {
+    model = this.resolveModel(model);
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
