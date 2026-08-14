@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { initializeDataRoot } from "../src/db.js";
-import { FakeBackend } from "../src/backend.js";
+import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { runProcess } from "../src/process.js";
 
@@ -216,4 +216,18 @@ test("stale validation and failure callbacks leave authoritative state unchanged
   assert.equal(state.job.status, "RUNNING");
   assert.equal(state.attempts[0].validation_state, "PENDING");
   assert.equal(state.attempts[0].quarantined, 0);
+});
+
+test("missing executables reject cleanly instead of crashing the process", async () => {
+  await assert.rejects(
+    runProcess("delegate-wave-executable-that-does-not-exist", []),
+    /ENOENT/,
+  );
+});
+
+test("Windows OpenCode launch bypasses command shims", { skip: process.platform !== "win32" }, () => {
+  const backend = new OpenCodeBackend();
+  assert.equal(backend.executable, process.execPath);
+  assert.match(backend.prefixArgs[0], /opencode-ai[\\/]bin[\\/]opencode$/);
+  assert.equal(fs.existsSync(backend.prefixArgs[0]), true);
 });
