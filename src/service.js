@@ -703,9 +703,20 @@ export class Dispatcher {
     const receipts = [];
     const captureFailures = [];
     const missingEvidence = [];
+    const unknownReceipts = [];
+    const partialReceipts = [];
+    const unpricedReceipts = [];
     for (const { id } of eligible) {
-      if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(id)) {
+      const receipt = this.db.prepare(
+        "SELECT status, reference_cost_usd FROM attempt_usage_receipts WHERE attempt_id = ?",
+      ).get(id);
+      if (receipt) {
         receipts.push(id);
+        // A receipt row is not the same as usable evidence. Each of these is durable and accounted
+        // for, but none supports a defensible cost total for the attempt it describes.
+        if (receipt.status === "UNKNOWN") unknownReceipts.push(id);
+        else if (receipt.status === "PARTIAL") partialReceipts.push(id);
+        else if (receipt.reference_cost_usd === null) unpricedReceipts.push(id);
         continue;
       }
       const failed = this.db.prepare(
@@ -720,8 +731,16 @@ export class Dispatcher {
       receipts: receipts.length,
       capture_failures: captureFailures,
       missing_evidence: missingEvidence,
+      unknown_receipts: unknownReceipts,
+      partial_receipts: partialReceipts,
+      unpriced_receipts: unpricedReceipts,
+      // Nothing vanished silently.
       accounted: missingEvidence.length === 0,
-      healthy: missingEvidence.length === 0 && captureFailures.length === 0,
+      // Every eligible attempt carries a complete, priceable receipt, so a cost-per-validated-
+      // candidate total over this dataset is defensible.
+      healthy: missingEvidence.length === 0 && captureFailures.length === 0
+        && unknownReceipts.length === 0 && partialReceipts.length === 0
+        && unpricedReceipts.length === 0,
     };
   }
 

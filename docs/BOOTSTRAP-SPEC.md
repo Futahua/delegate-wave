@@ -86,8 +86,14 @@ a durable record.
 Measurement health MUST distinguish two questions over the attempts that reached executor intent.
 A dataset is *accounted* when every such attempt has either a usage receipt or an explicit
 capture-failure record, so nothing vanished silently. A dataset is *healthy* only when every such
-attempt has an actual usage receipt. A recorded capture failure therefore leaves a dataset accounted
-but NOT healthy, because that attempt has no defensible cost.
+attempt carries a receipt that can actually support a cost total: `COMPLETE` status with a non-null
+reference cost.
+
+The existence of a receipt row is therefore not sufficient for health. A capture failure, an
+`UNKNOWN` receipt, a `PARTIAL` receipt, and a `COMPLETE` receipt the pricing basis could not price are
+each accounted for but leave the dataset unhealthy, because none yields a defensible cost for the
+attempt it describes. Coverage MUST report those categories separately so the reason is mechanical
+rather than inferred.
 
 A cost-per-validated-candidate result MUST NOT be accepted over a dataset that is not healthy.
 Attempts that never reached executor intent MUST be excluded from this coverage, since they invoked

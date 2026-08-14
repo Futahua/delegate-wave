@@ -303,3 +303,47 @@ test("duplicate step ids with conflicting usage degrade the observation", () => 
   // An identical replay stays COMPLETE.
   assert.equal(parseOpenCodeUsage([one, one].join("\n")).status, USAGE_COMPLETE);
 });
+
+test("a fractional token count in a raw artifact is malformed, not truncated", () => {
+  // Truncating 1.5 to 1 would launder malformed evidence past the finalizer, making the validation
+  // boundary true only for backend-supplied observations.
+  const usage = parseOpenCodeUsage([
+    stepFinish(tokens(1000, 50, 5, 4000), 0.0001),
+    stepFinish(tokens(1.5, 50, 5, 4000), 0.0001),
+  ].join("\n"));
+  assert.equal(usage.status, USAGE_PARTIAL);
+  assert.equal(usage.provider_steps, 1);
+  assert.equal(usage.input_tokens, 1000, "the fractional step must not contribute a truncated value");
+  assert.equal(usage.malformed_events, 1);
+});
+
+test("duplicate step ids agreeing on tokens but not cost degrade the observation", () => {
+  const withCost = (cost) => JSON.stringify({
+    type: "step_finish",
+    part: { id: "prt_same", type: "step_finish", tokens: tokens(1000, 50, 5, 4000), cost },
+  });
+  const usage = parseOpenCodeUsage([withCost(0.001), withCost(0.002)].join("\n"));
+  assert.equal(usage.status, USAGE_PARTIAL, "reported cost is part of the accounting evidence");
+  assert.equal(usage.provider_steps, 1);
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.001) < 1e-12);
+  assert.equal(usage.malformed_events, 1);
+
+  // A fully identical replay still dedupes cleanly.
+  assert.equal(parseOpenCodeUsage([withCost(0.001), withCost(0.001)].join("\n")).status, USAGE_COMPLETE);
+});
+
+test("cost provenance must name a source, not merely be non-null", () => {
+  const base = {
+    status: USAGE_COMPLETE,
+    input_tokens: 100, output_tokens: 10, reasoning_tokens: 0,
+    cache_read_tokens: 0, cache_write_tokens: 0,
+    provider_steps: 1, reported_cost_usd: 0.001, malformed_events: 0,
+  };
+  const finalize = (observation) => finalizeUsageReceipt({
+    attemptId: "a", backend: "TestBackend", model: "deepseek-v4-flash", observation,
+  });
+  assert.throws(() => finalize({ ...base, reported_cost_source: "" }), /non-empty string/);
+  assert.throws(() => finalize({ ...base, reported_cost_source: "   " }), /non-empty string/);
+  assert.throws(() => finalize({ ...base, reported_cost_source: 42 }), /non-empty string/);
+  assert.ok(finalize({ ...base, reported_cost_source: COST_SOURCE_EXECUTOR }).reported_cost_source);
+});

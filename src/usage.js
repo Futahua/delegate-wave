@@ -25,8 +25,10 @@ export const COST_SOURCE_EXECUTOR = "executor-computed";
 
 const TOKEN_DIMENSIONS = Object.freeze(["input", "output", "reasoning", "cache_read", "cache_write"]);
 
+// Integral, not merely finite: truncating a fractional count would launder malformed evidence past
+// the finalizer's validation, making WRK-010 true only for backend-supplied observations.
 function nonNegativeInteger(value) {
-  return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : null;
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 // Every expected dimension must be present and valid. A missing field is evidence of malformed or
@@ -70,12 +72,16 @@ export function parseOpenCodeUsage(text) {
     // than an ordinary replay, so they degrade the observation instead of silently keeping the first.
     const identity = step?.id ?? event?.id ?? null;
     if (identity !== null) {
+      // The signature covers every usage-relevant field, cost included: two events sharing an id
+      // but reporting different cost disagree about the accounting just as surely as differing
+      // token counts do.
+      const signature = JSON.stringify({ tokens: step?.tokens ?? null, cost: step?.cost ?? null });
       const previous = seen.get(identity);
       if (previous !== undefined) {
-        if (previous !== JSON.stringify(step?.tokens ?? null)) malformed += 1;
+        if (previous !== signature) malformed += 1;
         continue;
       }
-      seen.set(identity, JSON.stringify(step?.tokens ?? null));
+      seen.set(identity, signature);
     }
     steps.push(step);
   }
@@ -205,10 +211,15 @@ export function assertValidObservation(observed) {
     fail("malformed_events must be a non-negative integer");
   }
 
-  // Cost and its provenance are one fact: neither is meaningful without the other.
+  // Cost and its provenance are one fact: neither is meaningful without the other. Provenance must
+  // actually name a source, so an empty string or a number cannot stand in for one.
   const hasCost = observed.reported_cost_usd !== null && observed.reported_cost_usd !== undefined;
-  const hasSource = observed.reported_cost_source !== null && observed.reported_cost_source !== undefined;
+  const source = observed.reported_cost_source;
+  const hasSource = source !== null && source !== undefined;
   if (hasCost !== hasSource) fail("reported_cost_usd and reported_cost_source must agree");
+  if (hasSource && (typeof source !== "string" || !source.trim())) {
+    fail("reported_cost_source must be a non-empty string");
+  }
 }
 
 // The single place a receipt is finalized, for every backend.

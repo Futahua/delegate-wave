@@ -952,7 +952,12 @@ test("a usage capture failure is visible and breaks measurement health, not the 
 
 test("usage coverage reports an attempt with neither a receipt nor a failure record", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
-  const backend = new FakeBackend(async ({ worktreePath }) => {
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+      type: "step_finish",
+      part: { tokens: { input: 300, output: 15, reasoning: 0, cache: { read: 600, write: 0 } }, cost: 0.00003 },
+    }));
     fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
     return { exitCode: 0, stdout: "ok", stderr: "" };
   });
@@ -976,7 +981,12 @@ test("usage coverage reports an attempt with neither a receipt nor a failure rec
 
 test("coverage excludes attempts that never reached executor intent", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
-  const backend = new FakeBackend(async ({ worktreePath }) => {
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+      type: "step_finish",
+      part: { tokens: { input: 400, output: 20, reasoning: 0, cache: { read: 800, write: 0 } }, cost: 0.00004 },
+    }));
     fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
     return { exitCode: 0, stdout: "ok", stderr: "" };
   });
@@ -1000,7 +1010,7 @@ test("coverage excludes attempts that never reached executor intent", async (t) 
   assert.deepEqual(coverage.missing_evidence, []);
   assert.equal(coverage.healthy, true);
   assert.deepEqual(coverage.receipts, 1);
-  assert.ok(service.getAttemptUsage(attemptId));
+  assert.equal(service.getAttemptUsage(attemptId).status, "COMPLETE");
 });
 
 test("an invalid backend observation becomes visible missing evidence, not a corrupt receipt", async (t) => {
@@ -1033,4 +1043,42 @@ test("an invalid backend observation becomes visible missing evidence, not a cor
   const coverage = service.usageCoverage({ jobIds: [job.id] });
   assert.equal(coverage.healthy, false);
   assert.deepEqual(coverage.capture_failures, [attemptId]);
+});
+
+test("an UNKNOWN, PARTIAL, or unpriced receipt is accounted for but not healthy", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Each case is a durable receipt that cannot support a defensible cost total.
+  const cases = [
+    ["unknown", null, "opencode-go/deepseek-v4-flash", "unknown_receipts"],
+    ["partial", [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }),
+      '{"type":"step_finish","part":{"tokens":{"input":99',
+    ].join("\n"), "opencode-go/deepseek-v4-flash", "partial_receipts"],
+    // A model the pinned basis cannot price: COMPLETE usage, no reference cost.
+    ["unpriced", JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }),
+      "opencode-go/some-unpriced-model", "unpriced_receipts"],
+  ];
+
+  for (const [name, artifact, model, bucket] of cases) {
+    const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+      if (artifact !== null) {
+        fs.mkdirSync(artifactDir, { recursive: true });
+        fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), artifact);
+      }
+      fs.writeFileSync(path.join(worktreePath, `${name}.txt`), "ok\n");
+      return { exitCode: 0, stdout: "ok", stderr: "" };
+    });
+    const service = new Dispatcher({ root: path.join(root, name), backend });
+    const project = await service.addProject({ name, repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: `produce ${name}.txt` });
+    const attemptId = (await service.runJob(job.id, { model })).attempts.at(-1).id;
+
+    const coverage = service.usageCoverage({ jobIds: [job.id] });
+    assert.equal(coverage.accounted, true, `${name}: the attempt is explained`);
+    assert.equal(coverage.healthy, false, `${name}: must not support a cost total`);
+    assert.deepEqual(coverage[bucket], [attemptId], `${name}: reported in the right bucket`);
+    assert.deepEqual(coverage.missing_evidence, []);
+    service.close();
+  }
+  await cleanup();
 });
