@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  buildTaskXml, DpapiSecretStore, PROTECTED_SECRET_FILE, SUPERVISOR_TASK_NAME, WindowsSupervisor,
+  buildTaskXml, DpapiSecretStore, PROTECTED_SECRET_FILE, REQUIRED_SECRET_ROLES, SUPERVISOR_TASK_NAME,
+  WindowsSupervisor,
 } from "../src/supervisor.js";
 
 const configuredEnvironment = {
@@ -229,6 +230,64 @@ test("a failed re-protect leaves the readable legacy store in place", async (t) 
   await assert.rejects(store.migrateLegacyStore(), /Unable to protect/);
   assert.equal(store.isLegacyFormat(), true);
   assert.match(fs.readFileSync(storePath, "utf8"), /ciphertext-legacy/);
+});
+
+test("provisioning refuses to create a store missing a required role", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-partial-install-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  await assert.rejects(
+    store.provision({ DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak" }),
+    /missing required credentials: observer \(DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN\)/,
+  );
+  assert.equal(store.exists(), false, "a refused install must not leave a partial store");
+  assert.deepEqual(processRunner.sealed.size, 0, "validation must precede any DPAPI work");
+});
+
+test("an operator-only install cannot report success and then fail at supervised start", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-deferred-fail-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  const supervisor = new WindowsSupervisor({ platform: "win32", root, secretStore: store });
+
+  // The failure must surface at install, not be deferred to the next launch.
+  await assert.rejects(store.provision({ DELEGATE_WAVE_CONTROL_TOKEN: "operator-only" }), /missing required credentials/);
+  await assert.rejects(supervisor.runtimeEnvironment(), /store is missing/);
+
+  // A complete install starts cleanly.
+  await store.provision({ ...configuredEnvironment });
+  assert.deepEqual(await supervisor.runtimeEnvironment(), {
+    DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak",
+    DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN: "observer-secret-must-not-leak",
+  });
+});
+
+test("migration refuses a legacy bundle missing a required role", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-partial-migrate-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, {
+    DELEGATE_WAVE_CONTROL_TOKEN: "operator-secret-must-not-leak",
+  });
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  await assert.rejects(store.migrateLegacyStore(), /missing required credentials: observer/);
+  assert.equal(store.isLegacyFormat(), true, "a refused migration must leave the legacy store readable");
+  assert.match(fs.readFileSync(storePath, "utf8"), /ciphertext-legacy/);
+});
+
+test("the runtime loads exactly the roles declared required", async () => {
+  const loaded = [];
+  const supervisor = new WindowsSupervisor({
+    platform: "win32", env: configuredEnvironment,
+    secretStore: { load: async (role) => { loaded.push(role); return { [`TOKEN_${role}`]: role }; } },
+  });
+  await supervisor.runtimeEnvironment();
+  assert.deepEqual(loaded, REQUIRED_SECRET_ROLES);
+  assert.deepEqual(REQUIRED_SECRET_ROLES, ["operator", "observer"]);
 });
 
 test("store replacement leaves no temporary residue and never truncates the live path", async (t) => {

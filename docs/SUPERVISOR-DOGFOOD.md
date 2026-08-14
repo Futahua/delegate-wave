@@ -171,25 +171,48 @@ task enabled = true, state = running, logon and time triggers enabled
 The decryptable legacy backup taken before migration was removed once migration was verified, since
 a combined bundle is the artifact this change exists to eliminate.
 
+## Required-role validation
+
+A later review round found a robustness edge rather than an authority defect: `provision()` skipped
+any role whose token was absent, so an installation supplying only the operator credential wrote an
+operator-only store and reported success, while the supervised runtime unconditionally loaded both
+roles and failed at the next start.
+
+```text
+before: install reports provisioned = true
+        records on disk = [operator]
+        supervised start fails later: "store has no observer record"
+
+after:  install fails immediately: "missing required credentials: observer (...)"
+        store created on disk = false
+```
+
+The required set is now declared on `SECRET_RECORDS`, and both `provision()` and
+`migrateLegacyStore()` validate it before any DPAPI work, so a refused install performs no encryption
+and leaves no partial store. The runtime loads exactly the declared required roles. Adding the
+planned proposal principal extends this validation by declaring one more role.
+
+The documented setup always supplied both credentials, so no live installation was affected.
+
 ## Current-head validation
 
 There are no hosted checks, so the deterministic suite is the validation evidence and it is recorded
 against the exact head it was run on:
 
 ```text
-src/ tree       ff117f7fbee71eab5a72072b5e99af9dad3563dd
-test/ tree      2995082771380f7866b0540e6ddfa5328c8be359
+src/ tree       a2ae4f7c4497c17a4712ef874af6f6d999855c31
+test/ tree      76bfcb13ef0d86c64612d644102c774b03dc16c7
 command         npm run check
-result          83/83 pass, 0 fail, 0 skipped, 0 todo
-duration        approximately 32 s
+result          87/87 pass, 0 fail, 0 skipped, 0 todo
+duration        approximately 41 s
 ```
 
 The tree hashes identify the exact validated source; verify with `git rev-parse HEAD:src` and
 `HEAD:test`. Only documentation changed after the run, since this record is part of the same commit.
 
-That count includes the scoped-decryption, legacy-migration, non-orphaning-uninstall, and
-store-replacement regressions added after the first review round. Earlier PR text citing 72/72 or
-76/76 predates those batches and should not be used as this head's evidence.
+That count includes the scoped-decryption, legacy-migration, non-orphaning-uninstall,
+store-replacement, and required-role regressions added after the first review round. Earlier figures
+of 72/72, 76/76, and 83/83 predate those batches and should not be used as this head's evidence.
 
 Live re-verification after the store-replacement change, with the API still on PID 42664:
 

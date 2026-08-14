@@ -50,6 +50,12 @@ truncated or partially written live path. The store MUST be written to a tempora
 filesystem, flushed, and moved into place by a same-volume rename. A failed write MUST leave the
 previous store intact.
 
+**SUP-005d** The set of credential roles the supervised runtime requires MUST be declared explicitly,
+and provisioning and migration MUST validate that whole set before writing a store. An installation
+that cannot produce a startable store MUST fail at install time rather than report success and fail
+at the next supervised start. Adding a role to the declared set MUST extend that validation without
+further changes.
+
 ## Authority and recovery
 
 **SUP-006** Supervisor install, start, stop, status, and uninstall operations MUST remain explicit
@@ -87,6 +93,7 @@ same Windows user. Untrusted validation requires a separate OS identity, contain
 | SUP-005a | per-role DPAPI records; `load(role)` unseals exactly one | per-role blob isolation test; MCP-startup operator-decrypt-path test; scoped `runtimeEnvironment` test |
 | SUP-005b | explicit `migrate-secrets`; `load()` refuses a legacy bundle without decrypting | legacy migration, idempotence, fail-closed MCP load, and failed-re-protect tests; live migration dogfood |
 | SUP-005c | temporary-file write, fsync, and same-volume rename replacement | no-residue/never-truncated replacement test; failed-write preservation test |
+| SUP-005d | `SECRET_RECORDS` required flags validated before any store write | partial-install and partial-migration refusal tests; deferred-failure test; required-role runtime load test |
 | SUP-006 | CLI-only dynamic supervisor module; absent API/MCP routes | lifecycle command test and existing route allowlist tests |
 | SUP-007–009 | supervisor has no dispatcher/storage imports or cleanup actions | static implementation review; live state comparison |
 | SUP-009a | shared disable/end/PID-wait sequence runs before `/Delete` | non-orphaning uninstall test; stuck-runtime fail-closed uninstall test |

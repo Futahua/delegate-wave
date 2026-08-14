@@ -22,10 +22,38 @@ const OBSERVER_SECRET_NAMES = [
 
 // Each record is protected as its own DPAPI blob so that a process may decrypt the credential it
 // needs without ever materializing the credential it must not hold (SUP-005).
+//
+// `required: true` means the supervised runtime loads this role unconditionally, so a store without
+// it cannot start the API. Provisioning and migration validate the required set up front rather than
+// silently skipping a role and deferring the failure to the next launch. Adding a role here — a
+// proposal principal, for example — extends that validation automatically.
 export const SECRET_RECORDS = {
-  operator: { names: OPERATOR_SECRET_NAMES, required: "DELEGATE_WAVE_CONTROL_TOKEN" },
-  observer: { names: OBSERVER_SECRET_NAMES, required: "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN" },
+  operator: { names: OPERATOR_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_TOKEN", required: true },
+  observer: { names: OBSERVER_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN", required: true },
 };
+
+export const REQUIRED_SECRET_ROLES = Object.entries(SECRET_RECORDS)
+  .filter(([, record]) => record.required)
+  .map(([role]) => role);
+
+// Collects each role's values from a flat credential map, failing closed if a required role is
+// missing its token.
+function collectRoleRecords(source, describe) {
+  const collected = {};
+  const missing = [];
+  for (const [role, record] of Object.entries(SECRET_RECORDS)) {
+    const values = Object.fromEntries(record.names
+      .filter((name) => source[name])
+      .map((name) => [name, source[name]]));
+    if (!values[record.token]) {
+      if (record.required) missing.push(`${role} (${record.token})`);
+      continue;
+    }
+    collected[role] = values;
+  }
+  if (missing.length) throw new Error(`${describe} is missing required credentials: ${missing.join(", ")}`);
+  return collected;
+}
 
 const CONTROL_SECRET_NAMES = [...OPERATOR_SECRET_NAMES, ...OBSERVER_SECRET_NAMES];
 
@@ -254,16 +282,12 @@ export class DpapiSecretStore {
 
     let combined = JSON.parse(result.stdout.trim());
     try {
-      if (!combined.DELEGATE_WAVE_CONTROL_TOKEN) {
-        throw new Error("Legacy credential bundle has no operator token");
-      }
+      // A legacy bundle lacking a required role cannot produce a startable store, so refuse rather
+      // than migrate to something that fails at the next launch.
+      const collected = collectRoleRecords(combined, "Legacy credential bundle");
       const records = {};
       const roles = [];
-      for (const [role, record] of Object.entries(SECRET_RECORDS)) {
-        const values = Object.fromEntries(record.names
-          .filter((name) => combined[name])
-          .map((name) => [name, combined[name]]));
-        if (!values[record.required]) continue;
+      for (const [role, values] of Object.entries(collected)) {
         records[role] = await this.protect(values);
         roles.push(role);
       }
@@ -295,12 +319,11 @@ export class DpapiSecretStore {
       throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required to create the protected supervisor credential store");
     }
 
+    // Validate before any DPAPI work, so an under-specified install fails immediately instead of
+    // reporting success and then failing at the next supervised start.
+    const collected = collectRoleRecords(env, "Supervisor installation environment");
     const records = {};
-    for (const [role, record] of Object.entries(SECRET_RECORDS)) {
-      const values = Object.fromEntries(record.names
-        .filter((name) => env[name])
-        .map((name) => [name, env[name]]));
-      if (!values[record.required]) continue;
+    for (const [role, values] of Object.entries(collected)) {
       records[role] = await this.protect(values);
     }
 
@@ -340,7 +363,7 @@ export class DpapiSecretStore {
       throw new Error(`Unable to decrypt the ${role} Control API credential: ${result.stderr.trim()}`);
     }
     const values = JSON.parse(result.stdout.trim());
-    if (!values[record.required]) throw new Error(`Protected ${role} record has no ${record.required}`);
+    if (!values[record.token]) throw new Error(`Protected ${role} record has no ${record.token}`);
     return values;
   }
 }
@@ -446,10 +469,10 @@ export class WindowsSupervisor {
   // records. Each is still unsealed by a separate scoped call.
   async runtimeEnvironment() {
     requireWindows(this.platform);
-    const values = {
-      ...await this.secretStore.load("operator"),
-      ...await this.secretStore.load("observer"),
-    };
+    const values = {};
+    for (const role of REQUIRED_SECRET_ROLES) {
+      Object.assign(values, await this.secretStore.load(role));
+    }
     delete values.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
     return values;
   }
