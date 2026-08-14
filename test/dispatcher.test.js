@@ -73,6 +73,26 @@ test("overview is SQL-bounded, compact, and excludes detailed execution state", 
   assert.doesNotMatch(serialized, /repo_path|worktree|validation|failure_signature|artifact/);
 });
 
+test("overview health cannot be greener than doctor when a repository is missing", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const movedRepo = `${repo}-missing`;
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  await service.addProject({ name: "Missing repository", repoPath: repo, validation: [] });
+  fs.renameSync(repo, movedRepo);
+  try {
+    const doctor = service.doctor();
+    const overview = service.overview();
+    assert.equal(doctor.healthy, false);
+    assert.equal(doctor.missing_repositories.length, 1);
+    assert.equal(overview.health.healthy, false);
+    assert.equal(overview.health.missing_repositories, 1);
+    assert.doesNotMatch(JSON.stringify(overview), /repo_path|repo-missing/);
+  } finally {
+    fs.renameSync(movedRepo, repo);
+  }
+});
+
 test("successful worker produces a validated candidate commit", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const backend = new FakeBackend(async ({ worktreePath }) => {

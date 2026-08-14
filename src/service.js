@@ -142,21 +142,14 @@ export class Dispatcher {
   }
 
   overview() {
-    const integrity = this.db.prepare("PRAGMA quick_check").all().map((row) => row.quick_check);
+    const doctor = this.doctor();
     const projectTotal = this.db.prepare("SELECT COUNT(*) AS count FROM projects").get().count;
     const jobTotals = this.db.prepare(`SELECT
       COALESCE(SUM(CASE WHEN status = 'NEEDS_ATTENTION' THEN 1 ELSE 0 END), 0) AS needs_attention,
       COALESCE(SUM(CASE WHEN status = 'READY_FOR_INTEGRATION' THEN 1 ELSE 0 END), 0) AS ready_for_integration
       FROM jobs`).get();
-    const unresolvedIntegrations = this.db.prepare(`SELECT COUNT(*) AS count
-      FROM integration_operations o
-      WHERE NOT EXISTS (
-        SELECT 1 FROM integration_records r
-        WHERE r.operation_id = o.id
-          AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
-      )`).get().count;
-    const activeAttempts = this.db.prepare(`SELECT COUNT(*) AS count FROM attempts a
-      WHERE ${lifecycleActive("a")}`).get().count;
+    const unresolvedIntegrations = doctor.unresolved_integrations.length;
+    const activeAttempts = doctor.running_attempts.length;
     const projects = this.db.prepare(`SELECT
         p.id,
         p.name,
@@ -223,10 +216,10 @@ export class Dispatcher {
     const overview = {
       schema_version: 1,
       health: {
-        healthy: integrity.length === 1 && integrity[0] === "ok"
-          && unresolvedIntegrations === 0 && activeAttempts === 0,
+        healthy: doctor.healthy,
         unresolved_integrations: unresolvedIntegrations,
         active_attempts: activeAttempts,
+        missing_repositories: doctor.missing_repositories.length,
       },
       totals: {
         projects: projectTotal,

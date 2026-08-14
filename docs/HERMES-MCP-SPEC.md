@@ -37,6 +37,10 @@ receipts, failure details, or full job goals.
 **MCP-013** The overview's MCP text content MUST contain only compact totals. The complete overview
 MUST appear once in `structuredContent`, not be duplicated as JSON text.
 
+**MCP-014** Overview health MUST derive from authoritative `doctor()` health. It MUST expose only
+counts for active attempts, unresolved integrations, and missing repositories; repository paths MUST
+NOT enter the overview.
+
 ## Traceability
 
 | Rules | Enforced by | Tested by |
@@ -49,3 +53,4 @@ MUST appear once in `structuredContent`, not be duplicated as JSON text.
 | MCP-010 | bounded project-summary projection | 23-job summary test |
 | MCP-011–012 | `Dispatcher.overview` SQL projection and byte fitter | 25-project/25-attention query test |
 | MCP-013 | overview-specific MCP renderer | stdio structured-result non-duplication test |
+| MCP-014 | `doctor()`-derived overview health projection | missing-repository false-green regression |
