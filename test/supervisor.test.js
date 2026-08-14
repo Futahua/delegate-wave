@@ -231,6 +231,44 @@ test("a failed re-protect leaves the readable legacy store in place", async (t) 
   assert.match(fs.readFileSync(storePath, "utf8"), /ciphertext-legacy/);
 });
 
+test("store replacement leaves no temporary residue and never truncates the live path", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-store-atomic-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  const configDirectory = path.join(root, "config");
+
+  await store.provision({ ...configuredEnvironment });
+  const first = fs.readFileSync(store.path, "utf8");
+
+  // Replacing an existing store must succeed and must not leave a .tmp sibling behind.
+  store.writeStore({ operator: "ciphertext-replacement" });
+  assert.deepEqual(fs.readdirSync(configDirectory), [PROTECTED_SECRET_FILE]);
+  assert.equal(JSON.parse(fs.readFileSync(store.path, "utf8")).records.operator, "ciphertext-replacement");
+  assert.notEqual(fs.readFileSync(store.path, "utf8"), first);
+
+  // A store is always parseable: the live path is never observed mid-write.
+  assert.equal(JSON.parse(fs.readFileSync(store.path, "utf8")).version, 1);
+});
+
+test("a failed store write preserves the previous credential store", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-store-preserve-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  await store.provision({ ...configuredEnvironment });
+  const before = fs.readFileSync(store.path, "utf8");
+
+  const originalRename = fs.renameSync;
+  fs.renameSync = () => { throw new Error("simulated volume failure"); };
+  t.after(() => { fs.renameSync = originalRename; });
+
+  assert.throws(() => store.writeStore({ operator: "never-lands" }), /simulated volume failure/);
+  assert.equal(fs.readFileSync(store.path, "utf8"), before, "the previous store must survive a failed replacement");
+  assert.deepEqual(fs.readdirSync(path.join(root, "config")), [PROTECTED_SECRET_FILE]);
+});
+
 test("supervisor migrate-secrets is explicit and refuses outside Windows", async () => {
   const supervisor = new WindowsSupervisor({
     platform: "linux", env: configuredEnvironment,

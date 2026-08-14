@@ -45,6 +45,11 @@ supervised runtime at startup). A scoped load MUST NOT migrate implicitly: lazy 
 credential. Migration MUST re-protect each role independently, replace the store only after every
 role re-protects successfully, and discard the combined plaintext before returning.
 
+**SUP-005c** Because the protected store gates reboot recovery, writing it MUST NOT expose a
+truncated or partially written live path. The store MUST be written to a temporary file on the same
+filesystem, flushed, and moved into place by a same-volume rename. A failed write MUST leave the
+previous store intact.
+
 ## Authority and recovery
 
 **SUP-006** Supervisor install, start, stop, status, and uninstall operations MUST remain explicit
@@ -79,8 +84,12 @@ same Windows user. Untrusted validation requires a separate OS identity, contain
 |---|---|---|
 | SUP-001–003 | fixed task action and XML settings | task-definition conformance test; live restart dogfood |
 | SUP-004–005 | generated XML, DPAPI store, and user-environment cleanup | secret-free XML and DPAPI provision/load tests |
+| SUP-005a | per-role DPAPI records; `load(role)` unseals exactly one | per-role blob isolation test; MCP-startup operator-decrypt-path test; scoped `runtimeEnvironment` test |
+| SUP-005b | explicit `migrate-secrets`; `load()` refuses a legacy bundle without decrypting | legacy migration, idempotence, fail-closed MCP load, and failed-re-protect tests; live migration dogfood |
+| SUP-005c | temporary-file write, fsync, and same-volume rename replacement | no-residue/never-truncated replacement test; failed-write preservation test |
 | SUP-006 | CLI-only dynamic supervisor module; absent API/MCP routes | lifecycle command test and existing route allowlist tests |
 | SUP-007–009 | supervisor has no dispatcher/storage imports or cleanup actions | static implementation review; live state comparison |
+| SUP-009a | shared disable/end/PID-wait sequence runs before `/Delete` | non-orphaning uninstall test; stuck-runtime fail-closed uninstall test |
 | SUP-010 | disable/end and enable/run ordering plus task-process PID receipt | lifecycle/PID-wait tests and live stop/start dogfood |
 | SUP-011 | explicit documented execution-class limit | specification and operator-document review |
 

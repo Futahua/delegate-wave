@@ -95,10 +95,11 @@ A second review round found two more defects, now fixed locally:
 
 5. The scoped-record change needed a migration path for the already-provisioned legacy store.
    `supervisor migrate-secrets` decrypts the legacy bundle once inside the entitled supervisor
-   process, re-protects each role independently, replaces the store atomically, and discards the
-   combined plaintext. `supervisor run` completes a pending migration at startup so the logon task
-   cannot fail on a stale format. A scoped `load()` never migrates implicitly, which is what keeps
-   the operator credential away from the Hermes MCP process.
+   process, re-protects each role independently, replaces the store by same-volume rename, and
+   discards the combined plaintext. `supervisor run` completes a pending migration at startup so the
+   logon task cannot fail on a stale format. A scoped `load()` never migrates implicitly, which is
+   what keeps the operator credential away from the Hermes MCP process. The store is written via
+   temporary file, `fsync`, and rename, so a crash mid-write cannot truncate it (SUP-005c).
 
 The live store was migrated and the API restarted on the new code: PID 38736 stopped cleanly, PID
 42664 took over, and both the clean operator CLI and the clean Hermes MCP verified healthy against

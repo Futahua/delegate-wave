@@ -213,15 +213,23 @@ export class DpapiSecretStore {
     return parsed.records;
   }
 
+  // This file gates reboot recovery, so the live path must never be observable in a truncated or
+  // half-written state. Write to a sibling temporary on the same filesystem, flush it to disk, then
+  // replace by rename -- a same-volume rename is atomic, whereas copying over the live path would
+  // truncate it first and lose the credentials if the process died mid-write.
   writeStore(records) {
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     const temporary = `${this.path}.${crypto.randomUUID()}.tmp`;
+    let handle;
     try {
-      fs.writeFileSync(temporary, `${JSON.stringify({ version: 1, records }, null, 2)}\n`, {
-        encoding: "utf8", flag: "wx", mode: 0o600,
-      });
-      fs.copyFileSync(temporary, this.path);
+      handle = fs.openSync(temporary, "wx", 0o600);
+      fs.writeSync(handle, `${JSON.stringify({ version: 1, records }, null, 2)}\n`);
+      fs.fsyncSync(handle);
+      fs.closeSync(handle);
+      handle = undefined;
+      fs.renameSync(temporary, this.path);
     } finally {
+      if (handle !== undefined) fs.closeSync(handle);
       fs.rmSync(temporary, { force: true });
     }
   }

@@ -133,8 +133,13 @@ These two fixes are deterministic and covered by the suite; no additional model 
 The scoped-record change was initially left without a migration path, which put the live machine one
 restart away from a rejected credential store. The correct resolution is an explicit one-time
 migration: the supervisor process — already entitled to every role — decrypts the legacy bundle once,
-immediately re-protects each role independently, atomically replaces the store, and discards the
-combined plaintext. This never exposes the operator token to MCP.
+immediately re-protects each role independently, replaces the store by same-volume rename, and
+discards the combined plaintext. This never exposes the operator token to MCP.
+
+Review noted that the first version of this replacement copied over the live path, which truncates it
+before rewriting and is not the atomic swap the description claimed. Because this file gates reboot
+recovery, the store is now written to a sibling temporary, flushed with `fsync`, and moved into place
+by rename, so a crash mid-write leaves the previous store readable rather than a truncated one.
 
 `load()` deliberately does not migrate. It fails closed with a directive to run
 `supervisor migrate-secrets`, because a lazy migration inside `load()` would let the Hermes MCP
@@ -165,6 +170,36 @@ task enabled = true, state = running, logon and time triggers enabled
 
 The decryptable legacy backup taken before migration was removed once migration was verified, since
 a combined bundle is the artifact this change exists to eliminate.
+
+## Current-head validation
+
+There are no hosted checks, so the deterministic suite is the validation evidence and it is recorded
+against the exact head it was run on:
+
+```text
+src/ tree       ff117f7fbee71eab5a72072b5e99af9dad3563dd
+test/ tree      2995082771380f7866b0540e6ddfa5328c8be359
+command         npm run check
+result          83/83 pass, 0 fail, 0 skipped, 0 todo
+duration        approximately 32 s
+```
+
+The tree hashes identify the exact validated source; verify with `git rev-parse HEAD:src` and
+`HEAD:test`. Only documentation changed after the run, since this record is part of the same commit.
+
+That count includes the scoped-decryption, legacy-migration, non-orphaning-uninstall, and
+store-replacement regressions added after the first review round. Earlier PR text citing 72/72 or
+76/76 predates those batches and should not be used as this head's evidence.
+
+Live re-verification after the store-replacement change, with the API still on PID 42664:
+
+```text
+migrate-secrets on an already-scoped store -> { migrated: false }
+store bytes unchanged (sha256 prefix 47CEBB1225866CE2, 994 bytes)
+no temporary residue in the config directory
+clean operator CLI doctor healthy = true
+clean Hermes MCP get_overview = 15 projects, bounded result
+```
 
 The actual next-logon trigger remains unobserved by deliberate choice; the machine was not rebooted
 or logged off.
