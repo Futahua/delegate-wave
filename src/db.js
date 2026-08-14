@@ -10,7 +10,8 @@ import { managedPaths } from "./paths.js";
 // 12: usage receipts record cost provenance and enforce their value invariants.
 // 13: durable cancellation intents and results.
 // 14: jobs carry an enforced cost ceiling.
-export const SCHEMA_VERSION = "14";
+// 15: integration rollbacks are a first-class recorded outcome.
+export const SCHEMA_VERSION = "15";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -247,6 +248,29 @@ BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
 --   UNKNOWN   no usage receipt was observed at all
 -- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
 -- failed work appears free in cost per validated candidate.
+-- A rollback is a first-class terminal outcome, not an event footnote. Current integration state is
+-- derived from these rows, so the product cannot keep reporting a removed change as Done.
+--
+-- Recorded AFTER the branch actually moved. A crash between the compare-and-swap and this row leaves
+-- the branch moved with no receipt, which reconciliation detects and resolves.
+CREATE TABLE IF NOT EXISTS integration_rollbacks (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
+  integration_branch TEXT NOT NULL,
+  from_sha TEXT NOT NULL,
+  to_sha TEXT NOT NULL,
+  rolled_back_by TEXT NOT NULL,
+  rolled_back_origin TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_update
+BEFORE UPDATE ON integration_rollbacks
+BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_delete
+BEFORE DELETE ON integration_rollbacks
+BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
+
 CREATE TABLE IF NOT EXISTS attempt_usage_receipts (
   attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
   status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
@@ -355,6 +379,7 @@ CREATE INDEX IF NOT EXISTS idx_control_intents_created ON control_request_intent
 CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
 CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rollbacks_proposal ON integration_rollbacks(proposal_id, created_at);
 `;
 
 export function initializeDataRoot(root) {

@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { backup as sqliteBackup } from "node:sqlite";
 import { managedPaths } from "./paths.js";
 import { resolveRevision, updateRefCas, isAncestor } from "./git.js";
 
@@ -20,23 +21,45 @@ function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-// Captures the operational database plus a manifest describing what it was and where it came from.
+// Captures the operational database plus a manifest describing what it was, where it came from, and
+// crucially where every registered repository's integration branch stood at that moment.
 //
-// Uses SQLite's own backup API rather than a file copy: a copy taken while a write is in flight can
-// be torn, and a backup that cannot be trusted is worse than none.
-export function createBackup({ root, database, label = "manual" }) {
+// Uses node:sqlite's module-level backup(), which produces a consistent snapshot. A plain file copy
+// taken while a write is in flight can be torn, and a backup that cannot be trusted is worse than
+// none. An earlier version checked for a `database.backup` method, which does not exist, so it
+// silently always used the copy fallback.
+export async function createBackup({ root, database, label = "manual" }) {
   const paths = managedPaths(root);
   const directory = path.join(paths.backups, `${stamp()}-${label}`);
   fs.mkdirSync(directory, { recursive: true });
 
   const target = path.join(directory, "delegate-wave.sqlite");
-  // node:sqlite exposes a consistent backup; fall back to copying every WAL file when unavailable.
-  if (typeof database?.backup === "function") {
-    database.backup(target);
+  if (database) {
+    await sqliteBackup(database, target);
   } else {
+    // No open handle to snapshot from: copy the database and its WAL side files together, since
+    // copying only the main file can lose durably committed work.
     for (const suffix of DATABASE_FILES) {
       const source = `${paths.database}${suffix}`;
       if (fs.existsSync(source)) fs.copyFileSync(source, `${target}${suffix}`);
+    }
+  }
+
+  // Operational truth and code truth must be restorable together. A database snapshot alone can be
+  // restored on top of repositories that have moved on, which is precisely the inconsistency a
+  // recovery feature exists to prevent, so where each integration branch stood is recorded here.
+  const repositories = [];
+  if (database) {
+    const projects = database.prepare("SELECT id, name, repo_path, integration_branch FROM projects").all();
+    for (const project of projects) {
+      let head = null;
+      let error = null;
+      try {
+        head = await resolveRevision(project.repo_path, project.integration_branch);
+      } catch (failure) {
+        error = String(failure?.message ?? failure).slice(0, 200);
+      }
+      repositories.push({ ...project, integration_head: head, ...(error ? { error } : {}) });
     }
   }
 
@@ -45,6 +68,7 @@ export function createBackup({ root, database, label = "manual" }) {
     label,
     schema_version: database?.prepare?.("SELECT value FROM metadata WHERE key = 'schema_version'")?.get()?.value ?? null,
     source_database: paths.database,
+    repositories,
     files: fs.readdirSync(directory).filter((name) => name !== "manifest.json").map((name) => ({
       name,
       bytes: fs.statSync(path.join(directory, name)).size,
@@ -86,14 +110,14 @@ export function verifyBackup(backupDirectory) {
 // The database being replaced is itself backed up first, unconditionally. Restoring is the operation
 // most likely to be performed under stress, and losing the pre-restore state because the restore was
 // the wrong choice would be the worst possible outcome.
-export function restoreBackup({ root, backupDirectory, database = null }) {
+export async function restoreBackup({ root, backupDirectory, database = null, restoreRepositories = true }) {
   const verified = verifyBackup(backupDirectory);
   if (!verified.intact) {
     throw new Error(`Refusing to restore a damaged backup: ${JSON.stringify(verified.damaged)}`);
   }
   const paths = managedPaths(root);
   const safety = fs.existsSync(paths.database)
-    ? createBackup({ root, database, label: "pre-restore" })
+    ? await createBackup({ root, database, label: "pre-restore" })
     : null;
 
   // Remove the live WAL side files: leaving them beside a restored database would replay changes
@@ -107,7 +131,42 @@ export function restoreBackup({ root, backupDirectory, database = null }) {
     const suffix = file.name.replace("delegate-wave.sqlite", "");
     fs.copyFileSync(source, `${paths.database}${suffix}`);
   }
-  return { restored: backupDirectory, safety_backup: safety?.backup ?? null, files: verified.manifest.files.length };
+
+  // Operational truth is back; code truth must follow, or the restored database will describe
+  // integrations that the repositories no longer match. Each branch returns to the head recorded in
+  // the manifest, compare-and-swap against where it actually is.
+  const repositories = [];
+  for (const repository of verified.manifest.repositories ?? []) {
+    if (!restoreRepositories || !repository.integration_head) {
+      repositories.push({ ...repository, restored: false, reason: repository.integration_head ? "skipped" : "no recorded head" });
+      continue;
+    }
+    try {
+      const current = await resolveRevision(repository.repo_path, repository.integration_branch);
+      if (current === repository.integration_head) {
+        repositories.push({ ...repository, restored: false, reason: "already at the recorded head" });
+        continue;
+      }
+      await updateRefCas(
+        repository.repo_path, `refs/heads/${repository.integration_branch}`,
+        repository.integration_head, current,
+      );
+      repositories.push({ ...repository, restored: true, from: current });
+    } catch (error) {
+      // Reported rather than thrown: the database is already restored, and a repository that cannot
+      // be moved is a fact the operator must see, not a reason to leave the restore half-applied
+      // with no record of what happened.
+      repositories.push({ ...repository, restored: false, reason: String(error?.message ?? error).slice(0, 200) });
+    }
+  }
+
+  return {
+    restored: backupDirectory,
+    safety_backup: safety?.backup ?? null,
+    files: verified.manifest.files.length,
+    repositories,
+    coherent: repositories.every((entry) => entry.restored || entry.reason === "already at the recorded head"),
+  };
 }
 
 // Moves an integration branch back to a recorded commit.

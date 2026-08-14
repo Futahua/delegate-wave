@@ -163,3 +163,44 @@ test("the attempt limit still stops a job independently of cost", async (t) => {
   service.db.prepare("UPDATE jobs SET status = 'PENDING' WHERE id = ?").run(job.id);
   await assert.rejects(service.runJob(job.id), /exhausted its 2 attempts/);
 });
+
+test("a priced PARTIAL receipt cannot satisfy budget completeness", async (t) => {
+  // The finalizer prices PARTIAL observations, so a truncated receipt carries a real number. Letting
+  // that number count as complete spend would admit another attempt under a ceiling on the strength
+  // of accounting that is known to be incomplete -- the same hole UNKNOWN closes, one status along.
+  const { root, repo, cleanup } = await fixture(t);
+  const truncated = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 1000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.0001 } }),
+      '{"type":"step_finish","part":{"tokens":{"input":999',
+    ].join("\n"));
+    fs.writeFileSync(path.join(worktreePath, `out-${Date.now()}.txt`), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend: truncated });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "PartialBudget", repoPath: repo, validation: [] });
+  const job = await service.createJob({
+    projectId: project.id, goal: "partial accounting", maxAttempts: 3, maximumCost: 5.00,
+  });
+  await service.runJob(job.id, { model: "opencode-go/deepseek-v4-flash" });
+
+  const receipt = service.getAttemptUsage(service.status(job.id).attempts.at(-1).id);
+  assert.equal(receipt.status, "PARTIAL");
+  assert.ok(receipt.reference_cost_usd > 0, "the partial receipt does carry a price");
+
+  const spend = service.jobSpend(job.id);
+  assert.ok(spend.spent > 0, "what was observed still counts as spent");
+  assert.equal(spend.priced_attempts, 0, "but it is not completely measured");
+  assert.equal(spend.unpriced_attempts, 1);
+  assert.equal(spend.complete, false);
+
+  // The ceiling is nowhere near exhausted by measured spend, which is exactly the danger.
+  service.db.prepare("UPDATE jobs SET status = 'PENDING' WHERE id = ?").run(job.id);
+  await assert.rejects(
+    service.runJob(job.id, { model: "opencode-go/deepseek-v4-flash" }),
+    /unpriced usage, so spend against the 5 ceiling cannot be established/,
+  );
+});

@@ -19,7 +19,7 @@ import {
 } from "./git.js";
 import { runShell } from "./process.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
-import { createBackup, listBackups, verifyBackup, rollbackIntegration } from "./recovery.js";
+import { createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration } from "./recovery.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -862,9 +862,16 @@ export class Dispatcher {
         cost: jobCost(row.id),
       }));
 
+    // A job whose integration was rolled back is not Done: the change it describes is gone.
     const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'SUCCEEDED' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      WHERE j.status = 'SUCCEEDED'
+        AND NOT EXISTS (
+          SELECT 1 FROM integration_rollbacks rb
+          JOIN integration_proposals ip ON ip.id = rb.proposal_id
+          WHERE ip.job_id = j.id
+        )
+      ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
       .map((row) => ({
         job: row.id,
         project: row.project,
@@ -906,11 +913,14 @@ export class Dispatcher {
 
   // What actually landed, so "Done" can say what changed rather than only that something did.
   integratedFiles(jobId) {
-    const record = this.db.prepare(`SELECT r.detail FROM integration_records r
+    const record = this.db.prepare(`SELECT r.detail, r.proposal_id FROM integration_records r
       JOIN integration_proposals ip ON ip.id = r.proposal_id
       WHERE ip.job_id = ? AND r.kind = 'INTEGRATION_SUCCEEDED'
       ORDER BY r.sequence DESC LIMIT 1`).get(jobId);
-    return record ? { integrated_commit: record.detail } : null;
+    if (!record) return null;
+    const rolledBack = this.latestRollback(record.proposal_id);
+    if (rolledBack) return { rolled_back_from: record.detail, branch_now_at: rolledBack.to_sha };
+    return { integrated_commit: record.detail };
   }
 
   // --- Auto-advance -----------------------------------------------------------------------------
@@ -969,6 +979,25 @@ export class Dispatcher {
     return createBackup({ root: this.root, database: this.db, label });
   }
 
+  // Restore closes this dispatcher's database first: the live handle would keep the file open and a
+  // restored database beside a live WAL is not the database that was backed up.
+  async restore(backupDirectory, { restoreRepositories = true } = {}) {
+    const root = this.root;
+    const snapshot = verifyBackup(backupDirectory);
+    if (!snapshot.intact) {
+      throw new Error(`Refusing to restore a damaged backup: ${JSON.stringify(snapshot.damaged)}`);
+    }
+    const safety = await createBackup({ root, database: this.db, label: "pre-restore" });
+    this.db.close();
+    try {
+      const result = await restoreBackup({ root, backupDirectory, database: null, restoreRepositories });
+      return { ...result, safety_backup: safety.backup };
+    } finally {
+      // Reopen whatever is now on disk, restored or not, so the dispatcher stays usable.
+      this.db = openDatabase(this.paths.database);
+    }
+  }
+
   listBackups() {
     return listBackups(this.root);
   }
@@ -1002,11 +1031,73 @@ export class Dispatcher {
       expectedCurrentSha: succeeded.detail,
     });
 
-    recordEvent(this.db, {
-      kind: "INTEGRATION_ROLLED_BACK", entityType: "proposal", entityId: proposalId,
-      payload: { ...result, principal, origin },
+    // Recorded after the branch actually moved. A crash between the two leaves the branch moved with
+    // no receipt; reconcile() detects that and completes the record rather than leaving the product
+    // reporting a removed change as current.
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO integration_rollbacks(
+        id, proposal_id, integration_branch, from_sha, to_sha, rolled_back_by, rolled_back_origin, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        id("rollback"), proposalId, succeeded.integration_branch,
+        result.from, result.to, principal, origin, now(),
+      );
+      recordEvent(this.db, {
+        kind: "INTEGRATION_ROLLED_BACK", entityType: "proposal", entityId: proposalId,
+        payload: { ...result, principal, origin },
+      });
     });
     return result;
+  }
+
+  // The most recent rollback of a proposal, if any. Current integration state derives from this.
+  latestRollback(proposalId) {
+    return this.db.prepare(
+      "SELECT * FROM integration_rollbacks WHERE proposal_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).get(proposalId) ?? null;
+  }
+
+  // Detects a rollback whose branch move landed but whose receipt did not, by comparing the recorded
+  // integration head against where the branch actually points. Returns what it repaired.
+  async reconcileRollbacks({ apply = false } = {}) {
+    const repaired = [];
+    const succeeded = this.db.prepare(`SELECT r.proposal_id, r.detail AS integrated_sha,
+        o.expected_integration_head, o.integration_branch, ip.project_id
+      FROM integration_records r
+      JOIN integration_operations o ON o.id = r.operation_id
+      JOIN integration_proposals ip ON ip.id = r.proposal_id
+      WHERE r.kind = 'INTEGRATION_SUCCEEDED'`).all();
+
+    for (const row of succeeded) {
+      if (this.latestRollback(row.proposal_id)) continue;
+      const project = this.getProject(row.project_id);
+      if (!project || !fs.existsSync(project.repo_path)) continue;
+      let head;
+      try {
+        head = await resolveRevision(project.repo_path, row.integration_branch);
+      } catch {
+        continue;
+      }
+      // The branch sits exactly where a rollback of this integration would have left it, and no
+      // rollback was recorded: the receipt was lost between the CAS and the write.
+      if (head === row.expected_integration_head && head !== row.integrated_sha) {
+        repaired.push({ proposal_id: row.proposal_id, branch: row.integration_branch, head });
+        if (apply) {
+          transaction(this.db, () => {
+            this.db.prepare(`INSERT INTO integration_rollbacks(
+              id, proposal_id, integration_branch, from_sha, to_sha, rolled_back_by, rolled_back_origin, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'reconciliation', 'reconcile', ?)`).run(
+              id("rollback"), row.proposal_id, row.integration_branch,
+              row.integrated_sha, head, now(),
+            );
+            recordEvent(this.db, {
+              kind: "ROLLBACK_RECONCILED", entityType: "proposal", entityId: row.proposal_id,
+              payload: { branch: row.integration_branch, head, reason: "branch was rolled back without a receipt" },
+            });
+          });
+        }
+      }
+    }
+    return repaired;
   }
 
   // --- Budget -----------------------------------------------------------------------------------
@@ -1031,12 +1122,15 @@ export class Dispatcher {
     let spent = 0;
     let priced = 0;
     for (const row of rows) {
-      if (row.status !== "UNKNOWN" && row.reference_cost_usd !== null) {
-        spent += row.reference_cost_usd;
-        priced += 1;
-      }
+      // Only COMPLETE + priced counts as fully measured. The finalizer does compute a reference
+      // price for PARTIAL observations, and admitting those here would let a truncated receipt pass
+      // as complete spend -- the same "incomplete evidence treated as complete" hole that UNKNOWN
+      // already closes, one status along. Whatever was observed is still added to `spent`, because
+      // it was really consumed; it just cannot make the accounting complete.
+      if (row.reference_cost_usd !== null) spent += row.reference_cost_usd;
+      if (row.status === "COMPLETE" && row.reference_cost_usd !== null) priced += 1;
     }
-    // Every attempt that ran but produced no priceable receipt is unaccounted spend.
+    // Every attempt that ran without producing a complete priced receipt is unaccounted spend.
     const unpriced = Math.max(0, attempts - priced);
     return { spent, priced_attempts: priced, unpriced_attempts: unpriced, complete: unpriced === 0 };
   }
@@ -1088,8 +1182,12 @@ export class Dispatcher {
     if (!principal || !origin) throw new Error("Cancelling identity is required");
 
     const epoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+    // The same lifecycle-active definition doctor and reconcile use. An attempt whose executor
+    // succeeded but whose validation is still pending is running work: the job is RUNNING and a
+    // validation process may be alive, so treating it as "nothing running" would make cancel useless
+    // for exactly the phase most likely to hang.
     const active = this.db.prepare(`SELECT * FROM attempts WHERE job_id = ?
-      AND terminal_state IS NULL ORDER BY ordinal DESC LIMIT 1`).get(jobId);
+      AND ${lifecycleActive()} ORDER BY ordinal DESC LIMIT 1`).get(jobId);
 
     // Record the intent before touching any process.
     const intentId = id("cancel");
@@ -1125,20 +1223,24 @@ export class Dispatcher {
 
     // Kill the executor if one is running. A missing PID is not an error: the attempt may not have
     // spawned yet, and the loop's boundary check will still stop it.
+    // Which phase is actually running decides what to kill and what "cancelled" means afterwards.
+    const validating = active.terminal_state === "SUCCEEDED" && active.validation_state === "PENDING";
+    const targetPid = validating ? active.validation_pid : active.executor_pid;
+
     let killedPid = null;
-    if (active.executor_pid) {
+    if (targetPid) {
       // Never signal this process or its scheduler. A corrupt or misreported PID must not let a
       // cancel take down the control plane; the attempt is still marked cancelled below.
       const forbidden = [process.pid, active.scheduler_pid].filter(Boolean);
-      if (forbidden.includes(active.executor_pid)) {
+      if (forbidden.includes(targetPid)) {
         recordEvent(this.db, {
           kind: "CANCELLATION_KILL_REFUSED", entityType: "attempt", entityId: active.id, epoch,
-          payload: { intentId, pid: active.executor_pid, reason: "pid is the scheduler or this process" },
+          payload: { intentId, pid: targetPid, reason: "pid is the scheduler or this process" },
         });
       } else {
         try {
-          process.kill(active.executor_pid);
-          killedPid = active.executor_pid;
+          process.kill(targetPid);
+          killedPid = targetPid;
         } catch (error) {
           if (error.code !== "ESRCH") throw error;
         }
@@ -1152,14 +1254,27 @@ export class Dispatcher {
       const current = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(active.id);
       const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
       if (!current || current.scheduler_epoch !== epoch || currentEpoch !== epoch) return false;
-      if (current.terminal_state !== null) return false;
-      this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
-        executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
-        WHERE id = ?`).run(now(), active.id);
+
+      const stillValidating = current.terminal_state === "SUCCEEDED" && current.validation_state === "PENDING";
+      if (current.terminal_state !== null && !stillValidating) return false;
+
+      if (stillValidating) {
+        // The executor really did succeed, and validation was interrupted rather than failed. Marking
+        // it FAILED would claim the candidate was tested and rejected, which is not what happened.
+        // The candidate stays quarantined because it was never validated.
+        this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN',
+          validation_intent_id = NULL, validation_pid = NULL,
+          failure_signature = 'cancelled-during-validation', quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(active.id);
+      } else {
+        this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
+          executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(now(), active.id);
+      }
       this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, {
         kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: active.id, epoch,
-        payload: { intentId, killedPid },
+        payload: { intentId, killedPid, phase: stillValidating ? "validation" : "executor" },
       });
       return true;
     });
@@ -1549,7 +1664,14 @@ export class Dispatcher {
     if (!storedProposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
     const records = this.db.prepare("SELECT * FROM integration_records WHERE proposal_id = ? ORDER BY sequence").all(proposalId);
     const integrated = records.find((record) => record.kind === "PROPOSAL_INTEGRATED");
-    const proposal = { ...storedProposal, state: integrated ? "INTEGRATED" : storedProposal.state };
+    // A rollback is the later fact: an integration that was undone is no longer current, and
+    // reporting it as INTEGRATED would describe a change the repository no longer contains.
+    const rolledBack = this.latestRollback(proposalId);
+    const proposal = {
+      ...storedProposal,
+      state: rolledBack ? "ROLLED_BACK" : (integrated ? "INTEGRATED" : storedProposal.state),
+      ...(rolledBack ? { rolled_back: rolledBack } : {}),
+    };
     const storedApprovals = this.db.prepare(
       "SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at",
     ).all(proposalId);
@@ -1722,7 +1844,10 @@ export class Dispatcher {
         action: attempt.terminal_state === "SUCCEEDED" ? "VALIDATION_INTERRUPTED" : "ORPHANED",
       });
     }
-    return { applied: true, scheduler_epoch: epoch, observations, results: applied };
+    // A rollback whose branch move landed but whose receipt did not leaves the product reporting a
+    // removed change as current, so reconciliation completes that record too.
+    const rollbacks = await this.reconcileRollbacks({ apply });
+    return { applied: true, scheduler_epoch: epoch, observations, results: applied, rollbacks };
   }
 }
 

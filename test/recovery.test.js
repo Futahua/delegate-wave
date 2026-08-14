@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { initializeDataRoot } from "../src/db.js";
+import { initializeDataRoot, SCHEMA_VERSION } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { runProcess } from "../src/process.js";
@@ -62,11 +62,11 @@ test("a backup is checksummed, listable, and verifiable", async (t) => {
   t.after(async () => { service.close(); await cleanup(); });
 
   await service.addProject({ name: "Backup", repoPath: repo, validation: [] });
-  const created = service.backup("test");
+  const created = await service.backup("test");
 
   assert.ok(fs.existsSync(path.join(created.backup, "manifest.json")));
   assert.ok(created.files.length >= 1, "the database is captured");
-  assert.equal(created.schema_version, "14");
+  assert.equal(created.schema_version, SCHEMA_VERSION);
   assert.ok(created.files.every((file) => /^[a-f0-9]{64}$/.test(file.sha256)));
 
   const listed = service.listBackups();
@@ -81,7 +81,7 @@ test("a damaged backup is detected and refused for restore", async (t) => {
   t.after(async () => { service.close(); await cleanup(); });
 
   await service.addProject({ name: "Damaged", repoPath: repo, validation: [] });
-  const created = service.backup("damaged");
+  const created = await service.backup("damaged");
   const target = path.join(created.backup, created.files[0].name);
   fs.appendFileSync(target, "corruption");
 
@@ -90,8 +90,10 @@ test("a damaged backup is detected and refused for restore", async (t) => {
   assert.equal(verified.damaged[0].reason, "checksum mismatch");
 
   const { restoreBackup } = await import("../src/recovery.js");
-  assert.throws(() => restoreBackup({ root, backupDirectory: created.backup, database: service.db }),
-    /Refusing to restore a damaged backup/);
+  await assert.rejects(
+    () => restoreBackup({ root, backupDirectory: created.backup, database: service.db }),
+    /Refusing to restore a damaged backup/,
+  );
 });
 
 test("restoring recovers lost state and preserves what it replaced", async (t) => {
@@ -101,7 +103,7 @@ test("restoring recovers lost state and preserves what it replaced", async (t) =
 
   const project = await service.addProject({ name: "Restore", repoPath: repo, validation: [] });
   const job = await service.createJob({ projectId: project.id, goal: "before backup" });
-  const created = service.backup("before-loss");
+  const created = await service.backup("before-loss");
 
   // Work happens after the backup, then the database is lost.
   const later = await service.createJob({ projectId: project.id, goal: "after backup" });
@@ -109,7 +111,7 @@ test("restoring recovers lost state and preserves what it replaced", async (t) =
   service.close();
 
   const { restoreBackup } = await import("../src/recovery.js");
-  const restored = restoreBackup({ root, backupDirectory: created.backup });
+  const restored = await restoreBackup({ root, backupDirectory: created.backup });
   assert.ok(restored.safety_backup, "the replaced database is captured before being overwritten");
 
   service = new Dispatcher({ root, backend: writer("out.txt") });
@@ -202,4 +204,128 @@ test("rollback refuses a target that is not an ancestor", async (t) => {
     rollbackIntegration({ repoPath: repo, branch: "integration", toSha: unrelated }),
     /is not an ancestor of/,
   );
+});
+
+test("a backup records where every repository's integration branch stood", async (t) => {
+  // A database snapshot alone can be restored on top of repositories that moved on, which is exactly
+  // the incoherence a recovery feature must prevent.
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  await service.addProject({ name: "Coherent", repoPath: repo, branch: "integration", validation: [] });
+  const head = await command("git", ["-C", repo, "rev-parse", "integration"], repo);
+  const created = await service.backup("with-repos");
+
+  assert.equal(created.repositories.length, 1);
+  assert.equal(created.repositories[0].integration_branch, "integration");
+  assert.equal(created.repositories[0].integration_head, head);
+});
+
+test("restore returns the database and the integration branch together", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  t.after(async () => { try { service.close(); } catch { /* closed */ } await cleanup(); });
+
+  const project = await service.addProject({ name: "Together", repoPath: repo, branch: "integration", validation: [] });
+  const snapshotHead = await command("git", ["-C", repo, "rev-parse", "integration"], repo);
+  const created = await service.backup("before-integration");
+
+  // Real work lands after the snapshot: both the database and the branch move on.
+  const job = await service.createJob({ projectId: project.id, goal: "produce candidate.txt" });
+  await service.runJob(job.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+  assert.notEqual(await command("git", ["-C", repo, "rev-parse", "integration"], repo), snapshotHead);
+  assert.equal(service.listJobs().length, 1);
+
+  const restored = await service.restore(created.backup);
+  assert.equal(restored.coherent, true, "the restore is coherent across both truths");
+  assert.equal(restored.repositories[0].restored, true);
+  assert.ok(restored.safety_backup, "the replaced state is preserved");
+
+  // Operational truth and code truth both returned to the snapshot.
+  assert.equal(service.listJobs().length, 0, "the restored database predates the job");
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"], repo), snapshotHead,
+    "the integration branch returned with it");
+  assert.equal(service.doctor().healthy, true);
+});
+
+test("restore can be limited to the database when the repositories must not move", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  t.after(async () => { try { service.close(); } catch { /* closed */ } await cleanup(); });
+
+  const project = await service.addProject({ name: "DbOnly", repoPath: repo, branch: "integration", validation: [] });
+  const created = await service.backup("db-only");
+  const job = await service.createJob({ projectId: project.id, goal: "produce candidate.txt" });
+  await service.runJob(job.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+  const moved = await command("git", ["-C", repo, "rev-parse", "integration"], repo);
+
+  const restored = await service.restore(created.backup, { restoreRepositories: false });
+  assert.equal(restored.coherent, false, "a database-only restore is explicitly not coherent");
+  assert.equal(restored.repositories[0].reason, "skipped");
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"], repo), moved,
+    "the branch was deliberately left where it was");
+});
+
+test("after a rollback the product stops reporting the change as done", async (t) => {
+  // The defect this covers: rollback moved Git but left integrationStatus and the briefing saying
+  // INTEGRATED, so Hermes would describe a removed change as current.
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Truthful", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce candidate.txt" });
+  await service.runJob(job.id, { model: "opencode-go/deepseek-v4-flash" });
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+
+  assert.equal(service.integrationStatus(proposal.id).proposal.state, "INTEGRATED");
+  assert.equal(service.briefing().done.length, 1, "before rollback it is Done");
+
+  await service.rollbackIntegration({ proposalId: proposal.id, principal: "john", origin: "local-cli" });
+
+  const after = service.integrationStatus(proposal.id);
+  assert.equal(after.proposal.state, "ROLLED_BACK", "the current state reflects the rollback");
+  assert.ok(after.proposal.rolled_back, "the rollback is attached as evidence");
+  assert.deepEqual(service.briefing().done, [], "the removed change is no longer reported as Done");
+});
+
+test("a rollback whose receipt was lost is completed by reconciliation", async (t) => {
+  // Fault injection: the branch compare-and-swap lands, then the process dies before the receipt is
+  // written. Without repair the product would keep calling the removed change current.
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "CrashedRollback", repoPath: repo, branch: "integration", validation: [] });
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"], repo);
+  const job = await service.createJob({ projectId: project.id, goal: "produce candidate.txt" });
+  await service.runJob(job.id, { model: "opencode-go/deepseek-v4-flash" });
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+
+  // The branch moves back, exactly as rollback would leave it, with no receipt written.
+  await command("git", ["-C", repo, "branch", "-f", "integration", before], repo);
+  assert.equal(service.latestRollback(proposal.id), null, "no receipt exists yet");
+  assert.equal(service.integrationStatus(proposal.id).proposal.state, "INTEGRATED",
+    "before reconciliation the record still claims it is integrated");
+
+  const observed = await service.reconcileRollbacks({ apply: false });
+  assert.equal(observed.length, 1, "reconciliation observes the discrepancy without applying");
+  assert.equal(service.latestRollback(proposal.id), null, "a dry run changes nothing");
+
+  const repaired = await service.reconcileRollbacks({ apply: true });
+  assert.equal(repaired.length, 1);
+  assert.ok(service.latestRollback(proposal.id), "the receipt is completed");
+  assert.equal(service.integrationStatus(proposal.id).proposal.state, "ROLLED_BACK");
+  assert.deepEqual(service.briefing().done, []);
 });

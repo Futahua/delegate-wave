@@ -296,13 +296,13 @@ test("gauntlet 14: backup and restore recover a lost database", async (t) => {
   const { root, repo, service } = await fixture(t, producer());
   const project = await service.addProject({ name: "Recover", repoPath: repo, branch: "integration", validation: [] });
   const kept = await service.createJob({ projectId: project.id, goal: "before the backup" });
-  const backup = service.backup("gauntlet");
+  const backup = await service.backup("gauntlet");
   await service.createJob({ projectId: project.id, goal: "after the backup" });
   assert.equal(service.listJobs().length, 2);
   service.close();
 
   const { restoreBackup } = await import("../src/recovery.js");
-  const restored = restoreBackup({ root, backupDirectory: backup.backup });
+  const restored = await restoreBackup({ root, backupDirectory: backup.backup });
   assert.ok(restored.safety_backup, "the replaced database is preserved");
 
   // Closed here rather than in an after-hook: hooks run last-registered-first, so leaving this open

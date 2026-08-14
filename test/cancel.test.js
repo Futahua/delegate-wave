@@ -210,3 +210,74 @@ test("cancellation refuses to signal the scheduler or the calling process", asyn
   ).get();
   assert.ok(refused, "the refusal is recorded rather than silent");
 });
+
+test("cancel works during validation, not only during the executor phase", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  let dispatcher;
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    usageArtifact(artifactDir);
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  dispatcher = new Dispatcher({ root, backend });
+  t.after(async () => { dispatcher.close(); await cleanup(); });
+
+  // A validation command that blocks. During it the executor is already SUCCEEDED and the job is
+  // RUNNING, which is exactly the state the old cancel treated as "nothing running".
+  const project = await dispatcher.addProject({
+    name: "CancelValidation", repoPath: repo,
+    validation: [`"${process.execPath}" -e "setTimeout(()=>{},60000)"`],
+  });
+  const job = await dispatcher.createJob({ projectId: project.id, goal: "blocked validation", maxAttempts: 1 });
+
+  // Cancel once validation is genuinely in flight.
+  const cancelling = (async () => {
+    for (let i = 0; i < 200; i += 1) {
+      const attempt = dispatcher.db.prepare(
+        "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+      ).get(job.id);
+      if (attempt?.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING" && attempt.validation_pid) {
+        return dispatcher.cancelJob({ jobId: job.id, principal: "john", origin: "local-cli" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("validation never reached a cancellable state");
+  })();
+
+  const [, outcome] = await Promise.all([
+    dispatcher.runJob(job.id).catch(() => null),
+    cancelling,
+  ]);
+
+  assert.equal(outcome.outcome, "CANCELLED", "cancel must work during validation");
+  assert.ok(outcome.killed_pid, "the validation process was killed");
+  const attempt = dispatcher.status(job.id).attempts.at(-1);
+  assert.equal(attempt.terminal_state, "SUCCEEDED", "the executor really did succeed");
+  assert.notEqual(attempt.validation_state, "PASSED", "an interrupted validation never passed");
+  assert.notEqual(attempt.validation_state, "FAILED",
+    "and it was not tested and rejected either: cancelled is not failed");
+  assert.equal(attempt.quarantined, 1, "an unvalidated candidate stays quarantined");
+  assert.equal(dispatcher.getJob(job.id).status, "CANCELLED");
+});
+
+test("a stale validation callback cannot mutate a cancelled attempt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    usageArtifact(artifactDir);
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const dispatcher = new Dispatcher({ root, backend });
+  t.after(async () => { dispatcher.close(); await cleanup(); });
+
+  const project = await dispatcher.addProject({ name: "StaleValidation", repoPath: repo, validation: [] });
+  const job = await dispatcher.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await dispatcher.runJob(job.id);
+  const attempt = result.attempts.at(-1);
+
+  // A validation callback arriving after the attempt is no longer awaiting validation is refused.
+  assert.throws(
+    () => dispatcher.recordValidationPid(attempt.id, attempt.scheduler_epoch, "stale-intent", 4242),
+    /Stale or terminal attempt event rejected|Stale validation start rejected/,
+  );
+});
