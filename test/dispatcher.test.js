@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { initializeDataRoot } from "../src/db.js";
+import { initializeDataRoot, openDatabase, SCHEMA_VERSION } from "../src/db.js";
+import { managedPaths } from "../src/paths.js";
 import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
 import { Dispatcher, isProcessAlive } from "../src/service.js";
 import { runProcess } from "../src/process.js";
@@ -551,4 +552,53 @@ test("reconciliation fails closed for durable validation intent without a PID re
   assert.equal(result.refused, "UNCERTAIN_VALIDATION_START");
   assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
   assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
+});
+
+test("a schema 9 database migrates to 10 with the work proposal objects", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-schema-9-"));
+  const root = path.join(temp, "data");
+  initializeDataRoot(root);
+  const file = managedPaths(root).database;
+
+  // Rewind to a pre-PR9 database: drop the new objects and re-stamp the old version.
+  const seed = openDatabase(file);
+  seed.exec(`
+    DROP TRIGGER IF EXISTS trg_work_proposals_immutable_update;
+    DROP TRIGGER IF EXISTS trg_work_proposals_immutable_delete;
+    DROP TRIGGER IF EXISTS trg_work_decisions_immutable_update;
+    DROP TRIGGER IF EXISTS trg_work_decisions_immutable_delete;
+    DROP INDEX IF EXISTS idx_work_proposals_project;
+    DROP INDEX IF EXISTS idx_work_decisions_job;
+    DROP TABLE IF EXISTS work_proposal_decisions;
+    DROP TABLE IF EXISTS work_proposals;
+  `);
+  seed.prepare("UPDATE metadata SET value = '9' WHERE key = 'schema_version'").run();
+  assert.equal(seed.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, "9");
+  seed.close();
+
+  const upgraded = openDatabase(file);
+  t.after(() => { upgraded.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  assert.equal(upgraded.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, "10");
+
+  const names = (type) => upgraded.prepare("SELECT name FROM sqlite_master WHERE type = ?").all(type)
+    .map((row) => row.name);
+  assert.ok(names("table").includes("work_proposals"));
+  assert.ok(names("table").includes("work_proposal_decisions"));
+  for (const trigger of [
+    "trg_work_proposals_immutable_update", "trg_work_proposals_immutable_delete",
+    "trg_work_decisions_immutable_update", "trg_work_decisions_immutable_delete",
+  ]) assert.ok(names("trigger").includes(trigger), `missing trigger ${trigger}`);
+  for (const index of ["idx_work_proposals_project", "idx_work_decisions_job"]) {
+    assert.ok(names("index").includes(index), `missing index ${index}`);
+  }
+});
+
+test("a fresh database is created at the current schema version", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-schema-fresh-"));
+  const root = path.join(temp, "data");
+  initializeDataRoot(root);
+  const db = openDatabase(managedPaths(root).database);
+  t.after(() => { db.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
+  assert.equal(SCHEMA_VERSION, "10");
 });

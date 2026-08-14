@@ -20,6 +20,11 @@ const OBSERVER_SECRET_NAMES = [
   "DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL",
 ];
 
+const PROPOSER_SECRET_NAMES = [
+  "DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN",
+  "DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL",
+];
+
 // Each record is protected as its own DPAPI blob so that a process may decrypt the credential it
 // needs without ever materializing the credential it must not hold (SUP-005).
 //
@@ -30,6 +35,10 @@ const OBSERVER_SECRET_NAMES = [
 export const SECRET_RECORDS = {
   operator: { names: OPERATOR_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_TOKEN", required: true },
   observer: { names: OBSERVER_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN", required: true },
+  // Staged deliberately as optional: existing installations were provisioned before this role
+  // existed and must keep validating. Flipping this to `required: true` once installs provision a
+  // proposal credential is an explicit cutover, not something "optional" silently becomes.
+  proposer: { names: PROPOSER_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN", required: false },
 };
 
 export const REQUIRED_SECRET_ROLES = Object.entries(SECRET_RECORDS)
@@ -319,6 +328,12 @@ export class DpapiSecretStore {
     return REQUIRED_SECRET_ROLES.filter((role) => !records[role]);
   }
 
+  // Structural presence check for an optional role; never decrypts.
+  hasRecord(role) {
+    if (!this.exists() || this.isLegacyFormat()) return false;
+    return Boolean(this.readRecords()[role]);
+  }
+
   async provision(env = process.env) {
     requireWindows(this.platform);
     if (!env.DELEGATE_WAVE_CONTROL_TOKEN) {
@@ -491,7 +506,10 @@ export class WindowsSupervisor {
   async runtimeEnvironment() {
     requireWindows(this.platform);
     const values = {};
-    for (const role of REQUIRED_SECRET_ROLES) {
+    for (const role of Object.keys(SECRET_RECORDS)) {
+      // Required roles must load; optional ones are used when the store actually carries them, so a
+      // pre-existing installation keeps starting without a proposal credential.
+      if (!SECRET_RECORDS[role].required && !this.secretStore.hasRecord?.(role)) continue;
       Object.assign(values, await this.secretStore.load(role));
     }
     delete values.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;

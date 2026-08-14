@@ -3,6 +3,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { managedPaths } from "./paths.js";
 
+// Bump whenever the normative durable schema changes, so a database cannot advertise a version that
+// does not describe its actual objects. Single constant: creation and migration must never drift.
+// 10: work_proposals and work_proposal_decisions, with their immutability triggers and indexes.
+export const SCHEMA_VERSION = "10";
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
@@ -157,6 +162,48 @@ CREATE TABLE IF NOT EXISTS control_request_results (
   created_at TEXT NOT NULL
 );
 
+-- Bounded work proposed in ordinary language by a non-operator principal. A proposal is a request,
+-- never authority: only an operator-authorized transition turns one into a job.
+CREATE TABLE IF NOT EXISTS work_proposals (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  goal TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+  action_digest TEXT NOT NULL,
+  expected_state_version TEXT,
+  maximum_cost REAL,
+  expires_at TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  origin_principal TEXT NOT NULL,
+  origin_channel TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- Terminal decisions on a work proposal. Separate table so proposals stay immutable and every
+-- decision keeps its own authorizing identity.
+CREATE TABLE IF NOT EXISTS work_proposal_decisions (
+  proposal_id TEXT PRIMARY KEY REFERENCES work_proposals(id),
+  decision TEXT NOT NULL CHECK (decision IN ('AUTHORIZED', 'REJECTED')),
+  job_id TEXT REFERENCES jobs(id),
+  decided_by TEXT NOT NULL,
+  decided_origin TEXT NOT NULL,
+  action_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
+BEFORE UPDATE ON work_proposals
+BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_delete
+BEFORE DELETE ON work_proposals
+BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_work_decisions_immutable_update
+BEFORE UPDATE ON work_proposal_decisions
+BEGIN SELECT RAISE(ABORT, 'work_proposal_decisions is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_work_decisions_immutable_delete
+BEFORE DELETE ON work_proposal_decisions
+BEGIN SELECT RAISE(ABORT, 'work_proposal_decisions is immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS trg_proposals_immutable_update
 BEFORE UPDATE ON integration_proposals
 BEGIN SELECT RAISE(ABORT, 'integration_proposals is immutable'); END;
@@ -203,6 +250,8 @@ CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_
 CREATE INDEX IF NOT EXISTS idx_ops_proposal ON integration_operations(proposal_id, state);
 CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_control_intents_created ON control_request_intents(created_at);
+CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
 `;
 
 export function initializeDataRoot(root) {
@@ -235,7 +284,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '9')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)").run(SCHEMA_VERSION);
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -287,7 +336,7 @@ function migrate(db) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
-  db.prepare("UPDATE metadata SET value = '9' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE metadata SET value = ? WHERE key = 'schema_version'").run(SCHEMA_VERSION);
 }
 
 export function transaction(db, action) {

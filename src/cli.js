@@ -41,6 +41,10 @@ Commands:
   supervisor stop
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
+  proposal list [--project ID]   list Hermes work proposals awaiting a decision
+  proposal show --id ID
+  proposal authorize --id ID     authorize one proposal into a job (operator only)
+  proposal reject --id ID
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
@@ -111,8 +115,17 @@ async function main() {
       && !process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN
       && !process.env.DELEGATE_WAVE_CONTROL_TOKEN) {
       const { DpapiSecretStore } = await import("./supervisor.js");
-      const observer = await new DpapiSecretStore().load("observer");
-      process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+      const store = new DpapiSecretStore();
+      // Cutover by record presence: once a proposal credential is deliberately provisioned, Hermes
+      // gains read + propose. Until then it stays read-only. Exactly one record is ever decrypted,
+      // and the operator record is never among them.
+      if (store.hasRecord("proposer")) {
+        const proposer = await store.load("proposer");
+        process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = proposer.DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN;
+      } else {
+        const observer = await store.load("observer");
+        process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = observer.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+      }
     }
     const { runMcpStdio } = await import("./mcp/server.js");
     runMcpStdio();
@@ -131,6 +144,19 @@ async function main() {
     print(await client.get("/v1/attention"));
   } else if (resource === "reconcile") {
     print(await client.post("/v1/reconcile", { apply: options.apply === true }, requestId(options)));
+  } else if (resource === "proposal" && action === "list") {
+    const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";
+    print(await client.get(`/v1/work/proposals${query}`));
+  } else if (resource === "proposal" && action === "show") {
+    print(await client.get(`/v1/work/proposals/${encodeURIComponent(required(options, "id"))}`));
+  } else if (resource === "proposal" && action === "authorize") {
+    print(await client.post(
+      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/authorize`, {}, requestId(options),
+    ));
+  } else if (resource === "proposal" && action === "reject") {
+    print(await client.post(
+      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/reject`, {}, requestId(options),
+    ));
   } else if (resource === "project" && action === "add") {
     print(await client.post("/v1/projects", {
       name: required(options, "name"), repoPath: required(options, "path"), branch: options.branch || "HEAD",

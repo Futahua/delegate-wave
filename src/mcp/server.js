@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import readline from "node:readline";
+import { randomUUID } from "node:crypto";
 import { ControlClient } from "../control/client.js";
 
 const TOOLS = Object.freeze([
@@ -39,6 +40,39 @@ const TOOLS = Object.freeze([
       type: "object", properties: { proposal_id: { type: "string" } }, required: ["proposal_id"], additionalProperties: false,
     },
   },
+  {
+    name: "propose_work",
+    description:
+      "Propose one bounded unit of work for human authorization. This does NOT start work: it creates a "
+      + "pending request that a human operator must explicitly authorize before any worker runs. "
+      + "Requires a proposal credential; it cannot approve, run, or integrate anything.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string" },
+        goal: { type: "string", description: "What the worker should accomplish, in plain language." },
+        mode: { type: "string", enum: ["read", "write"] },
+        maximum_cost: { type: "number", description: "Optional cost ceiling in dollars." },
+        idempotency_key: { type: "string", description: "Stable key so a retried proposal is not duplicated." },
+      },
+      required: ["project_id", "goal", "idempotency_key"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_work_proposals",
+    description: "List work proposals and their decisions. Read-only.",
+    inputSchema: {
+      type: "object", properties: { project_id: { type: "string" } }, additionalProperties: false,
+    },
+  },
+  {
+    name: "get_work_proposal",
+    description: "Get one work proposal, its bounds, and its authorization decision.",
+    inputSchema: {
+      type: "object", properties: { proposal_id: { type: "string" } }, required: ["proposal_id"], additionalProperties: false,
+    },
+  },
 ]);
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -73,6 +107,23 @@ export class HermesMcpAdapter {
     if (name === "get_job") return this.client.get(`/v1/jobs/${encodeURIComponent(requiredString(args, "job_id"))}`);
     if (name === "get_attention_needed") return this.client.get("/v1/attention");
     if (name === "get_integration") return this.client.get(`/v1/proposals/${encodeURIComponent(requiredString(args, "proposal_id"))}`);
+    if (name === "propose_work") {
+      // The Control API derives origin identity from the credential; the adapter never supplies it.
+      return this.client.post("/v1/work/proposals", {
+        projectId: requiredString(args, "project_id"),
+        goal: requiredString(args, "goal"),
+        mode: args.mode || "write",
+        maximumCost: args.maximum_cost ?? null,
+        idempotencyKey: requiredString(args, "idempotency_key"),
+      }, `req_${randomUUID()}`);
+    }
+    if (name === "list_work_proposals") {
+      const query = args.project_id ? `?projectId=${encodeURIComponent(args.project_id)}` : "";
+      return this.client.get(`/v1/work/proposals${query}`);
+    }
+    if (name === "get_work_proposal") {
+      return this.client.get(`/v1/work/proposals/${encodeURIComponent(requiredString(args, "proposal_id"))}`);
+    }
     throw new Error(`Unknown tool: ${name}`);
   }
 }

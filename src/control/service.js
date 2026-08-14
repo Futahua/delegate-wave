@@ -7,6 +7,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
+  "work.propose", "work.proposal.authorize", "work.proposal.reject",
 ]);
 
 function canonical(value) {
@@ -47,6 +48,8 @@ export class ControlService {
       "job.list": () => this.dispatcher.listJobs(args.projectId || null),
       "job.get": () => this.dispatcher.status(args.jobId),
       "proposal.get": () => this.dispatcher.integrationStatus(args.proposalId),
+      "work.proposal.list": () => this.dispatcher.listWorkProposals(args.projectId || null),
+      "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       attention: () => this.dispatcher.attention(),
     };
@@ -161,6 +164,29 @@ export class ControlService {
       }),
       "integration.run": () => this.dispatcher.runIntegration(args.proposalId),
       reconcile: () => this.dispatcher.reconcile({ apply: args.apply === true }),
+      // Origin identity is taken from the authenticated credential, never from the request body.
+      "work.propose": () => this.dispatcher.proposeWork({
+        projectId: args.projectId,
+        goal: args.goal,
+        mode: args.mode || "write",
+        maximumCost: args.maximumCost ?? null,
+        expiresAt: args.expiresAt || null,
+        expectedStateVersion: args.expectedStateVersion || null,
+        idempotencyKey: args.idempotencyKey,
+        principal: context.principalId,
+        origin: context.originChannel,
+      }),
+      "work.proposal.authorize": () => this.dispatcher.authorizeWorkProposal({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        maxAttempts: args.maxAttempts ?? 2,
+      }),
+      "work.proposal.reject": () => this.dispatcher.rejectWorkProposal({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+      }),
     };
     const handler = handlers[command];
     if (!handler) throw new ControlError("UNKNOWN_COMMAND", `Unknown mutation command: ${command}`, 404);
