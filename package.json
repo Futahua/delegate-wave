@@ -1,0 +1,17 @@
+{
+  "name": "delegate-wave",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic, evidence-driven dispatcher for inexpensive coding workers",
+  "bin": {
+    "delegate-wave": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+.delegate-wave/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+coverage/
+
