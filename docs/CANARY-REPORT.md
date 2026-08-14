@@ -127,3 +127,26 @@ cost    $0.0018791472
 ```
 
 The audit returned `NO BLOCKERS`. It independently verified fail-closed liveness behavior, row-level intent before spawn, both reconciliation refusal checks, validation intent/PID matching, the genuine live-validator and uncertain-start tests, and additive schema migration safety. It changed no files. Total reported OpenCode Go cost through the final audit is `$0.0199010672`.
+
+## Luna client comparison and executor symmetry
+
+The same read-only audit prompt was run with `opencode-go/gpt-5.6-luna` against head `21c3d32` through both client paths.
+
+OpenCode completed useful review in 50.671 seconds for `$0.0007872`, using 33,344 total tokens: 1,764 uncached input, 31,080 cache-read, 252 output, and 248 reasoning tokens. It found a real blocker missed by the preceding DeepSeek audit: passing `isProcessAlive` directly to `Array.some` supplied the array index as the injectable probe argument, causing dead recorded PIDs to fail closed as falsely alive inside authoritative reconciliation.
+
+For the closest prior same-prompt comparison, DeepSeek Flash took 145.454 seconds and `$0.0018791472`, using 51,394 total tokens: 2,192 uncached input, 37,248 cache-read, 904 output, and 11,050 reasoning tokens. It returned `NO BLOCKERS` and missed the callback defect. On this single audit, OpenCode Luna was approximately 2.9 times faster, cost 58% less, and found the more accurate result.
+
+The identical Codex CLI prompt connected successfully to Luna through an isolated custom OpenCode Go provider, but could not inspect files because the prompt prohibited shell use and Codex CLI exposes repository reads through its sandboxed shell. That 5.115-second compatibility trial used 13,608 input and 252 output tokens and produced no audit.
+
+An equivalent Codex CLI trial permitting read-only shell inspection completed in approximately 96 seconds. It used 525,063 input tokens, of which 482,642 were cached, plus 4,798 output and 2,454 reasoning tokens. It found the same `Array.some` defect and raised a stricter non-production-window test concern. At OpenCode Go's listed Luna rates, its token usage is approximately `$0.01194732`; this is an estimate because Codex CLI reports tokens rather than provider cost. The large client prompt and shell transcripts made this path materially less efficient for the same bounded audit.
+
+| Client/model | Useful result | Time | Cost | Main result |
+|---|---:|---:|---:|---|
+| OpenCode / Luna | yes | 50.671 s | `$0.0007872` | found callback blocker |
+| OpenCode / DeepSeek Flash | yes | 145.454 s | `$0.0018791472` | missed callback blocker |
+| Codex CLI / Luna, exact prompt | no | 5.115 s | est. `$0.00151200` | no non-shell read tool |
+| Codex CLI / Luna, read-only shell | yes | ~96 s | est. `$0.01194732` | found callback blocker |
+
+The `Array.some` callback defect is now covered by recovery of an actual exited child PID. The executor lifecycle is also symmetric with validation: `executor_intent_id` is durable before backend launch, spawn and result receipts must match it, and intent-without-PID makes reconciliation refuse without epoch movement. The existing scheduler-gap test now exercises this production `runJob` path and isolates the executor-intent fence before releasing the backend.
+
+Reported OpenCode-client model cost is now `$0.0206882672`. Including the two Codex CLI trials at token-rate estimates, total observed model spend is approximately `$0.0341475872`.

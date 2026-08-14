@@ -57,7 +57,7 @@ delegate-wave reconcile       # read-only preview
 delegate-wave reconcile --apply   # only after reviewing the preview
 ```
 
-Applied reconciliation starts a new fencing epoch only after proving recorded scheduler, executor, and validator processes are dead. An uncertain validator start fails closed for operator attention instead of being guessed dead.
+Applied reconciliation starts a new fencing epoch only after proving recorded scheduler, executor, and validator processes are dead. An uncertain executor or validator start fails closed for operator attention instead of being guessed dead.
 
 ## 7. READY_FOR_INTEGRATION requires manual review
 

@@ -124,11 +124,14 @@ test("reconciliation orphans a dead fenced attempt without consulting a model", 
   t.after(async () => { service.close(); await cleanup(); });
   const project = await service.addProject({ name: "Fixture", repoPath: repo });
   const job = await service.createJob({ projectId: project.id, goal: "interrupted" });
+  let deadPid;
+  await runProcess(process.execPath, ["-e", "process.exit(0)"], { onSpawn: (pid) => { deadPid = pid; } });
+  assert.equal(isProcessAlive(deadPid), false);
   service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
   service.db.prepare(`INSERT INTO attempts(
     id, job_id, ordinal, scheduler_epoch, backend, executor_pid, worktree_path, started_at
-  ) VALUES (?, ?, 1, 1, 'FakeBackend', NULL, ?, ?)`).run(
-    "attempt-dead", job.id, path.join(root, "missing-worktree"), new Date().toISOString(),
+  ) VALUES (?, ?, 1, 1, 'FakeBackend', ?, ?, ?)`).run(
+    "attempt-dead", job.id, deadPid, path.join(root, "missing-worktree"), new Date().toISOString(),
   );
   const preview = await service.reconcile();
   assert.equal(preview.applied, false);
@@ -179,7 +182,7 @@ test("process liveness fails closed except for definite nonexistence", () => {
   assert.equal(isProcessAlive(42, () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; }), false);
 });
 
-test("the scheduler PID fences reconciliation before an executor PID is published", async (t) => {
+test("durable executor intent fences reconciliation before an executor PID is published", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   let releaseWorker;
   let reportEntered;
@@ -199,13 +202,27 @@ test("the scheduler PID fences reconciliation before an executor PID is publishe
   await workerEntered;
   const attempt = service.status(job.id).attempts[0];
   assert.equal(attempt.scheduler_pid, process.pid);
+  assert.match(attempt.executor_intent_id, /^executor_/);
   assert.equal(attempt.executor_pid, null);
+  assert.throws(
+    () => service.recordExecutorPid(attempt.id, attempt.scheduler_epoch, "wrong-intent", process.pid),
+    /Stale executor start/,
+  );
   const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
   const reconciliation = await service.reconcile({ apply: true });
   assert.equal(reconciliation.applied, false);
   assert.equal(reconciliation.refused, "LIVE_ATTEMPT_PROCESS");
   assert.equal(reconciliation.observations[0].scheduler_alive, true);
   assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+
+  service.db.prepare("UPDATE attempts SET scheduler_pid = NULL WHERE id = ?").run(attempt.id);
+  const uncertain = await service.reconcile({ apply: true });
+  assert.equal(uncertain.applied, false);
+  assert.equal(uncertain.refused, "UNCERTAIN_EXECUTOR_START");
+  assert.equal(uncertain.observations[0].executor_intent_id, attempt.executor_intent_id);
+  assert.equal(uncertain.observations[0].executor_start_uncertain, true);
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+
   releaseWorker();
   assert.equal((await run).job.status, "READY_FOR_INTEGRATION");
 });

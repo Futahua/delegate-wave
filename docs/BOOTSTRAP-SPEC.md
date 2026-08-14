@@ -36,6 +36,10 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **ATT-010** Attempt creation MUST persist the owning scheduler process identity in the same transaction as epoch acquisition.
 
+**ATT-011** Executor intent MUST be persisted on the attempt row before backend launch; PID publication and terminal results MUST match that intent.
+
+**ATT-012** Reconciliation MUST fail closed when executor intent exists without an executor PID receipt because whether the backend process spawned is uncertain.
+
 ## Filesystem and Git
 
 **FS-001** Filesystem location MUST NOT determine lifecycle state or authority.
@@ -88,6 +92,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **REC-008** Process-liveness probing MUST treat only definite process nonexistence as dead; access denial or an unknown probe failure MUST be treated as alive.
 
+**REC-009** Authoritative reconciliation MUST invoke process probing with only a PID argument; collection callback metadata MUST NOT be interpreted as a probe implementation.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
@@ -97,12 +103,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
-| ATT-007–ATT-010 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID receipt | invalid invocation, live executor, blocked validation, and direct predicate tests |
+| ATT-007–ATT-012 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID and executor intent/PID receipts | invalid invocation, live executor, uncertain executor start, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| VAL-005–VAL-007, REC-001–REC-008 | fenced row-level validation intent/PID receipt, fail-closed liveness probe, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead, live, uncertain-start, genuine blocked-validator, and interrupted validation recovery tests |
+| VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 
 ## Known bootstrap limitations
 
