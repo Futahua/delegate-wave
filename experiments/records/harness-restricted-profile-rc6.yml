@@ -1,0 +1,54 @@
+# delegate-wave restricted Harness worker.
+#
+# Strips every capability the delegate-wave worker contract forbids, and points the DeepSeek adapter
+# at the OpenCode Go gateway so both A/B arms share one commercial route.
+#
+# Removed deliberately:
+#   bash / pwsh / shell-env  - the worker contract grants no shell
+#   skills                   - not part of the contract, and repo-controlled
+#   user-questions           - the executor is unattended; a question is a hang
+#
+# Code Mode, subagents, workflows and Ralph are absent from headless already and stay absent: Harness
+# documents its worker-thread code runtime as containment rather than a security boundary, with
+# authority comparable to a shell.
+
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: bash-sandbox
+  disabled: true
+- id: pwsh-sandbox
+  disabled: true
+- id: shell-env
+  disabled: true
+# permission-presets waits on the shell service, so removing the shell requires removing its
+# dependent too. Its presets exist to gate shell/exec permissions this worker does not have.
+- id: permission
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: skill
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: skill-badge
+  disabled: true
+- id: user-questions
+  disabled: true
+
+# The DeepSeek adapter, routed through OpenCode Go. `deepseek-official` names the adapter, not the
+# destination host; baseURL decides where the request goes.
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    apiKeyEnv: OPENCODE_GO_API_KEY
+    baseURL: https://opencode.ai/zen/go/v1
+    models:
+      - id: deepseek-v4-flash
+        name: DeepSeek V4 Flash
+
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
