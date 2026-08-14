@@ -25,7 +25,7 @@ Total failed implementation-worker spend: `$0.0727556726`.
 
 ## Deterministic evidence
 
-`npm run check` passes 50/50 tests. New tests cover:
+`npm run check` passes 54/54 tests. New tests cover:
 
 - one side effect for duplicate and concurrent request identities, including two CLI processes;
 - durable uncertain intent that cannot redispatch;
@@ -35,6 +35,11 @@ Total failed implementation-worker spend: `$0.0727556726`.
 - malformed, unknown, and spoofed requests rejected before dispatch;
 - approval principal/origin bound by the server;
 - unavailable Control API with no CLI storage fallback.
+
+The post-review hardening tests additionally prove that the Control API token is absent from both
+normal and integration validation, project/job inserts roll back when their event receipt fails,
+success-receipt failure remains uncertain without a false failed record, explicit uncertain domain
+errors remain nonterminal, and the CLI exposes the request identity needed for an exact retry.
 
 ## Independent focused review
 

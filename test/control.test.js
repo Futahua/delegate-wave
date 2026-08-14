@@ -43,8 +43,9 @@ async function fixture(t, overrides = {}, root = null) {
   const dataRoot = root || path.join(temp, "data");
   const dispatcher = fakeDispatcher(dataRoot, overrides);
   const token = `token-${crypto.randomUUID()}`;
+  const service = new ControlService({ dispatcher, pendingWaitMs: 2000 });
   const server = createControlServer({
-    service: new ControlService({ dispatcher, pendingWaitMs: 2000 }),
+    service,
     token,
     principalId: "john",
   });
@@ -61,7 +62,7 @@ async function fixture(t, overrides = {}, root = null) {
     if (temp) fs.rmSync(temp, { recursive: true, force: true });
   };
   if (t) t.after(close);
-  return { root: dataRoot, dispatcher, server, token, url, client: new ControlClient({ baseUrl: url, token }), close };
+  return { root: dataRoot, dispatcher, service, server, token, url, client: new ControlClient({ baseUrl: url, token }), close };
 }
 
 test("duplicate and concurrent request IDs produce one durable side effect", async (t) => {
@@ -129,6 +130,37 @@ test("durable intent without a result fails closed instead of redispatching", as
   assert.equal(calls, 0);
 });
 
+test("successful mutation with failed success receipt remains uncertain and never redispatches", async (t) => {
+  let calls = 0;
+  const f = await fixture(t, {
+    createJob: () => {
+      calls += 1;
+      f.dispatcher.db.prepare("INSERT INTO metadata(key, value) VALUES ('receipt-test-effect', 'created')").run();
+      return { id: "created-before-receipt-failure" };
+    },
+  });
+  f.service.recordSucceededResult = () => { throw new Error("injected success receipt failure"); };
+  const body = { projectId: "p1", goal: "receipt fault", mode: "write", maxAttempts: 2 };
+  const request = requestId();
+  await assert.rejects(f.client.post("/v1/jobs", body, request), (error) => error.code === "REQUEST_UNCERTAIN");
+  assert.equal(f.dispatcher.db.prepare("SELECT value FROM metadata WHERE key = 'receipt-test-effect'").get().value, "created");
+  assert.equal(f.dispatcher.db.prepare("SELECT * FROM control_request_results WHERE request_id = ?").get(request), undefined);
+  await assert.rejects(f.client.post("/v1/jobs", body, request), (error) => error.code === "REQUEST_UNCERTAIN");
+  assert.equal(calls, 1);
+});
+
+test("explicit uncertain command errors never become definitive failed receipts", async (t) => {
+  const uncertain = new Error("branch outcome requires reconciliation");
+  uncertain.code = "POST_CAS_RECEIPT_UNCERTAIN";
+  const f = await fixture(t, { runIntegration: async () => { throw uncertain; } });
+  const request = requestId();
+  await assert.rejects(
+    f.client.post("/v1/integration/proposal-one/run", {}, request),
+    (error) => error.code === "REQUEST_UNCERTAIN",
+  );
+  assert.equal(f.dispatcher.db.prepare("SELECT * FROM control_request_results WHERE request_id = ?").get(request), undefined);
+});
+
 test("the Control API carries a write job through exact approved integration", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-control-flow-"));
   const root = path.join(temp, "data");
@@ -138,6 +170,12 @@ test("the Control API carries a write job through exact approved integration", a
   await command("git", ["config", "user.name", "Test"], repo);
   await command("git", ["config", "user.email", "test@example.invalid"], repo);
   fs.writeFileSync(path.join(repo, "input.txt"), "before\n");
+  const validationEvidence = path.join(temp, "validation-environment.txt");
+  fs.writeFileSync(path.join(repo, "validate-env.cjs"), [
+    "const fs = require('node:fs');",
+    "if (process.env.DELEGATE_WAVE_CONTROL_TOKEN) process.exit(23);",
+    "fs.appendFileSync(process.argv[2], 'token-absent\\n');",
+  ].join("\n"));
   await command("git", ["add", "."], repo);
   await command("git", ["commit", "-m", "initial"], repo);
   await command("git", ["branch", "integration"], repo);
@@ -146,11 +184,15 @@ test("the Control API carries a write job through exact approved integration", a
     fs.writeFileSync(path.join(worktreePath, "output.txt"), "through-control-api\n");
     return { exitCode: 0, stdout: "ok", stderr: "" };
   });
+  const originalToken = process.env.DELEGATE_WAVE_CONTROL_TOKEN;
+  process.env.DELEGATE_WAVE_CONTROL_TOKEN = token;
   const running = await startControlServer({ root, backend, token, principalId: "john", port: 0 });
   const client = new ControlClient({ baseUrl: running.url, token });
   try {
     const project = await client.post("/v1/projects", {
-      name: "Flow", repoPath: repo, branch: "integration", validation: [], protectedPaths: [],
+      name: "Flow", repoPath: repo, branch: "integration",
+      validation: [`node validate-env.cjs ${JSON.stringify(validationEvidence.replaceAll("\\", "/"))}`],
+      protectedPaths: [],
     }, requestId());
     const job = await client.post("/v1/jobs", {
       projectId: project.id, goal: "create output", mode: "write", maxAttempts: 2,
@@ -164,9 +206,12 @@ test("the Control API carries a write job through exact approved integration", a
     const integrated = await client.post(`/v1/integration/${proposal.id}/run`, {}, requestId());
     assert.equal(integrated.proposal.state, "INTEGRATED");
     assert.equal(await command("git", ["show", "integration:output.txt"], repo), "through-control-api");
+    assert.equal(fs.readFileSync(validationEvidence, "utf8"), "token-absent\ntoken-absent\n");
     assert.equal((await client.get(`/v1/jobs/${job.id}`)).job.id, job.id);
   } finally {
     await running.close();
+    if (originalToken === undefined) delete process.env.DELEGATE_WAVE_CONTROL_TOKEN;
+    else process.env.DELEGATE_WAVE_CONTROL_TOKEN = originalToken;
     const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
     for (const line of listed.stdout.split(/\r?\n/).filter((item) => item.startsWith("worktree ")).slice(1)) {
       await runProcess("git", ["-C", repo, "worktree", "remove", "--force", line.slice(9)]);
@@ -272,6 +317,8 @@ test("CLI unavailable fails closed and contains no dispatcher storage imports", 
     });
     assert.notEqual(result.exitCode, 0);
     assert.match(result.stderr, /CONTROL_API_UNAVAILABLE/);
+    assert.match(result.stderr, /request_id: req_/);
+    assert.match(result.stderr, /Retry the exact command with: --request-id req_/);
     assert.equal(fs.existsSync(path.join(temp, "data")), false);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });

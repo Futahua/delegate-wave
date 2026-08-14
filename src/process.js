@@ -1,11 +1,17 @@
 import { spawn } from "node:child_process";
 
+export function childEnvironment(extra = {}) {
+  const environment = { ...process.env };
+  delete environment.DELEGATE_WAVE_CONTROL_TOKEN;
+  return { ...environment, ...extra };
+}
+
 export function runProcess(command, args, options = {}) {
   const { cwd, env, timeoutMs = 10 * 60_000, onSpawn, onStdout, onStderr } = options;
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
-      env: { ...process.env, ...env },
+      env: childEnvironment(env),
       windowsHide: true,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],

@@ -19,6 +19,10 @@ assert or override either value.
 **CTL-AUTH-004** The initial local CLI origin MUST be `local-cli`. The principal MUST come from the
 server configuration or local operating-system identity, never from CLI arguments.
 
+**CTL-AUTH-005** Control-plane authority credentials MUST NOT be inherited by executors,
+validation commands, Git hooks, or other child processes. A caller MAY explicitly supply a token
+only for a process whose purpose is to act as a Control API client.
+
 ## Explicit command surface
 
 **CTL-CMD-001** The HTTP adapter MUST expose an explicit allowlist of commands. It MUST NOT expose
@@ -68,6 +72,13 @@ available within the bounded wait, they MUST return `REQUEST_UNCERTAIN`; they MU
 **CTL-REQ-006** After restart, an intent without a terminal result MUST remain uncertain. Restart or
 transport disconnect MUST NOT grant permission to repeat its side effect.
 
+**CTL-REQ-007** Failure to persist a success receipt after a mutation returns success MUST leave the
+request without a terminal result and return `REQUEST_UNCERTAIN`. It MUST NOT manufacture a failed
+receipt. A command error explicitly classified as uncertain MUST receive the same treatment.
+
+**CTL-REQ-008** The CLI MUST print a mutation's request identity before sending it. When transport
+or receipt state is uncertain, the CLI MUST show how to retry the exact command with that identity.
+
 ## Local transport
 
 **CTL-HTTP-001** The bootstrap server MUST bind to loopback by default and require a bearer token.
@@ -83,8 +94,9 @@ exposure, TLS termination, token provisioning, and multi-user authentication are
 |---|---|---|
 | CTL-AUTH-001 | `ControlClient`-only CLI imports and no fallback | unavailable-API/static-import test |
 | CTL-AUTH-002–004 | bearer check and server context | spoofing and bound-identity tests |
+| CTL-AUTH-005 | scrubbed generic child environment | subprocess and full validation/integration tests |
 | CTL-CMD-001–003 | route and command allowlists | malformed/unknown/no-dispatch tests |
-| CTL-REQ-001–006 | immutable intent/result tables and `ControlService` | duplicate, concurrent, disconnect, conflict, and restart tests |
+| CTL-REQ-001–008 | immutable intent/result tables, split receipt handling, and visible CLI request IDs | duplicate, concurrent, disconnect, conflict, restart, receipt-fault, uncertain-error, and CLI retry tests |
 | CTL-HTTP-001–003 | local HTTP server and bounded parser | HTTP contract tests and full integration flow |
 
 ## Deferred

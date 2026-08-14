@@ -78,14 +78,16 @@ export class Dispatcher {
     if (!integrationBranch) throw new Error("Register a named integration branch; detached HEAD is not supported");
     await resolveRevision(resolvedPath, integrationBranch);
     const projectId = safeProjectId(name);
-    this.db.prepare(`INSERT INTO projects(
-      id, name, repo_path, integration_branch, validation_json, protected_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-      projectId, name, resolvedPath, integrationBranch,
-      JSON.stringify(validation), JSON.stringify(protectedPaths), now(),
-    );
-    recordEvent(this.db, { kind: "PROJECT_REGISTERED", entityType: "project", entityId: projectId });
-    return this.getProject(projectId);
+    return transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO projects(
+        id, name, repo_path, integration_branch, validation_json, protected_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+        projectId, name, resolvedPath, integrationBranch,
+        JSON.stringify(validation), JSON.stringify(protectedPaths), now(),
+      );
+      recordEvent(this.db, { kind: "PROJECT_REGISTERED", entityType: "project", entityId: projectId });
+      return this.getProject(projectId);
+    });
   }
 
   getProject(projectId) {
@@ -103,13 +105,15 @@ export class Dispatcher {
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
     const jobId = id("job");
     const timestamp = now();
-    this.db.prepare(`INSERT INTO jobs(
-      id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
-      jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
-    );
-    recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
-    return this.getJob(jobId);
+    return transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO jobs(
+        id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
+        jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
+      );
+      recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
+      return this.getJob(jobId);
+    });
   }
 
   getJob(jobId) {

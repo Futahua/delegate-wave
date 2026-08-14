@@ -18,7 +18,7 @@ $env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
 delegate-wave init
 ```
 
-Data root defaults to `D:\AssistantSystem\delegate-wave`. Set `DELEGATE_WAVE_DATA_ROOT` on the server for a scratch run. CLI mutations accept `--request-id` for an exact retry; without one the CLI generates a fresh identity.
+Data root defaults to `D:\AssistantSystem\delegate-wave`. Set `DELEGATE_WAVE_DATA_ROOT` on the server for a scratch run. CLI mutations print their request ID before sending. If a failure says the outcome may be uncertain, rerun the exact command with the printed `--request-id`; do not issue a fresh request.
 
 ## 2. Register a project
 

@@ -22,7 +22,12 @@ function required(options, name) {
   if (!options[name] || options[name] === true) throw new Error(`Missing --${name}`);
   return options[name];
 }
-function requestId(options) { return options["request-id"] || `req_${crypto.randomUUID()}`; }
+let activeRequestId = null;
+function requestId(options) {
+  activeRequestId = options["request-id"] || `req_${crypto.randomUUID()}`;
+  console.error(`request_id: ${activeRequestId}`);
+  return activeRequestId;
+}
 function print(value) { console.log(JSON.stringify(value, null, 2)); }
 
 function help() {
@@ -121,5 +126,8 @@ async function main() {
 
 main().catch((error) => {
   console.error(`delegate-wave: ${error.code ? `${error.code}: ` : ""}${error.message}`);
+  if (activeRequestId && ["CONTROL_API_UNAVAILABLE", "INVALID_CONTROL_RESPONSE", "REQUEST_UNCERTAIN"].includes(error.code)) {
+    console.error(`Request outcome may be uncertain. Retry the exact command with: --request-id ${activeRequestId}`);
+  }
   process.exitCode = 1;
 });

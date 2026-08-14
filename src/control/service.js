@@ -82,23 +82,51 @@ export class ControlService {
     if (claim.kind === "result") return this.decodeResult(claim.result);
     if (claim.kind === "pending") return this.waitForResult(requestId);
 
+    let response;
     try {
-      const response = await this.executeMutation(command, args, { principalId, originChannel });
-      transaction(this.db, () => {
-        this.db.prepare(`INSERT INTO control_request_results(
-          request_id, outcome, response_json, created_at
-        ) VALUES (?, 'SUCCEEDED', ?, ?)`).run(requestId, JSON.stringify(response), now());
-      });
-      return response;
+      response = await this.executeMutation(command, args, { principalId, originChannel });
     } catch (error) {
       const normalized = asControlError(error);
-      transaction(this.db, () => {
-        this.db.prepare(`INSERT INTO control_request_results(
-          request_id, outcome, error_code, error_message, created_at
-        ) VALUES (?, 'FAILED', ?, ?, ?)`).run(requestId, normalized.code, normalized.message, now());
-      });
+      if (String(normalized.code).includes("UNCERTAIN")) throw this.uncertain(requestId, normalized);
+      try {
+        this.recordFailedResult(requestId, normalized);
+      } catch (receiptError) {
+        throw this.uncertain(requestId, receiptError);
+      }
       throw normalized;
     }
+
+    try {
+      this.recordSucceededResult(requestId, response);
+    } catch (receiptError) {
+      throw this.uncertain(requestId, receiptError);
+    }
+    return response;
+  }
+
+  recordSucceededResult(requestId, response) {
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO control_request_results(
+        request_id, outcome, response_json, created_at
+      ) VALUES (?, 'SUCCEEDED', ?, ?)`).run(requestId, JSON.stringify(response), now());
+    });
+  }
+
+  recordFailedResult(requestId, error) {
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO control_request_results(
+        request_id, outcome, error_code, error_message, created_at
+      ) VALUES (?, 'FAILED', ?, ?, ?)`).run(requestId, error.code, error.message, now());
+    });
+  }
+
+  uncertain(requestId, cause) {
+    return new ControlError(
+      "REQUEST_UNCERTAIN",
+      `request_id ${requestId} has durable intent but no terminal receipt: ${cause.message}`,
+      409,
+      { cause_code: cause.code || "RECEIPT_WRITE_FAILED" },
+    );
   }
 
   async waitForResult(requestId) {

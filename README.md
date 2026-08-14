@@ -49,7 +49,7 @@ delegate-wave reconcile          # preview only
 delegate-wave reconcile --apply  # fence and orphan dead executors
 ```
 
-Mutating commands accept `--request-id <id>` for exact transport retries; otherwise the CLI generates one. The server—not CLI arguments—binds approval identity and the `local-cli` origin. The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it on the server for testing with `DELEGATE_WAVE_DATA_ROOT`.
+Mutating commands accept `--request-id <id>` for exact transport retries; otherwise the CLI generates and prints one before sending. If transport or receipt state is uncertain, reuse the printed identity with the exact same command. The server—not CLI arguments—binds approval identity and the `local-cli` origin. The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it on the server for testing with `DELEGATE_WAVE_DATA_ROOT`.
 
 ## Current safety boundary
 
@@ -58,6 +58,8 @@ The OpenCode worker receives runtime permissions that allow reading and editing 
 Attempts are isolated as locked, detached Git worktrees. Failed attempts are marked quarantined in SQLite and retained for inspection. Two failures stop the job at `NEEDS_ATTENTION` by default.
 
 The CLI is now strictly a Control API client. It does not open SQLite, instantiate the dispatcher, or execute a worker itself. If the local server is unavailable it fails closed. Mutating requests have durable immutable intent/result receipts, so duplicate, concurrent, disconnected, and post-restart retries cannot silently repeat a side effect.
+
+The server's Control API bearer token is removed from the inherited environment of OpenCode, validation commands, Git hooks, and other child processes. This is the minimum credential boundary for the bootstrap; validation should eventually use a tighter allowlisted environment for all unrelated provider and user secrets.
 
 `doctor` checks SQLite integrity, missing repositories, lifecycle-active attempts, and integration operations without immutable terminal records. An unresolved integration makes health false. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch only after proving that recorded scheduler, executor, and validator processes are dead; an uncertain executor or validator start fails closed for operator attention.
 
