@@ -105,6 +105,25 @@ The receipt's five dimensions are therefore defined as disjoint, with `output_to
 non-reasoning output (WRK-011). A subset-style report is converted by the adapter; pricing stays
 backend-independent, and a test proves the same real usage costs the same from either arm.
 
+## Reasoning effort must be equalized before the protocol is frozen
+
+Neither arm's implicit default may be relied on. Harness's DeepSeek adapter defaults the selected
+model to reasoning effort `high`, while delegate-wave's OpenCode backend currently passes only
+`--model` and no variant, so it takes whatever OpenCode's route default happens to be. That would
+leave reasoning effort varying with the executor, confounding the very quantity being measured.
+
+`opencode run --variant` exists and is documented as provider-specific reasoning effort, so both arms
+can be pinned explicitly:
+
+```text
+OpenCode   --model opencode-go/deepseek-v4-flash --variant high
+Harness    thinking enabled, reasoningEffort high, model deepseek-v4-flash
+```
+
+The specific level matters less than both arms stating the same one. This is recorded as a protocol
+prerequisite rather than applied to production routing now, since changing the OpenCode default would
+alter the operational baseline mid-stream.
+
 ## Read isolation is not yet sufficient for the experiment
 
 The restricted profile removes shell, skills and questions, but stock `headless` uses `fs-local`, and
@@ -119,5 +138,13 @@ before the corpus is exposed to Harness. Stock `dsh-fs-sandbox` is not sufficien
 
 ## Not yet done
 
-`executor-ab-go-v1` is not frozen. Freezing a route protocol whose usage evidence path is unproven
-would preregister an experiment that cannot satisfy its own measurement gate.
+`executor-ab-go-v1` is not frozen. Three prerequisites remain, each of which would otherwise
+preregister an experiment that cannot answer its own question:
+
+```text
+JSON-RPC usage path      prove a real Harness run yields a COMPLETE receipt with a
+                         hand-reproducible reference cost
+attempt-root read fence  delegate-wave-owned, symlink-aware, confining reads as well as writes,
+                         with the trusted verifiers unreadable from the worktree
+reasoning effort         pinned explicitly and identically on both arms
+```

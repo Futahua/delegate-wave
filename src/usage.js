@@ -36,9 +36,17 @@ export const COST_SOURCE_EXECUTOR = "executor-computed";
 const TOKEN_DIMENSIONS = Object.freeze(["input", "output", "reasoning", "cache_read", "cache_write"]);
 
 // Converts a provider report whose reasoning tokens are counted inside its completion total into the
-// canonical disjoint form. Returns null when the report is incoherent, so the caller can record a
-// malformed observation rather than a plausible but wrong one.
-export function canonicalizeNestedReasoning({ completionTokens, reasoningTokens = 0 }) {
+// canonical disjoint form. Returns null when the report is incoherent OR incomplete, so the caller
+// records a malformed observation rather than a plausible but wrong one.
+//
+// reasoningTokens is deliberately NOT defaulted. The wire field is optional, so defaulting it to
+// zero would turn absent evidence into an observation of no reasoning -- the same substitution this
+// contract forbids everywhere else. Absence is the caller's decision to interpret:
+//
+//   count present                          canonicalize normally
+//   absent, thinking explicitly disabled   the adapter may supply an explicit 0
+//   absent, thinking enabled               incomplete evidence: PARTIAL, not zero
+export function canonicalizeNestedReasoning({ completionTokens, reasoningTokens }) {
   if (!Number.isInteger(completionTokens) || completionTokens < 0) return null;
   if (!Number.isInteger(reasoningTokens) || reasoningTokens < 0) return null;
   if (reasoningTokens > completionTokens) return null;

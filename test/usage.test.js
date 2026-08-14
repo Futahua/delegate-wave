@@ -362,6 +362,16 @@ test("nested reasoning tokens are canonicalized so pricing cannot double-count t
   assert.equal(canonicalizeNestedReasoning({ completionTokens: 5, reasoningTokens: 9 }), null);
   assert.equal(canonicalizeNestedReasoning({ completionTokens: -1, reasoningTokens: 0 }), null);
   assert.equal(canonicalizeNestedReasoning({ completionTokens: 1.5, reasoningTokens: 0 }), null);
+
+  // The wire field is optional. Absent reasoning evidence must not become an observation of zero
+  // reasoning: the caller decides whether absence means "thinking was disabled" or "incomplete".
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40 }), null,
+    "a missing reasoning count is incomplete evidence, not zero");
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: undefined }), null);
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: null }), null);
+  // An adapter that knows thinking was disabled may still state zero explicitly.
+  assert.deepEqual(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: 0 }),
+    { output_tokens: 40, reasoning_tokens: 0 });
 });
 
 test("two arms reporting the same real usage price identically", () => {
