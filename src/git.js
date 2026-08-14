@@ -52,3 +52,54 @@ export async function commitAll(worktreePath, message) {
   await git(worktreePath, ["-c", "user.name=delegate-wave", "-c", "user.email=delegate-wave@local", "commit", "-m", message]);
   return resolveRevision(worktreePath, "HEAD");
 }
+
+export async function listWorktrees(repoPath) {
+  const output = await git(repoPath, ["worktree", "list", "--porcelain"], { raw: true });
+  const entries = [];
+  for (const block of output.split(/\r?\n\r?\n/)) {
+    const entry = { path: null, branch: null, detached: false, head: null };
+    for (const line of block.split(/\r?\n/).filter(Boolean)) {
+      if (line.startsWith("worktree ")) entry.path = line.slice("worktree ".length);
+      else if (line.startsWith("branch ")) entry.branch = line.slice("branch ".length);
+      else if (line === "detached") entry.detached = true;
+      else if (line.startsWith("HEAD ")) entry.head = line.slice("HEAD ".length);
+    }
+    if (entry.path) entries.push(entry);
+  }
+  return entries;
+}
+
+export async function removeWorktree(repoPath, targetPath) {
+  if (!fs.existsSync(targetPath)) return false;
+  try { await git(repoPath, ["worktree", "unlock", targetPath]); } catch { /* unlocked already */ }
+  await git(repoPath, ["worktree", "remove", "--force", targetPath]);
+  return true;
+}
+
+export async function isAncestor(repoPath, ancestor, descendant) {
+  const result = await runProcess("git", ["-C", repoPath, "merge-base", "--is-ancestor", ancestor, descendant]);
+  return result.exitCode === 0;
+}
+
+export async function updateRefCas(repoPath, ref, newSha, expectedOldSha) {
+  const result = await runProcess("git", ["-C", repoPath, "push", "--porcelain",
+    "--receive-pack=git -c receive.denyCurrentBranch=refuse receive-pack",
+    `--force-with-lease=${ref}:${expectedOldSha}`,
+    repoPath, `${newSha}:${ref}`,
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error(`compare-and-swap ${ref} failed (${result.exitCode}): ${result.stderr.trim()}`);
+  }
+  return newSha;
+}
+
+export async function cherryPick(worktreePath, commit) {
+  const result = await runProcess("git", ["-C", worktreePath,
+    "-c", "user.name=delegate-wave", "-c", "user.email=delegate-wave@local",
+    "cherry-pick", commit,
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error(`cherry-pick ${commit} failed (${result.exitCode}): ${result.stderr.trim()}`);
+  }
+  return resolveRevision(worktreePath, "HEAD");
+}
