@@ -128,3 +128,36 @@ executor        OpenCodeBackend, dispatcher-resolved model (WRK-004)
 credentials     operator, observer, proposer sealed in current-user DPAPI
 suite           117/117
 ```
+
+## Historical normalization through the production parser
+
+The five baseline attempts were re-read through `parseOpenCodeUsage`/`buildUsageReceipt` rather than
+by hand, to prove the evidence contract reproduces the recorded figures. Nothing was rerun.
+
+```text
+attempt                status    steps   input  cacheRd    provider$    reference$
+hermes #1 TOTALS       COMPLETE      4    4665    20992  0.000397799   0.002019556
+hermes #1 attempt 1    UNKNOWN       0       -        -       absent        absent
+hermes #2 CONTRIBUTING COMPLETE      4    4576    21248  0.000400607   0.002027844
+baseline #1 SUMMARY    COMPLETE      4    4531    21376  0.000407436   0.002048228
+baseline #2 REVENUE    COMPLETE      3    4511    14848  0.000387937   0.001832964
+baseline #3 PRICING    COMPLETE      4    5217    22400  0.000498610   0.002394140
+
+provider-reported total   0.002092390   (matches the hand-computed total exactly)
+reference total           0.010322732   basis deepseek-direct-2026-08-14-v1
+```
+
+The failed provider-auth attempt normalizes to `UNKNOWN` with null numeric fields, not to five
+zeroes, which is the distinction the contract exists to preserve.
+
+### The two cost figures differ by roughly 4.9x
+
+This is the clearest argument yet for keeping them separate. The `opencode-go` subscription route
+reports about one fifth of what the same token counts would cost at DeepSeek direct list pricing.
+Neither number is wrong; they measure different things.
+
+For the A/B this means a naive comparison of provider-reported cost between an `opencode-go` run and
+a direct-DeepSeek Harness run would be dominated by the commercial arrangement rather than by
+executor efficiency. The paired experiment must compare reference cost computed on one pinned basis,
+with both executors on the same DeepSeek route, and treat provider-reported cost as a separate
+operational fact.

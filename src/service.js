@@ -18,6 +18,7 @@ import {
   updateRefCas,
 } from "./git.js";
 import { runShell } from "./process.js";
+import { buildUsageReceipt } from "./usage.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -536,6 +537,11 @@ export class Dispatcher {
         attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
         onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
       });
+      // Record usage before any failure becomes a lifecycle outcome. A timeout, nonzero exit,
+      // protected-path rejection, empty diff, or failed validation still consumed tokens, and those
+      // attempts belong in the denominator of cost per validated candidate.
+      this.recordAttemptUsage({ attemptId, artifactDir, model, backendResult });
+
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
 
@@ -615,6 +621,46 @@ export class Dispatcher {
       this.db.prepare("UPDATE attempts SET validation_pid = ? WHERE id = ?").run(pid, attemptId);
       recordEvent(this.db, { kind: "VALIDATION_STARTED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, pid } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
+  }
+
+  // Persists one immutable usage receipt per attempt. Evidence only: it never affects acceptance.
+  //
+  // Failures here are swallowed deliberately. Losing an observation must not fail an attempt that
+  // otherwise succeeded, and re-recording is a no-op so a retry cannot double-count usage.
+  recordAttemptUsage({ attemptId, artifactDir, model, backendResult = null, backend = this.backend }) {
+    try {
+      if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(attemptId)) return null;
+      const backendName = backend?.constructor?.name ?? "UnknownBackend";
+      const receipt = buildUsageReceipt({
+        attemptId,
+        backend: backendName,
+        model,
+        artifactPath: artifactDir ? path.join(artifactDir, "opencode-events.jsonl") : null,
+        format: "opencode-events-jsonl",
+      });
+      // A backend may report usage directly rather than through an artifact; prefer that when given.
+      if (backendResult?.usage) {
+        Object.assign(receipt, backendResult.usage, { attempt_id: attemptId, source_backend: backendName });
+      }
+      this.db.prepare(`INSERT INTO attempt_usage_receipts(
+        attempt_id, status, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+        cache_write_tokens, provider_steps, provider_reported_cost_usd, reference_cost_usd,
+        pricing_basis_id, source_backend, source_artifact, source_format, malformed_events, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        receipt.attempt_id, receipt.status, receipt.input_tokens, receipt.output_tokens,
+        receipt.reasoning_tokens, receipt.cache_read_tokens, receipt.cache_write_tokens,
+        receipt.provider_steps, receipt.provider_reported_cost_usd, receipt.reference_cost_usd,
+        receipt.pricing_basis_id, receipt.source_backend, receipt.source_artifact,
+        receipt.source_format, receipt.malformed_events, receipt.observed_at,
+      );
+      return receipt;
+    } catch {
+      return null;
+    }
+  }
+
+  getAttemptUsage(attemptId) {
+    return this.db.prepare("SELECT * FROM attempt_usage_receipts WHERE attempt_id = ?").get(attemptId) ?? null;
   }
 
   async validate(attemptId, epoch, worktreePath, artifactDir, command) {

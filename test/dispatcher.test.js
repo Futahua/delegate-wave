@@ -598,7 +598,7 @@ test("reconciliation fails closed for durable validation intent without a PID re
   assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
 });
 
-test("a schema 9 database migrates to 10 with the work proposal objects", async (t) => {
+test("a legacy database migrates forward to the current schema with the work proposal objects", async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-schema-9-"));
   const root = path.join(temp, "data");
   initializeDataRoot(root);
@@ -622,7 +622,8 @@ test("a schema 9 database migrates to 10 with the work proposal objects", async 
 
   const upgraded = openDatabase(file);
   t.after(() => { upgraded.close(); fs.rmSync(temp, { recursive: true, force: true }); });
-  assert.equal(upgraded.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, "10");
+  // Asserted against the constant so a later schema bump does not require editing this test.
+  assert.equal(upgraded.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
 
   const names = (type) => upgraded.prepare("SELECT name FROM sqlite_master WHERE type = ?").all(type)
     .map((row) => row.name);
@@ -644,7 +645,7 @@ test("a fresh database is created at the current schema version", async (t) => {
   const db = openDatabase(managedPaths(root).database);
   t.after(() => { db.close(); fs.rmSync(temp, { recursive: true, force: true }); });
   assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, "10");
+  assert.equal(Number(SCHEMA_VERSION) >= 11, true, "work proposals and usage receipts require schema 11+");
 });
 
 test("a job without --model resolves to DeepSeek Flash and persists the resolved model", async (t) => {
@@ -705,4 +706,131 @@ test("explicit review and escalation lanes stay distinct from the default", () =
   assert.equal(REVIEW_MODEL, "opencode-go/gpt-5.6-luna");
   assert.equal(ESCALATION_MODEL, "opencode-go/deepseek-v4-pro");
   assert.equal(new Set([DEFAULT_WORKER_MODEL, REVIEW_MODEL, ESCALATION_MODEL]).size, 3);
+});
+
+test("usage is persisted for a failed attempt and never affects acceptance", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // A worker that burns tokens and then exits nonzero: the attempt fails, but the cost is real.
+  const backend = new FakeBackend(async ({ artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 900, output: 40, reasoning: 3, cache: { read: 2000, write: 0 } }, cost: 0.00009 } }),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 800, output: 30, reasoning: 2, cache: { read: 1500, write: 0 } }, cost: 0.00008 } }),
+    ].join("\n"));
+    return { exitCode: 3, stdout: "", stderr: "worker gave up" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "FailUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "will fail", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.terminal_state, "FAILED");
+
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "a failed attempt must still carry its usage receipt");
+  assert.equal(usage.status, "COMPLETE");
+  assert.equal(usage.provider_steps, 2);
+  assert.equal(usage.input_tokens, 1700);
+  assert.ok(Math.abs(usage.provider_reported_cost_usd - 0.00017) < 1e-12);
+  // Evidence must not launder a failure into success.
+  assert.notEqual(attempt.terminal_state, "SUCCEEDED");
+  assert.equal(result.job.status, "NEEDS_ATTENTION");
+});
+
+test("usage is retained when validation fails after a successful executor", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 500, output: 25, reasoning: 0, cache: { read: 1000, write: 0 } }, cost: 0.00005 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "produced\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({
+    name: "ValFailUsage", repoPath: repo, validation: ["node -e \"process.exit(1)\""],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "fails validation", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.validation_state, "FAILED");
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "validation failure must not discard the usage receipt");
+  assert.equal(usage.input_tokens, 500);
+  assert.equal(usage.status, "COMPLETE");
+});
+
+test("an attempt with no usage artifact records UNKNOWN rather than zero", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Mirrors the live ProviderAuthError failure: the executor died before any model call.
+  const backend = new FakeBackend(async () => ({ exitCode: 1, stdout: "", stderr: "auth failed" }));
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "NoUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "dies early", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const usage = service.getAttemptUsage(result.attempts.at(-1).id);
+  assert.equal(usage.status, "UNKNOWN");
+  assert.equal(usage.input_tokens, null, "absent usage must never be recorded as zero");
+  assert.equal(usage.provider_reported_cost_usd, null);
+  assert.equal(usage.reference_cost_usd, null);
+  assert.equal(usage.provider_steps, 0);
+});
+
+test("recording usage twice for one attempt does not double-count", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 700, output: 20, reasoning: 0, cache: { read: 900, write: 0 } }, cost: 0.00007 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Idem", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+  const attemptId = result.attempts.at(-1).id;
+  const before = service.getAttemptUsage(attemptId);
+
+  const artifactDir = path.join(root, "artifacts", project.id, attemptId);
+  assert.equal(service.recordAttemptUsage({ attemptId, artifactDir, model: "opencode-go/deepseek-v4-flash" }), null);
+  assert.deepEqual(service.getAttemptUsage(attemptId), before, "a second record must be a no-op");
+  assert.equal(before.input_tokens, 700);
+});
+
+test("usage receipts are immutable once written", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Immutable", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const attemptId = (await service.runJob(job.id)).attempts.at(-1).id;
+
+  assert.throws(
+    () => service.db.prepare("UPDATE attempt_usage_receipts SET input_tokens = 999 WHERE attempt_id = ?").run(attemptId),
+    /immutable/,
+  );
+  assert.throws(
+    () => service.db.prepare("DELETE FROM attempt_usage_receipts WHERE attempt_id = ?").run(attemptId),
+    /immutable/,
+  );
 });

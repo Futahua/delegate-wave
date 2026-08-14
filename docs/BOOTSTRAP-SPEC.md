@@ -58,6 +58,26 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **WRK-003** Validation commands MUST run under dispatcher control after executor completion.
 
+**WRK-005** Every executor attempt MUST record one immutable usage receipt describing what was
+observed of its provider consumption. The receipt MUST be written before an executor failure,
+timeout, protected-path rejection, empty candidate, or validation failure is converted into a
+lifecycle outcome, because those attempts consume tokens and belong in cost per validated candidate.
+
+**WRK-006** A usage receipt is an observation, never authority. It MUST NOT cause an attempt to
+succeed, satisfy validation, or authorize integration. The raw executor artifact remains the audit
+source; the receipt is a compact projection of it.
+
+**WRK-007** Absent usage MUST be recorded as `UNKNOWN` with null numeric fields, never as zero. A
+provider receipt explicitly reporting no usage is `COMPLETE` with zeroes. Usage observed alongside a
+malformed or truncated accounting is `PARTIAL`, retaining what was observed. If normalization fails,
+the raw artifact MUST be preserved and the receipt MUST record `UNKNOWN` rather than guessed numbers.
+
+**WRK-008** Provider-reported cost and reference cost MUST remain distinct facts. Provider-reported
+cost MUST be null when the provider does not report one, never zero. Reference cost MUST be derived
+from observed tokens against a pinned, append-only pricing basis whose identifier is stored beside
+the number, so historical receipts stay reproducible after prices change. A reference cost MUST NOT
+overwrite a provider-reported cost.
+
 **WRK-004** Every executor attempt MUST have a dispatcher-resolved, provider-qualified model
 persisted before the attempt launches. An execution backend MUST fail closed rather than fall back to
 an ambient model or provider, so a caller that bypasses dispatcher routing cannot reopen
@@ -114,6 +134,10 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | WRK-004 | `Dispatcher.resolveModel` persists the resolved model; `OpenCodeBackend` refuses an absent model | default-model resolution test; unrouted-backend refusal test; distinct-lane test; live no-model run recorded in the proposal dogfood |
+| WRK-005 | `recordAttemptUsage` runs immediately after the backend returns, before failure conversion | failed-attempt usage test; validation-failure retention test; immutability triggers |
+| WRK-006 | receipts live in their own table and are never read by acceptance logic | failed-attempt test asserting the attempt stays FAILED; idempotent re-record test |
+| WRK-007 | `parseOpenCodeUsage` status states with null numeric fields under UNKNOWN, enforced by a schema CHECK | UNKNOWN/PARTIAL/COMPLETE parser tests; missing-artifact test; live historical normalization |
+| WRK-008 | `pricing.js` pinned bases; separate provider and reference columns | separate-facts receipt test; unknown-model and unknown-basis null tests; recorded 4.9x divergence in the baseline |
 | VAL-004 | absence of integration command | interface conformance review |
 | VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 

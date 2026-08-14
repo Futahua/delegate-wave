@@ -6,7 +6,8 @@ import { managedPaths } from "./paths.js";
 // Bump whenever the normative durable schema changes, so a database cannot advertise a version that
 // does not describe its actual objects. Single constant: creation and migration must never drift.
 // 10: work_proposals and work_proposal_decisions, with their immutability triggers and indexes.
-export const SCHEMA_VERSION = "10";
+// 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
+export const SCHEMA_VERSION = "11";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -190,6 +191,46 @@ CREATE TABLE IF NOT EXISTS work_proposal_decisions (
   action_digest TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- One immutable receipt per executor run, describing what was observed of its provider usage.
+-- Deliberately separate from the attempts table: an attempt's lifecycle changes over time, while a
+-- receipt records one observation and never changes. Evidence only; MUST NOT influence acceptance.
+--
+-- status distinguishes three genuinely different situations:
+--   COMPLETE  a full accounting receipt was observed (including an explicit zero-usage receipt)
+--   PARTIAL   some usage was observed but the accounting is known to be incomplete
+--   UNKNOWN   no usage receipt was observed at all
+-- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
+-- failed work appears free in cost per validated candidate.
+CREATE TABLE IF NOT EXISTS attempt_usage_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  provider_steps INTEGER,
+  provider_reported_cost_usd REAL,
+  reference_cost_usd REAL,
+  pricing_basis_id TEXT,
+  source_backend TEXT NOT NULL,
+  source_artifact TEXT,
+  source_format TEXT NOT NULL,
+  malformed_events INTEGER NOT NULL DEFAULT 0,
+  observed_at TEXT NOT NULL,
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+  ))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_update
+BEFORE UPDATE ON attempt_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
+BEFORE DELETE ON attempt_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
 BEFORE UPDATE ON work_proposals
