@@ -73,3 +73,13 @@ The worker was asked to create only `docs/OPERATOR-CHECKLIST.md`. It changed exa
 The running system did not install its own result. The candidate was inspected manually and then cherry-picked as `b785484`, demonstrating the intended external integration boundary.
 
 Total reported OpenCode Go model cost across the successful disposable canary and self-dogfood task was `$0.0016058812`.
+
+## Remote review follow-up
+
+The blocking post-executor validation review was delegated back through `delegate-wave` as job `job_720dd252-3c63-4f0c-8cb8-c28e898eeb97`. DeepSeek produced candidate `539b21e89c02562480bde8ffd09698cbd4c856aa` for a reported `$0.0070597128`; dispatcher-controlled tests passed before manual integration.
+
+The resulting scheduler treats both executor-running and validation-pending attempts as lifecycle-active. Concurrent claims cannot advance the epoch during validation, and reconciliation now detects and explicitly classifies interrupted validation. Combined regression coverage passes 13 tests before the portability follow-up.
+
+The Windows explicit-executable override was also made lazy and receives a platform-independent test. Repository-local Git identity is now `Futahua <226466458+Futahua@users.noreply.github.com>` for future commits. Existing draft-branch history was not rewritten or force-pushed.
+
+Total reported OpenCode Go cost for all successful canary, self-dogfood, and review-fix work through this report is `$0.0086655940`.

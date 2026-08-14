@@ -59,10 +59,15 @@ export class FakeBackend {
 }
 
 export class OpenCodeBackend {
-  constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000 } = {}) {
-    const launch = defaultOpenCodeLaunch();
-    this.executable = executable ?? launch.executable;
-    this.prefixArgs = prefixArgs ?? (executable ? [] : launch.prefixArgs);
+  constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000, launchResolver = defaultOpenCodeLaunch } = {}) {
+    if (executable) {
+      this.executable = executable;
+      this.prefixArgs = prefixArgs ?? [];
+    } else {
+      const launch = launchResolver();
+      this.executable = launch.executable;
+      this.prefixArgs = prefixArgs ?? launch.prefixArgs;
+    }
     this.attach = attach;
     this.timeoutMs = timeoutMs;
   }

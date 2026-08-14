@@ -232,6 +232,16 @@ test("Windows OpenCode launch bypasses command shims", { skip: process.platform 
   assert.equal(fs.existsSync(backend.prefixArgs[0]), true);
 });
 
+test("explicit OpenCode executable bypasses default launch resolution", () => {
+  const backend = new OpenCodeBackend({
+    executable: "custom-opencode",
+    prefixArgs: ["custom-entry"],
+    launchResolver: () => { throw new Error("default resolver must remain lazy"); },
+  });
+  assert.equal(backend.executable, "custom-opencode");
+  assert.deepEqual(backend.prefixArgs, ["custom-entry"]);
+});
+
 async function waitFor(predicate, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

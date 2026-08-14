@@ -85,7 +85,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
 | AUTH-001, TRUTH-001 | `Dispatcher`, SQLite transactions | all dispatcher tests |
-| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | configuration review; live canary pending |
+| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
@@ -98,7 +98,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 ## Known bootstrap limitations
 
-- OpenCode permission enforcement has not yet received a paid live-model canary.
+- OpenCode permission enforcement passed the documented disposable live-model canary; this evidence applies to the tested runtime configuration and is not a general OS sandbox guarantee.
 - The scheduler runs one CLI-owned attempt at a time; wave concurrency is not implemented.
 - PID liveness cannot prove that a remote or attached OpenCode session has stopped. Reconciliation therefore refuses live recorded processes and never attaches a replacement mid-attempt.
 - Candidate integration remains a human/Codex operation.
