@@ -42,6 +42,8 @@ Commands:
   job run --job ID [--model provider/model]
   job status --job ID
   job list [--project ID]
+  doctor
+  reconcile [--apply]
 
 Environment:
   DELEGATE_WAVE_DATA_ROOT   managed data root (Windows default: D:\\AssistantSystem\\delegate-wave)
@@ -64,7 +66,11 @@ async function main() {
   });
   try {
     const [resource, action] = positional;
-    if (resource === "project" && action === "add") {
+    if (resource === "doctor") {
+      print(dispatcher.doctor());
+    } else if (resource === "reconcile") {
+      print(await dispatcher.reconcile({ apply: options.apply === true }));
+    } else if (resource === "project" && action === "add") {
       print(await dispatcher.addProject({
         name: required(options, "name"),
         repoPath: required(options, "path"),

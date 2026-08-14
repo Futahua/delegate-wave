@@ -65,7 +65,7 @@ export class OpenCodeBackend {
     this.timeoutMs = timeoutMs;
   }
 
-  async run({ attemptId, worktreePath, goal, model, artifactDir, mode }) {
+  async run({ attemptId, worktreePath, goal, model, artifactDir, mode, onSpawn }) {
     fs.mkdirSync(artifactDir, { recursive: true });
     const stdoutPath = path.join(artifactDir, "opencode-events.jsonl");
     const stderrPath = path.join(artifactDir, "opencode-stderr.log");
@@ -87,6 +87,7 @@ export class OpenCodeBackend {
       cwd: worktreePath,
       timeoutMs: this.timeoutMs,
       env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(INLINE_POLICY) },
+      onSpawn,
       onStdout: (text) => stdoutStream.write(text),
       onStderr: (text) => stderrStream.write(text),
     });

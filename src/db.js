@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   )),
   backend TEXT NOT NULL,
   model TEXT,
+  executor_pid INTEGER,
   worktree_path TEXT,
   worktree_locked INTEGER NOT NULL DEFAULT 0,
   quarantined INTEGER NOT NULL DEFAULT 0,
@@ -111,11 +112,23 @@ export function openDatabase(filename) {
   const db = new DatabaseSync(filename);
   db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA);
+  migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '1')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '2')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
+}
+
+function migrate(db) {
+  const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
+  if (!attemptColumns.includes("validation_state")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT 'NOT_RUN'");
+  }
+  if (!attemptColumns.includes("executor_pid")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN executor_pid INTEGER");
+  }
+  db.prepare("UPDATE metadata SET value = '2' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

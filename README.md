@@ -30,6 +30,9 @@ delegate-wave project list
 delegate-wave job create --project <project-id> --goal 'Fix the export bug'
 delegate-wave job run --job <job-id> --model <provider/model>
 delegate-wave job status --job <job-id>
+delegate-wave doctor
+delegate-wave reconcile          # preview only
+delegate-wave reconcile --apply  # fence and orphan dead executors
 ```
 
 The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it for testing with `DELEGATE_WAVE_DATA_ROOT`.
@@ -40,13 +43,16 @@ The OpenCode worker receives runtime permissions that allow reading and editing 
 
 Attempts are isolated as locked, detached Git worktrees. Failed attempts are marked quarantined in SQLite and retained for inspection. Two failures stop the job at `NEEDS_ATTENTION` by default.
 
+`doctor` checks SQLite integrity, missing repositories, and nonterminal attempts. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch, refuses to orphan an executor whose recorded PID is still alive, and classifies dead attempts without consulting a model.
+
 ## Not implemented yet
 
 - automatic or approved integration
-- scheduler crash reconciliation
 - semantic escalation across jobs
 - persistent OpenCode server lifecycle
 - Control API, MCP, Hermes, or T3 adapters
 - policy receipts and capability management
 
 Those remain outside the trusted bootstrap rather than being represented as finished.
+
+The implemented normative rules and traceability table are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md).

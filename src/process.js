@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 
 export function runProcess(command, args, options = {}) {
-  const { cwd, env, timeoutMs = 10 * 60_000, onStdout, onStderr } = options;
+  const { cwd, env, timeoutMs = 10 * 60_000, onSpawn, onStdout, onStderr } = options;
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -10,6 +10,13 @@ export function runProcess(command, args, options = {}) {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    try {
+      onSpawn?.(child.pid);
+    } catch (error) {
+      child.kill();
+      reject(error);
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;

@@ -117,3 +117,25 @@ test("validation failure rejects but preserves a completed executor attempt", as
   assert.equal(result.attempts[0].validation_state, "FAILED");
   assert.equal(result.attempts[0].quarantined, 1);
 });
+
+test("reconciliation orphans a dead fenced attempt without consulting a model", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "interrupted" });
+  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, backend, executor_pid, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'FakeBackend', NULL, ?, ?)`).run(
+    "attempt-dead", job.id, path.join(root, "missing-worktree"), new Date().toISOString(),
+  );
+  const preview = await service.reconcile();
+  assert.equal(preview.applied, false);
+  assert.equal(preview.observations[0].proposed, "ORPHAN");
+  assert.equal(service.status(job.id).attempts[0].terminal_state, null);
+  const result = await service.reconcile({ apply: true });
+  assert.equal(result.results[0].action, "ORPHANED");
+  assert.equal(service.status(job.id).attempts[0].terminal_state, "ORPHANED");
+  assert.equal(service.status(job.id).job.status, "PENDING");
+});
