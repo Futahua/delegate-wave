@@ -34,6 +34,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **ATT-009** A job claim MUST refuse while any lifecycle-active attempt or `RUNNING` job exists and MUST NOT advance the scheduler epoch on refusal.
 
+**ATT-010** Attempt creation MUST persist the owning scheduler process identity in the same transaction as epoch acquisition.
+
 ## Filesystem and Git
 
 **FS-001** Filesystem location MUST NOT determine lifecycle state or authority.
@@ -64,17 +66,19 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
 
+**VAL-006** A validation MUST record fenced durable intent before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
+
 ## Recovery
 
 **REC-001** Reconciliation MUST be read-only unless the operator explicitly requests application.
 
 **REC-002** Applied reconciliation MUST acquire a new scheduler fencing epoch before mutating abandoned attempts.
 
-**REC-003** Reconciliation MUST NOT orphan an attempt whose recorded executor process is still alive.
+**REC-003** Reconciliation MUST NOT recover an attempt while any recorded scheduler, executor, or validator process is still alive.
 
 **REC-004** A dead nonterminal attempt MAY be transitioned to `ORPHANED` without consulting a model.
 
-**REC-005** Applied reconciliation MUST NOT advance the scheduler epoch if any recorded executor is alive.
+**REC-005** Applied reconciliation MUST NOT advance the scheduler epoch if any recorded scheduler, executor, or validator process is alive.
 
 **REC-006** `doctor` and `reconcile` MUST detect both the executor-running (`terminal_state IS NULL`) and validation-pending (`SUCCEEDED` with `PENDING`) lifecycle phases.
 
@@ -89,12 +93,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
-| ATT-007–ATT-009 | `runJob` immediate claim transaction, lifecycle-active predicate | invalid invocation, live executor, blocked validation, and direct predicate tests |
+| ATT-007–ATT-010 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID receipt | invalid invocation, live executor, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| VAL-005, REC-001–REC-007 | `doctor`, `reconcile`, PID receipt, `VALIDATION_INTERRUPTED` | dead, live, and interrupted validation recovery tests |
+| VAL-005, VAL-006, REC-001–REC-007 | fenced validation intent/PID receipt, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead, live, genuine blocked-validator, and interrupted validation recovery tests |
 
 ## Known bootstrap limitations
 

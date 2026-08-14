@@ -125,9 +125,9 @@ export class Dispatcher {
       const epoch = currentEpoch + 1;
       this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
       this.db.prepare(`INSERT INTO attempts(
-        id, job_id, ordinal, scheduler_epoch, backend, model, worktree_path, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        attemptId, jobId, ordinal, epoch, this.backend.constructor.name, model, worktreePath, now(),
+        id, job_id, ordinal, scheduler_epoch, backend, model, scheduler_pid, worktree_path, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        attemptId, jobId, ordinal, epoch, this.backend.constructor.name, model, process.pid, worktreePath, now(),
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
@@ -213,10 +213,24 @@ export class Dispatcher {
     });
   }
 
+  recordValidationPid(attemptId, epoch, pid) {
+    this.acceptAttemptEvent(attemptId, epoch, () => {
+      this.db.prepare("UPDATE attempts SET validation_pid = ? WHERE id = ?").run(pid, attemptId);
+      recordEvent(this.db, { kind: "VALIDATION_STARTED", entityType: "attempt", entityId: attemptId, epoch, payload: { pid } });
+    }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
+  }
+
   async validate(attemptId, epoch, worktreePath, artifactDir, command) {
     const validationId = id("validation");
     const startedAt = now();
-    const result = await runShell(command, { cwd: worktreePath, timeoutMs: 15 * 60_000 });
+    this.acceptAttemptEvent(attemptId, epoch, () => {
+      recordEvent(this.db, { kind: "VALIDATION_INTENDED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, command } });
+    }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
+    const result = await runShell(command, {
+      cwd: worktreePath,
+      timeoutMs: 15 * 60_000,
+      onSpawn: (pid) => this.recordValidationPid(attemptId, epoch, pid),
+    });
     const outputPath = path.join(artifactDir, `${validationId}.log`);
     fs.writeFileSync(outputPath, `${result.stdout}\n${result.stderr}`, { flag: "wx" });
     this.acceptAttemptEvent(attemptId, epoch, () => {
@@ -225,6 +239,7 @@ export class Dispatcher {
       ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
         validationId, attemptId, command, result.exitCode, outputPath, startedAt, now(),
       );
+      this.db.prepare("UPDATE attempts SET validation_pid = NULL WHERE id = ?").run(attemptId);
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
@@ -274,7 +289,9 @@ export class Dispatcher {
       WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all().map((attempt) => ({
         ...attempt,
         phase: attempt.terminal_state === "SUCCEEDED" ? "VALIDATION" : "EXECUTOR",
+        scheduler_alive: isProcessAlive(attempt.scheduler_pid),
         executor_alive: isProcessAlive(attempt.executor_pid),
+        validation_alive: isProcessAlive(attempt.validation_pid),
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
       }));
     const missingRepositories = this.listProjects()
@@ -295,20 +312,27 @@ export class Dispatcher {
       WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all();
     const observations = running.map((attempt) => {
       const phase = attempt.terminal_state === "SUCCEEDED" ? "VALIDATION" : "EXECUTOR";
+      const schedulerAlive = isProcessAlive(attempt.scheduler_pid);
       const executorAlive = isProcessAlive(attempt.executor_pid);
+      const validationAlive = isProcessAlive(attempt.validation_pid);
+      const anyOwnerAlive = schedulerAlive || executorAlive || validationAlive;
       return {
         attempt_id: attempt.id,
         phase,
+        scheduler_pid: attempt.scheduler_pid,
+        scheduler_alive: schedulerAlive,
         executor_pid: attempt.executor_pid,
         executor_alive: executorAlive,
+        validation_pid: attempt.validation_pid,
+        validation_alive: validationAlive,
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
-        proposed: phase === "VALIDATION" ? "VALIDATION_INTERRUPTED"
-          : (executorAlive ? "LEAVE_RUNNING" : "ORPHAN"),
+        proposed: anyOwnerAlive ? "LEAVE_RUNNING"
+          : (phase === "VALIDATION" ? "VALIDATION_INTERRUPTED" : "ORPHAN"),
       };
     });
     if (!apply || running.length === 0) return { applied: false, observations };
-    if (observations.some((item) => item.executor_alive)) {
-      return { applied: false, refused: "LIVE_EXECUTOR", observations };
+    if (observations.some((item) => item.scheduler_alive || item.executor_alive || item.validation_alive)) {
+      return { applied: false, refused: "LIVE_ATTEMPT_PROCESS", observations };
     }
 
     let epoch;
@@ -319,9 +343,9 @@ export class Dispatcher {
           (SELECT COUNT(*) FROM attempts x WHERE x.job_id = a.job_id) AS attempt_count
           FROM attempts a JOIN jobs j ON j.id = a.job_id
           WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all();
-        if (candidates.some((attempt) => isProcessAlive(attempt.executor_pid))) {
-          const refusal = new Error("live executor appeared during reconciliation");
-          refusal.code = "LIVE_EXECUTOR";
+        if (candidates.some((attempt) => [attempt.scheduler_pid, attempt.executor_pid, attempt.validation_pid].some(isProcessAlive))) {
+          const refusal = new Error("live attempt process appeared during reconciliation");
+          refusal.code = "LIVE_ATTEMPT_PROCESS";
           throw refusal;
         }
         const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
@@ -344,7 +368,7 @@ export class Dispatcher {
         return { epoch: claimedEpoch, recovered: candidates };
       }));
     } catch (error) {
-      if (error.code === "LIVE_EXECUTOR") return { applied: false, refused: "LIVE_EXECUTOR", observations };
+      if (error.code === "LIVE_ATTEMPT_PROCESS") return { applied: false, refused: "LIVE_ATTEMPT_PROCESS", observations };
       throw error;
     }
     const applied = [];

@@ -91,3 +91,9 @@ A fresh disposable clone was reviewed read-only by `opencode-go/deepseek-v4-flas
 Its non-blocking findings were closed directly: reconciliation now conservatively refuses epoch movement for a live recorded PID in either lifecycle phase; the lifecycle-active predicate has an independent defense-in-depth test; interrupted validation recovery asserts epoch advancement and the retryable `PENDING` branch; and the Windows default-launch test skips machines without that exact global OpenCode installation while explicit overrides remain portable.
 
 The full regression suite now passes 16 tests. Total reported OpenCode Go cost through the independent audit is `$0.0154583548`.
+
+## Live validator ownership follow-up
+
+Final remote review identified that production validation processes were not represented by the old `executor_pid`. The schema now records `scheduler_pid`, `executor_pid`, and `validation_pid` separately. Attempt claim durably records the scheduler owner; validation records fenced intent before launch and publishes the real shell PID through a fenced spawn callback; reconciliation refuses epoch movement while any recorded owner is alive.
+
+The blocked-validation regression now waits for a real validation spawn receipt, verifies that PID is live, removes the scheduler receipt to isolate the validator fence, runs applied reconciliation, and proves that reconciliation refuses without moving the epoch. After release, the original attempt reaches `READY_FOR_INTEGRATION`. The suite remains 16 tests because this production-path test replaces the earlier synthetic validation-PID test.

@@ -163,7 +163,7 @@ test("reconciliation refuses a live executor without advancing the epoch", async
   const reconciliation = await service.reconcile({ apply: true });
   const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
   assert.equal(reconciliation.applied, false);
-  assert.equal(reconciliation.refused, "LIVE_EXECUTOR");
+  assert.equal(reconciliation.refused, "LIVE_ATTEMPT_PROCESS");
   assert.equal(epochAfter, epochBefore);
   releaseWorker();
   const result = await run;
@@ -171,27 +171,35 @@ test("reconciliation refuses a live executor without advancing the epoch", async
   assert.equal(result.attempts[0].terminal_state, "SUCCEEDED");
 });
 
-test("reconciliation refuses any live recorded PID during validation without advancing the epoch", async (t) => {
+test("the scheduler PID fences reconciliation before an executor PID is published", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
-  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  let releaseWorker;
+  let reportEntered;
+  const workerEntered = new Promise((resolve) => { reportEntered = resolve; });
+  const workerRelease = new Promise((resolve) => { releaseWorker = resolve; });
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    reportEntered();
+    await workerRelease;
+    fs.writeFileSync(path.join(worktreePath, "scheduler-owned.txt"), "completed\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
   t.after(async () => { service.close(); await cleanup(); });
   const project = await service.addProject({ name: "Fixture", repoPath: repo });
-  const job = await service.createJob({ projectId: project.id, goal: "validation pid fence" });
-  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
-  service.db.prepare(`INSERT INTO attempts(
-    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
-    backend, executor_pid, worktree_path, started_at
-  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?, ?)`).run(
-    "attempt-live-validation-pid", job.id, process.pid, repo, new Date().toISOString(),
-  );
+  const job = await service.createJob({ projectId: project.id, goal: "scheduler ownership gap" });
+  const run = service.runJob(job.id);
+  await workerEntered;
+  const attempt = service.status(job.id).attempts[0];
+  assert.equal(attempt.scheduler_pid, process.pid);
+  assert.equal(attempt.executor_pid, null);
   const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
-  const result = await service.reconcile({ apply: true });
-  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
-  assert.equal(result.applied, false);
-  assert.equal(result.refused, "LIVE_EXECUTOR");
-  assert.equal(result.observations[0].phase, "VALIDATION");
-  assert.equal(epochAfter, epochBefore);
-  assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
+  const reconciliation = await service.reconcile({ apply: true });
+  assert.equal(reconciliation.applied, false);
+  assert.equal(reconciliation.refused, "LIVE_ATTEMPT_PROCESS");
+  assert.equal(reconciliation.observations[0].scheduler_alive, true);
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+  releaseWorker();
+  assert.equal((await run).job.status, "READY_FOR_INTEGRATION");
 });
 
 test("invalid job invocation does not consume a scheduler epoch", async (t) => {
@@ -224,7 +232,12 @@ test("stale validation and failure callbacks leave authoritative state unchanged
     attemptId, job.id, repo, new Date().toISOString(),
   );
   service.db.prepare("UPDATE metadata SET value = '2' WHERE key = 'scheduler_epoch'").run();
-  await assert.rejects(service.validate(attemptId, 1, repo, artifactDir, "exit 0"), /Stale/);
+  const staleValidator = path.join(root, "stale-validator.js");
+  const staleSideEffect = path.join(root, "stale-validation-ran.txt");
+  fs.writeFileSync(staleValidator, "require('fs').writeFileSync(process.argv[2], 'ran\\n');\n");
+  const staleCommand = `node ${JSON.stringify(staleValidator.replaceAll("\\", "/"))} ${JSON.stringify(staleSideEffect.replaceAll("\\", "/"))}`;
+  await assert.rejects(service.validate(attemptId, 1, repo, artifactDir, staleCommand), /Stale/);
+  assert.equal(fs.existsSync(staleSideEffect), false);
   assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM validation_runs WHERE attempt_id = ?").get(attemptId).count, 0);
   const failureApplied = await service.failAttempt({
     attemptId,
@@ -280,7 +293,7 @@ async function waitFor(predicate, timeoutMs = 10_000) {
   throw new Error("timed out waiting for condition");
 }
 
-test("a blocked validation fences a concurrent claim without epoch movement, then finishes normally", async (t) => {
+test("a real blocked validator fences claims and reconciliation without epoch movement, then finishes normally", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const waiter = path.join(root, "waiter.js");
   const release = path.join(root, "release.marker");
@@ -310,13 +323,30 @@ test("a blocked validation fences a concurrent claim without epoch movement, the
   const attemptId = `${first.id}.1`;
   await waitFor(() => {
     const attempt = service.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
-    return attempt && attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING";
+    return attempt
+      && attempt.terminal_state === "SUCCEEDED"
+      && attempt.validation_state === "PENDING"
+      && Number.isInteger(attempt.validation_pid);
   });
+  const activeAttempt = service.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
+  assert.equal(activeAttempt.scheduler_pid, process.pid);
+  assert.notEqual(activeAttempt.validation_pid, process.pid);
+  assert.doesNotThrow(() => process.kill(activeAttempt.validation_pid, 0));
   const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
   await assert.rejects(service.runJob(second.id), /running job|live attempt/);
-  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
-  assert.equal(epochAfter, epochBefore);
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
   assert.equal(service.getJob(second.id).status, "PENDING");
+
+  // Isolate the validator receipt: even without the scheduler owner, the real spawned validator fences recovery.
+  service.db.prepare("UPDATE attempts SET scheduler_pid = NULL WHERE id = ?").run(attemptId);
+  const reconciliation = await service.reconcile({ apply: true });
+  assert.equal(reconciliation.applied, false);
+  assert.equal(reconciliation.refused, "LIVE_ATTEMPT_PROCESS");
+  assert.equal(reconciliation.observations[0].phase, "VALIDATION");
+  assert.equal(reconciliation.observations[0].validation_pid, activeAttempt.validation_pid);
+  assert.equal(reconciliation.observations[0].validation_alive, true);
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+
   fs.writeFileSync(release, "go\n");
   const result = await run;
   assert.equal(result.job.status, "READY_FOR_INTEGRATION");

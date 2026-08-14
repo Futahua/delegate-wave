@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   )),
   backend TEXT NOT NULL,
   model TEXT,
+  scheduler_pid INTEGER,
   executor_pid INTEGER,
+  validation_pid INTEGER,
   worktree_path TEXT,
   worktree_locked INTEGER NOT NULL DEFAULT 0,
   quarantined INTEGER NOT NULL DEFAULT 0,
@@ -114,7 +116,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '2')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '3')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -128,7 +130,13 @@ function migrate(db) {
   if (!attemptColumns.includes("executor_pid")) {
     db.exec("ALTER TABLE attempts ADD COLUMN executor_pid INTEGER");
   }
-  db.prepare("UPDATE metadata SET value = '2' WHERE key = 'schema_version'").run();
+  if (!attemptColumns.includes("scheduler_pid")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN scheduler_pid INTEGER");
+  }
+  if (!attemptColumns.includes("validation_pid")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN validation_pid INTEGER");
+  }
+  db.prepare("UPDATE metadata SET value = '3' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {
