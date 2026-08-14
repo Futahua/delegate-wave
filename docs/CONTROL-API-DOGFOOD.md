@@ -57,3 +57,9 @@ Codex           → cross-cutting authority/state design when workers exhaust bo
 ```
 
 Total model spend recorded for this PR dogfood: `$0.0763692726`.
+
+## Post-merge real API self-dogfood
+
+PR #4 merged as `f29677b`. The real localhost Control API created and ran this documentation-only
+DeepSeek Flash job through the CLI, the control token was scrubbed from child processes, and
+`npm test` was the validation gate.
