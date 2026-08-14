@@ -45,7 +45,7 @@ Commands:
   integration propose --job ID
   integration run --proposal ID
   integration show --proposal ID
-  approval grant --proposal ID --principal ID --origin CHANNEL [--expires-at ISO] [--idempotency-key KEY]
+  approval grant --proposal ID --principal ID --origin CHANNEL [--expires-at ISO] [--maximum-cost AMOUNT] [--idempotency-key KEY]
   approval list [--proposal ID]
   doctor
   reconcile [--apply]
@@ -110,6 +110,7 @@ async function main() {
         principal: required(options, "principal"),
         origin: required(options, "origin"),
         expiresAt: options["expires-at"] || null,
+        maximumCost: options["maximum-cost"] === undefined ? null : Number(options["maximum-cost"]),
         idempotencyKey: options["idempotency-key"] || null,
       }));
     } else if (resource === "approval" && action === "list") {

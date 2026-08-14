@@ -109,6 +109,9 @@ CREATE TABLE IF NOT EXISTS approval_receipts (
   expires_at TEXT,
   idempotency_key TEXT UNIQUE,
   granted_digest TEXT NOT NULL,
+  expected_state_version TEXT NOT NULL,
+  granted_scope TEXT NOT NULL,
+  maximum_cost REAL,
   granted_at TEXT NOT NULL
 );
 
@@ -201,7 +204,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '7')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '8')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -238,13 +241,22 @@ function migrate(db) {
     if (approvalColumns.includes("consumed_at")) db.exec("ALTER TABLE approval_receipts DROP COLUMN consumed_at");
     db.exec("CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id)");
   }
+  if (!approvalColumns.includes("expected_state_version")) {
+    db.exec("ALTER TABLE approval_receipts ADD COLUMN expected_state_version TEXT NOT NULL DEFAULT ''");
+  }
+  if (!approvalColumns.includes("granted_scope")) {
+    db.exec("ALTER TABLE approval_receipts ADD COLUMN granted_scope TEXT NOT NULL DEFAULT 'integration'");
+  }
+  if (!approvalColumns.includes("maximum_cost")) {
+    db.exec("ALTER TABLE approval_receipts ADD COLUMN maximum_cost REAL");
+  }
   const operationColumns = db.prepare("PRAGMA table_info(integration_operations)").all().map((column) => column.name);
   for (const column of ["action_digest", "base_sha", "candidate_commit", "integration_branch", "validation_plan_digest"]) {
     if (!operationColumns.includes(column)) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
-  db.prepare("UPDATE metadata SET value = '7' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE metadata SET value = '8' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

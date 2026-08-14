@@ -19,8 +19,9 @@ SHA-256 hex over a canonical `\n`-joined record.
 **INT-004** `expected_integration_head` MUST be the integration branch tip resolved when the
 proposal is recorded.
 
-**INT-005** `validation_plan_digest` MUST be the digest of the project's validation command plan
-at proposal time.
+**INT-005** A proposal MUST store the exact ordered validation command plan from proposal time and
+`validation_plan_digest` MUST bind that snapshot. Later project configuration changes MUST NOT
+change the commands executed for the proposal.
 
 **INT-006** One attempt MUST have at most one proposal. Re-proposing the same candidate MUST
 return the existing proposal unchanged and MUST refuse if the derivable digest differs.
@@ -30,7 +31,9 @@ return the existing proposal unchanged and MUST refuse if the derivable digest d
 **APP-001** An approval receipt MUST be immutable in its granted authority: it grants exactly the
 proposal's action digest and nothing broader.
 
-**APP-002** An approval MUST record the granting principal, origin channel, and optional expiry.
+**APP-002** An approval MUST record the granting principal, origin channel, expected state version,
+granted scope, optional maximum cost, and optional expiry. For this slice, the expected state
+version is the action digest and the only granted scope is `integration`.
 
 **APP-003** Repeating a grant for the same principal and unconsumed proposal MUST return the
 existing receipt. Reusing an idempotency key MUST return the existing receipt and MUST refuse if
@@ -41,8 +44,9 @@ approval whose granted digest equals the proposal's action digest.
 
 ## Integration runs
 
-**INT-RUN-001** An integration run MUST atomically validate and consume one unexpired approval
-and MUST record durable operation intent in one immediate transaction.
+**INT-RUN-001** An integration run MUST atomically select one unexpired, unconsumed approval and
+record durable immutable operation intent in one immediate transaction. The operation's reference
+to that receipt constitutes consumption.
 
 **INT-RUN-002** A run MUST refuse while any `INTENDED` operation exists for the proposal.
 
@@ -51,8 +55,8 @@ and MUST record durable operation intent in one immediate transaction.
 **INT-RUN-004** A run MUST refuse if the current integration branch tip differs from the
 proposal's `expected_integration_head`.
 
-**INT-RUN-005** A run MUST refuse if the current validation plan digest differs from the
-proposal's `validation_plan_digest`.
+**INT-RUN-005** A run MUST recompute the digest of the stored validation-plan snapshot, refuse if
+the snapshot no longer matches its digest, and MUST execute only that stored snapshot.
 
 **INT-RUN-006** A run MUST verify the candidate descends from `base_sha` before proceeding.
 
@@ -65,17 +69,19 @@ deterministic validation plan in that worktree before advancing any branch.
 **INT-RUN-009** The integration branch MUST be advanced only by compare-and-swap against
 `expected_integration_head` (`git update-ref <ref> <new> <expected-old>`).
 
-**INT-RUN-010** Any pre-CAS or CAS failure MUST leave the branch tip unchanged and MUST record a
-`FAILED` operation. A failed proposal remains `OPEN` and MAY be retried with a fresh approval.
+**INT-RUN-010** After operation intent is durable, any pre-CAS or CAS failure MUST leave the branch
+tip unchanged and append an `INTEGRATION_FAILED` terminal record. A failed proposal remains `OPEN`
+and MAY be retried only with a fresh approval and a new operation.
 
-**INT-RUN-011** A successful run MUST mark the operation `SUCCEEDED`, record the new head, mark
-the proposal `INTEGRATED`, and transition the job to `SUCCEEDED`.
+**INT-RUN-011** A successful run MUST append `INTEGRATION_SUCCEEDED` and `PROPOSAL_INTEGRATED`
+records containing the new head and transition the job to `SUCCEEDED`. Operation and proposal
+status MUST be derived from immutable records; their stored intent rows MUST NOT be mutated.
 
 **INT-RUN-012** Re-running a successful proposal MUST be idempotent: it returns the recorded
 success and consumes no additional approval.
 
-**INT-RUN-013** Conflicting state (a successful operation on a non-`INTEGRATED` proposal) MUST be
-refused as inconsistent.
+**INT-RUN-013** An operation intent without an immutable terminal record MUST fail closed and MUST
+NOT be rerun automatically.
 
 ## Traceability
 
@@ -86,11 +92,11 @@ refused as inconsistent.
 | INT-RUN-001–INT-RUN-002 | immediate claim transaction with approval consumption and `INTENDED` operation | happy-path and validation-failure tests |
 | INT-RUN-003 | `git worktree list --porcelain` branch check | checked-out-elsewhere test |
 | INT-RUN-004 | `resolveRevision` comparison | stale-head test |
-| INT-RUN-005 | re-derived plan digest comparison | stale-digest test |
+| INT-RUN-005 | stored plan snapshot and re-derived digest comparison | snapshot and tamper tests |
 | INT-RUN-006 | `git merge-base --is-ancestor` | happy-path test |
 | INT-RUN-007–INT-RUN-008 | integration-root detached worktree, cherry-pick, validation re-run | happy-path and validation-failure tests |
-| INT-RUN-009–INT-RUN-010 | `git update-ref` CAS, `FAILED` operation on error | stale-head and no-branch-movement tests |
-| INT-RUN-011–INT-RUN-013 | success transaction, idempotent early return | happy-path and idempotency tests |
+| INT-RUN-009–INT-RUN-010 | `git update-ref` CAS, immutable failure record | stale-head, ancestry, validation-failure, and no-branch-movement tests |
+| INT-RUN-011–INT-RUN-013 | immutable terminal records, derived status, idempotent early return | happy-path, immutability, stuck-intent, and idempotency tests |
 
 ## Out of scope for this slice
 

@@ -61,4 +61,4 @@ Applied reconciliation starts a new fencing epoch only after proving recorded sc
 
 ## 7. READY_FOR_INTEGRATION requires manual review
 
-A successful write job stops at `READY_FOR_INTEGRATION` and is **never** integrated automatically. A human or Codex must inspect the candidate commit in the attempt worktree, then integrate it with Git manually. Apply changes only after explicit operator approval.
+A successful write job stops at `READY_FOR_INTEGRATION` and is **never** integrated automatically. A human or Codex must inspect the candidate commit, create an integration proposal, and grant an exact approval receipt. Run `delegate-wave integration run --proposal <id>` only after approval; the dispatcher uses its managed detached worktree and compare-and-swap rather than modifying the user's checkout.

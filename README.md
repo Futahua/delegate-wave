@@ -32,7 +32,7 @@ delegate-wave job run --job <job-id> --model <provider/model>
 delegate-wave job status --job <job-id>
 
 delegate-wave integration propose --job <job-id>
-delegate-wave approval grant --proposal <proposal-id> --principal <id> --origin <channel>
+delegate-wave approval grant --proposal <proposal-id> --principal <id> --origin <channel> [--maximum-cost <amount>]
 delegate-wave integration run --proposal <proposal-id>
 
 delegate-wave doctor
@@ -52,7 +52,7 @@ Attempts are isolated as locked, detached Git worktrees. Failed attempts are mar
 
 ## Not implemented yet
 
-- automatic or approved integration
+- automatic integration (approved integration is intentionally explicit)
 - semantic escalation across jobs
 - persistent OpenCode server lifecycle
 - Control API, MCP, Hermes, or T3 adapters

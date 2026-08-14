@@ -383,12 +383,18 @@ export class Dispatcher {
     return this.getProposal(proposalId);
   }
 
-  grantApproval({ proposalId, principal, origin, expiresAt = null, idempotencyKey = null }) {
+  grantApproval({ proposalId, principal, origin, expiresAt = null, idempotencyKey = null, maximumCost = null }) {
     const proposal = this.getProposal(proposalId);
     if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
-    if (proposal.state !== "OPEN") throw new Error(`Proposal ${proposalId} is ${proposal.state}`);
+    const integrated = this.db.prepare(
+      "SELECT 1 FROM integration_records WHERE proposal_id = ? AND kind = 'PROPOSAL_INTEGRATED' LIMIT 1",
+    ).get(proposalId);
+    if (integrated) throw new Error(`Proposal ${proposalId} is INTEGRATED`);
     if (!principal || !principal.trim()) throw new Error("principal is required");
     if (!origin || !origin.trim()) throw new Error("origin is required");
+    if (maximumCost !== null && (!Number.isFinite(Number(maximumCost)) || Number(maximumCost) < 0)) {
+      throw new Error("maximumCost must be a non-negative number");
+    }
     if (expiresAt) {
       const parsed = new Date(expiresAt);
       if (Number.isNaN(parsed.getTime())) throw new Error(`Invalid --expires-at: ${expiresAt}`);
@@ -404,7 +410,10 @@ export class Dispatcher {
         return keyed;
       }
     }
-    const existing = this.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ? AND principal = ?").get(proposalId, principal);
+    const existing = this.db.prepare(`SELECT * FROM approval_receipts
+      WHERE proposal_id = ? AND principal = ?
+        AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY granted_at DESC LIMIT 1`).get(proposalId, principal, now());
     if (existing) {
       if (existing.granted_digest !== proposal.action_digest) {
         throw new Error(`Existing approval ${existing.id} grants a different digest`);
@@ -414,9 +423,11 @@ export class Dispatcher {
     }
     const receiptId = id("approval");
     this.db.prepare(`INSERT INTO approval_receipts(
-      id, proposal_id, principal, origin, expires_at, idempotency_key, granted_digest, granted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      receiptId, proposalId, principal, origin, expiresAt, idempotencyKey, proposal.action_digest, now(),
+      id, proposal_id, principal, origin, expires_at, idempotency_key, granted_digest,
+      expected_state_version, granted_scope, maximum_cost, granted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'integration', ?, ?)`).run(
+      receiptId, proposalId, principal, origin, expiresAt, idempotencyKey, proposal.action_digest,
+      proposal.action_digest, maximumCost === null ? null : Number(maximumCost), now(),
     );
     recordEvent(this.db, {
       kind: "APPROVAL_GRANTED", entityType: "approval", entityId: receiptId,
@@ -494,12 +505,6 @@ export class Dispatcher {
       throw new Error(`Action digest mismatch for proposal ${proposalId}`);
     }
 
-    const branchRef = `refs/heads/${proposal.integration_branch}`;
-    await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
-    if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
-      throw new Error(`Candidate ${proposal.candidate_commit} does not descend from base ${proposal.base_sha}`);
-    }
-
     const claim = transaction(this.db, () => {
       const current = this.getProposal(proposalId);
       if (!current) throw new Error(`Proposal ${proposalId} no longer exists`);
@@ -509,11 +514,15 @@ export class Dispatcher {
       const receipt = this.db.prepare(`SELECT r.* FROM approval_receipts r
         WHERE r.proposal_id = ?
           AND r.granted_digest = ?
+          AND r.expected_state_version = ?
+          AND r.granted_scope = 'integration'
           AND (r.expires_at IS NULL OR r.expires_at > ?)
           AND NOT EXISTS (
             SELECT 1 FROM integration_operations o WHERE o.approval_receipt_id = r.id
           )
-        ORDER BY r.granted_at LIMIT 1`).get(proposalId, proposal.action_digest, now());
+        ORDER BY r.granted_at LIMIT 1`).get(
+        proposalId, proposal.action_digest, proposal.action_digest, now(),
+      );
       if (!receipt) throw new Error(`No unexpired unconsumed approval for proposal ${proposalId}`);
       const operationId = id("integration_op");
       const worktreePath = path.join(this.paths.integration, project.id, proposal.id);
@@ -542,7 +551,12 @@ export class Dispatcher {
     });
 
     const { operationId, worktreePath } = claim;
+    const branchRef = `refs/heads/${proposal.integration_branch}`;
     try {
+      await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
+      if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
+        throw new Error(`Candidate ${proposal.candidate_commit} does not descend from base ${proposal.base_sha}`);
+      }
       await removeWorktree(project.repo_path, worktreePath);
       await createDetachedWorktree(project.repo_path, worktreePath, proposal.expected_integration_head);
       this.recordIntegrationRecord(operationId, proposalId, "WORKTREE_CREATED", worktreePath);
@@ -580,11 +594,31 @@ export class Dispatcher {
   }
 
   integrationStatus(proposalId) {
-    const proposal = this.getProposal(proposalId);
-    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
-    const approvals = this.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at").all(proposalId);
-    const operations = this.db.prepare("SELECT * FROM integration_operations WHERE proposal_id = ? ORDER BY created_at").all(proposalId);
+    const storedProposal = this.getProposal(proposalId);
+    if (!storedProposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
     const records = this.db.prepare("SELECT * FROM integration_records WHERE proposal_id = ? ORDER BY sequence").all(proposalId);
+    const integrated = records.find((record) => record.kind === "PROPOSAL_INTEGRATED");
+    const proposal = { ...storedProposal, state: integrated ? "INTEGRATED" : storedProposal.state };
+    const storedApprovals = this.db.prepare(
+      "SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at",
+    ).all(proposalId);
+    const storedOperations = this.db.prepare(
+      "SELECT * FROM integration_operations WHERE proposal_id = ? ORDER BY created_at",
+    ).all(proposalId);
+    const approvals = storedApprovals.map((approval) => ({
+      ...approval,
+      consumed: storedOperations.some((operation) => operation.approval_receipt_id === approval.id) ? 1 : 0,
+    }));
+    const operations = storedOperations.map((operation) => {
+      const terminal = records.find((record) => record.operation_id === operation.id
+        && (record.kind === "INTEGRATION_SUCCEEDED" || record.kind === "INTEGRATION_FAILED"));
+      return {
+        ...operation,
+        state: terminal?.kind === "INTEGRATION_SUCCEEDED" ? "SUCCEEDED"
+          : (terminal?.kind === "INTEGRATION_FAILED" ? "FAILED" : "INTENDED"),
+        new_head: terminal?.kind === "INTEGRATION_SUCCEEDED" ? terminal.detail : null,
+      };
+    });
     return { proposal, approvals, operations, records };
   }
 
