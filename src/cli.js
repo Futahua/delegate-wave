@@ -73,6 +73,7 @@ Commands:
   integration show --proposal ID
   approval grant --proposal ID [--expires-at ISO] [--maximum-cost AMOUNT] [--idempotency-key KEY]
   approval list [--proposal ID]
+  status                              what is working, needs a decision, is ready, or finished
   attention
   doctor
   reconcile [--apply]
@@ -159,6 +160,8 @@ async function main() {
   const [resource, action] = positional;
   if (resource === "init" || resource === "doctor") {
     print(await client.get("/v1/health"));
+  } else if (resource === "status") {
+    print(await client.get("/v1/briefing"));
   } else if (resource === "attention") {
     print(await client.get("/v1/attention"));
   } else if (resource === "reconcile") {

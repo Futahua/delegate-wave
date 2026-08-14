@@ -54,6 +54,7 @@ export class ControlService {
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       attention: () => this.dispatcher.attention(),
+      briefing: () => this.dispatcher.briefing(),
     };
     const handler = handlers[command];
     if (!handler) throw new ControlError("UNKNOWN_COMMAND", `Unknown query command: ${command}`, 404);

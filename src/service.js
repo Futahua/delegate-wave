@@ -789,6 +789,122 @@ export class Dispatcher {
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
   }
 
+  // --- Everyday status --------------------------------------------------------------------------
+  //
+  // One bounded answer to "what is happening", written for a person rather than for a machine.
+  //
+  // Four states, because those are the four things worth knowing: something is running, something
+  // needs a decision, something is ready to check, or something finished. Raw transcripts, worktree
+  // paths, and internal identifiers are deliberately absent -- they are available on request through
+  // the detailed endpoints, and putting them here would bury the answer.
+  briefing({ limit = 8 } = {}) {
+    const doctor = this.doctor();
+    const short = (text, max = 90) => {
+      const clean = String(text ?? "").replace(/\s+/g, " ").trim();
+      return clean.length > max ? `${clean.slice(0, max - 1)}...` : clean;
+    };
+    const money = (value) => (value === null || value === undefined ? null : Number(value.toFixed(6)));
+
+    // Cost is reported with its completeness, never as a bare number that might be silently partial.
+    const jobCost = (jobId) => {
+      const spend = this.jobSpend(jobId);
+      return {
+        reference_cost_usd: money(spend.spent),
+        complete: spend.complete,
+        ...(spend.complete ? {} : { unmeasured_attempts: spend.unpriced_attempts }),
+      };
+    };
+
+    const working = this.db.prepare(`SELECT j.id, j.goal, p.name AS project, j.updated_at
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'RUNNING' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
+
+    const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
+      decision: "authorize or reject this work",
+      proposal: row.id,
+      project: this.getProject(row.project_id)?.name ?? row.project_id,
+      goal: short(row.goal),
+      ceiling_usd: money(row.maximum_cost),
+      expires_at: row.expires_at,
+    }));
+
+    const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, j.goal, p.name AS project
+      FROM integration_proposals ip
+      JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
+      WHERE ip.state = 'OPEN' ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        decision: "approve to integrate, or roll back later",
+        proposal: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        cost: jobCost(row.job_id),
+      }));
+
+    const attention = this.db.prepare(`SELECT j.id, j.goal, j.status, p.name AS project,
+        (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id
+         ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'NEEDS_ATTENTION' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        job: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        why: this.lastFailureReason(row.id),
+        cost: jobCost(row.id),
+      }));
+
+    const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'SUCCEEDED' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        job: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        finished: row.updated_at,
+        changed: this.integratedFiles(row.id),
+        cost: jobCost(row.id),
+      }));
+
+    return {
+      schema_version: 1,
+      healthy: doctor.healthy,
+      working,
+      needs_your_decision: [...proposals, ...candidates],
+      ready_to_check: attention,
+      done,
+      ...(doctor.healthy ? {} : { health_detail: {
+        missing_repositories: doctor.missing_repositories.length,
+        unresolved_integrations: doctor.unresolved_integrations.length,
+      } }),
+    };
+  }
+
+  // The most recent failure in plain language, taken from the recorded event rather than a
+  // transcript. A person needs to know what went wrong, not what the model said while it happened.
+  lastFailureReason(jobId) {
+    const row = this.db.prepare(`SELECT e.payload_json FROM events e
+      JOIN attempts a ON a.id = e.entity_id
+      WHERE a.job_id = ? AND e.kind = 'ATTEMPT_FAILED'
+      ORDER BY e.sequence DESC LIMIT 1`).get(jobId);
+    if (!row) return "stopped without a recorded reason";
+    try {
+      const message = JSON.parse(row.payload_json).message ?? "";
+      return String(message).replace(/\s+/g, " ").trim().slice(0, 200) || "stopped without a recorded reason";
+    } catch {
+      return "stopped without a recorded reason";
+    }
+  }
+
+  // What actually landed, so "Done" can say what changed rather than only that something did.
+  integratedFiles(jobId) {
+    const record = this.db.prepare(`SELECT r.detail FROM integration_records r
+      JOIN integration_proposals ip ON ip.id = r.proposal_id
+      WHERE ip.job_id = ? AND r.kind = 'INTEGRATION_SUCCEEDED'
+      ORDER BY r.sequence DESC LIMIT 1`).get(jobId);
+    return record ? { integrated_commit: record.detail } : null;
+  }
+
   // --- Auto-advance -----------------------------------------------------------------------------
   //
   // Human authority is preserved exactly where it matters and removed everywhere it was ceremony.

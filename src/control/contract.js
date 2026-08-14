@@ -28,6 +28,7 @@ export const ROUTES = Object.freeze([
   { method: "GET", pattern: /^\/v1\/approvals$/, command: "approval.list", scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/integration\/([^/]+)\/run$/, command: "integration.run", params: ["proposalId"], mutation: true, scope: SCOPES.OPERATE },
   { method: "GET", pattern: /^\/v1\/attention$/, command: "attention", scope: SCOPES.READ },
+  { method: "GET", pattern: /^\/v1\/briefing$/, command: "briefing", scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/reconcile$/, command: "reconcile", mutation: true, scope: SCOPES.OPERATE },
   { method: "POST", pattern: /^\/v1\/jobs\/([^/]+)\/cancel$/, command: "job.cancel", params: ["jobId"], mutation: true, scope: SCOPES.OPERATE },
   // Recovery: explicit operator operations so a problem never requires editing SQLite or Git by hand.
