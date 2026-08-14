@@ -298,11 +298,34 @@ test("the CAS primitive refuses a branch checked out after any scheduler prechec
   const next = await command("git", ["-C", repo, "commit-tree", tree, "-p", expected, "-m", "next"]);
   const other = path.join(temp, "late-checkout");
   await command("git", ["-C", repo, "worktree", "add", other, "integration"]);
+  await command("git", ["-C", repo, "config", "receive.denyCurrentBranch", "ignore"]);
   await assert.rejects(
     updateRefCas(repo, "refs/heads/integration", next, expected),
     /refusing to update checked out branch/,
   );
   assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), expected);
+});
+
+test("production CAS refuses a checkout created between the final precheck and ref transaction", async (t) => {
+  const { temp, root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  await command("git", ["-C", repo, "config", "receive.denyCurrentBranch", "ignore"]);
+  const other = path.join(temp, "racing-checkout");
+  const originalCheck = service.assertIntegrationHeadUnchanged.bind(service);
+  let checks = 0;
+  service.assertIntegrationHeadUnchanged = async (...args) => {
+    await originalCheck(...args);
+    checks += 1;
+    if (checks === 2) await command("git", ["-C", repo, "worktree", "add", other, "integration"]);
+  };
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /refusing to update checked out branch/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+  assert.equal(service.integrationStatus(proposal.id).operations[0].state, "FAILED");
 });
 
 test("candidate ancestry failure is terminal and consumes only its exact approval", async (t) => {
@@ -391,6 +414,28 @@ test("a receipt failure after CAS remains uncertain instead of being mislabeled 
   await assert.rejects(service.runIntegration(proposal.id), /stuck without a terminal outcome/);
 });
 
+test("an ambiguous CAS error is reconciled from the ref instead of recording false failure", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({
+    root,
+    backend: writeCandidateBackend("candidate\n"),
+    updateRef: async (...args) => {
+      await updateRefCas(...args);
+      throw new Error("injected lost receive-pack acknowledgement");
+    },
+  });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /outcome is uncertain/);
+  assert.notEqual(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+  const status = service.integrationStatus(proposal.id);
+  assert.equal(status.operations[0].state, "INTENDED");
+  assert.equal(status.records.some((record) => record.kind === "INTEGRATION_FAILED"), false);
+});
+
 test("proposal creation refuses a non-ready or non-write job", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
@@ -400,4 +445,17 @@ test("proposal creation refuses a non-ready or non-write job", async (t) => {
   await assert.rejects(service.proposeIntegration({ jobId: pending.id }), /expected READY_FOR_INTEGRATION/);
   const read = await service.createJob({ projectId: project.id, goal: "read only", mode: "read" });
   await assert.rejects(service.proposeIntegration({ jobId: read.id }), /only write jobs/);
+});
+
+test("malformed project validation config is rejected before worker claim", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "must not run" });
+  service.db.prepare("UPDATE projects SET validation_json = ? WHERE id = ?").run("{", project.id);
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  await assert.rejects(service.runJob(job.id), /Stored validation plan is not valid JSON/);
+  assert.equal(service.status(job.id).attempts.length, 0);
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
 });

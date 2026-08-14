@@ -60,10 +60,11 @@ function normalizeFailureSignature(text) {
 }
 
 export class Dispatcher {
-  constructor({ root, backend }) {
+  constructor({ root, backend, updateRef = updateRefCas }) {
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
     this.backend = backend;
+    this.updateRef = updateRef;
   }
 
   close() { this.db.close(); }
@@ -125,6 +126,7 @@ export class Dispatcher {
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
     const project = this.getProject(job.project_id);
+    const validationPlan = job.mode === "write" ? parseValidationPlan(project.validation_json) : [];
     const claim = transaction(this.db, () => {
       const current = this.getJob(jobId);
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
@@ -188,8 +190,7 @@ export class Dispatcher {
         recordEvent(this.db, { kind: "EXECUTOR_SUCCEEDED", entityType: "attempt", entityId: attemptId, epoch, payload: { executorIntentId, files, resultCommit } });
       }, { terminalState: null, validationState: "NOT_RUN" });
 
-      const validations = job.mode === "write" ? parseJson(project.validation_json) : [];
-      for (const command of validations) await this.validate(attemptId, epoch, worktreePath, artifactDir, command);
+      for (const command of validationPlan) await this.validate(attemptId, epoch, worktreePath, artifactDir, command);
 
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET validation_state = 'PASSED' WHERE id = ?").run(attemptId);
@@ -361,7 +362,7 @@ export class Dispatcher {
     if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
     const project = this.getProject(job.project_id);
     const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);
-    const planCommands = parseJson(project.validation_json);
+    const planCommands = parseValidationPlan(project.validation_json);
     const planJson = JSON.stringify(planCommands);
     const planDigest = this.planDigest(planCommands);
     const digest = this.actionDigest({
@@ -566,6 +567,7 @@ export class Dispatcher {
     const { operationId, worktreePath } = claim;
     const branchRef = `refs/heads/${proposal.integration_branch}`;
     let branchAdvanced = false;
+    let branchOutcomeUncertain = false;
     try {
       await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
       if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
@@ -581,8 +583,19 @@ export class Dispatcher {
       this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCE_INTENDED", JSON.stringify({
         branchRef, newHead, expectedHead: proposal.expected_integration_head,
       }));
-      await updateRefCas(project.repo_path, branchRef, newHead, proposal.expected_integration_head);
-      branchAdvanced = true;
+      try {
+        await this.updateRef(project.repo_path, branchRef, newHead, proposal.expected_integration_head);
+        branchAdvanced = true;
+      } catch (casError) {
+        try {
+          const observedHead = await resolveRevision(project.repo_path, proposal.integration_branch);
+          if (observedHead === newHead) branchAdvanced = true;
+          else if (observedHead !== proposal.expected_integration_head) branchOutcomeUncertain = true;
+        } catch {
+          branchOutcomeUncertain = true;
+        }
+        throw casError;
+      }
       this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCED", newHead);
       transaction(this.db, () => {
         const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
@@ -600,9 +613,9 @@ export class Dispatcher {
       return this.integrationStatus(proposalId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (branchAdvanced) {
+      if (branchAdvanced || branchOutcomeUncertain) {
         const uncertain = new Error(
-          `Integration branch advanced but completion receipt failed for ${operationId}; reconciliation required: ${message}`,
+          `Integration branch outcome is uncertain for ${operationId}; reconciliation required: ${message}`,
         );
         uncertain.code = "POST_CAS_RECEIPT_UNCERTAIN";
         throw uncertain;

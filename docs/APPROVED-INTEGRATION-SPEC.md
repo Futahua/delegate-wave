@@ -23,7 +23,10 @@ proposal is recorded.
 `validation_plan_digest` MUST bind that snapshot. Later project configuration changes MUST NOT
 change the commands executed for the proposal.
 
-**INT-006** One attempt MUST have at most one proposal. Re-proposing the same candidate MUST
+**INT-006** Malformed project validation configuration MUST be rejected before a worker attempt is
+claimed. Malformed proposal validation JSON MUST be rejected rather than interpreted as no checks.
+
+**INT-007** One attempt MUST have at most one proposal. Re-proposing the same candidate MUST
 return the existing proposal unchanged and MUST refuse if the derivable digest differs.
 
 ## Approvals
@@ -85,14 +88,16 @@ success and consumes no additional approval.
 NOT be rerun automatically.
 
 **INT-RUN-014** The scheduler MUST append `BRANCH_ADVANCE_INTENDED` before the ref transaction. If
-the ref advances but a later receipt write fails, it MUST NOT append `INTEGRATION_FAILED`; the
-operation remains uncertain and requires deterministic reconciliation.
+the ref transaction reports an error, the scheduler MUST inspect the authoritative ref. It MAY
+append `INTEGRATION_FAILED` only when the ref still equals the expected old head. If the ref
+advanced, diverged, cannot be read, or a later receipt write fails, it MUST NOT append
+`INTEGRATION_FAILED`; the operation remains uncertain and requires deterministic reconciliation.
 
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
-| INT-001–INT-006 | `Dispatcher.proposeIntegration`, `UNIQUE(attempt_id)`, action digest | proposal readiness and happy-path tests |
+| INT-001–INT-007 | strict plan parsing, `Dispatcher.proposeIntegration`, `UNIQUE(attempt_id)`, action digest | malformed-config, proposal readiness, snapshot, and happy-path tests |
 | APP-001–APP-004 | `Dispatcher.grantApproval`, stored `granted_digest`, `UNIQUE(idempotency_key)` | missing-approval and expired-approval tests |
 | INT-RUN-001–INT-RUN-002 | immediate claim transaction with approval consumption and `INTENDED` operation | happy-path and validation-failure tests |
 | INT-RUN-003 | `git worktree list --porcelain` branch check | checked-out-elsewhere test |
