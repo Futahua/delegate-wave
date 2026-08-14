@@ -102,7 +102,10 @@ test("stdio MCP lifecycle and tool calls use newline-delimited JSON-RPC", async 
   assert.equal(responses[0].result.capabilities.tools.listChanged, false);
   assert.equal(responses[1].result.tools.length, 9);
   assert.deepEqual(responses[2].result.structuredContent, { result: [{ id: "project-one" }] });
-  assert.equal(responses[3].result.content[0].text, "3 projects; jobs needing attention: 2; jobs awaiting integration: 1.");
+  assert.equal(
+    responses[3].result.content[0].text,
+    "3 projects; jobs needing attention: 2; jobs awaiting integration: 1; proposals awaiting decision: 0.",
+  );
   assert.doesNotMatch(responses[3].result.content[0].text, /structured-only-marker/);
   assert.deepEqual(responses[3].result.structuredContent, { result: overview });
 });

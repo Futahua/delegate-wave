@@ -329,12 +329,27 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all();
   }
 
+  // Work proposals awaiting an operator decision. Excludes expired ones, which can no longer be
+  // authorized and would otherwise accumulate as permanent noise.
+  pendingWorkProposals() {
+    return this.db.prepare(`SELECT p.* FROM work_proposals p
+      LEFT JOIN work_proposal_decisions d ON d.proposal_id = p.id
+      WHERE d.proposal_id IS NULL AND p.expires_at > ?
+      ORDER BY p.created_at`).all(now());
+  }
+
   attention() {
     const jobs = this.db.prepare(`SELECT * FROM jobs
       WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
       ORDER BY updated_at`).all();
     const unresolvedIntegrations = this.doctor().unresolved_integrations;
-    return { jobs, unresolved_integrations: unresolvedIntegrations };
+    // A proposal nobody can see is a proposal nobody acts on: surface it in the normal path rather
+    // than only under an explicit `proposal list`.
+    return {
+      jobs,
+      unresolved_integrations: unresolvedIntegrations,
+      work_proposals_awaiting_decision: this.pendingWorkProposals(),
+    };
   }
 
   overview() {
@@ -346,6 +361,9 @@ export class Dispatcher {
       FROM jobs`).get();
     const unresolvedIntegrations = doctor.unresolved_integrations.length;
     const activeAttempts = doctor.running_attempts.length;
+    const pendingProposalTotal = this.db.prepare(`SELECT COUNT(*) AS count FROM work_proposals w
+      LEFT JOIN work_proposal_decisions d ON d.proposal_id = w.id
+      WHERE d.proposal_id IS NULL AND w.expires_at > ?`).get(now()).count;
     const projects = this.db.prepare(`SELECT
         p.id,
         p.name,
@@ -392,6 +410,20 @@ export class Dispatcher {
         )
         UNION ALL
         SELECT
+          'work_proposal' AS kind,
+          w.id AS id,
+          w.project_id AS project_id,
+          projects.name AS project_name,
+          'AWAITING_DECISION' AS status,
+          substr(w.goal, 1, ?) AS summary,
+          w.created_at AS updated_at,
+          0 AS priority
+        FROM work_proposals w
+        JOIN projects ON projects.id = w.project_id
+        LEFT JOIN work_proposal_decisions d ON d.proposal_id = w.id
+        WHERE d.proposal_id IS NULL AND w.expires_at > ?
+        UNION ALL
+        SELECT
           'job' AS kind,
           j.id AS id,
           j.project_id AS project_id,
@@ -404,11 +436,15 @@ export class Dispatcher {
         WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
       )
       ORDER BY priority, updated_at DESC, id
-      LIMIT ?`).all(OVERVIEW_SUMMARY_LIMIT, OVERVIEW_ATTENTION_LIMIT).map((item) => ({
+      LIMIT ?`)
+      // Bind order follows the UNION branches: work-proposal summary/expiry, then job summary.
+      .all(OVERVIEW_SUMMARY_LIMIT, now(), OVERVIEW_SUMMARY_LIMIT, OVERVIEW_ATTENTION_LIMIT)
+      .map((item) => ({
       ...item,
       summary: compactOverviewText(item.summary),
     }));
-    const totalAttention = jobTotals.needs_attention + jobTotals.ready_for_integration + unresolvedIntegrations;
+    const totalAttention = jobTotals.needs_attention + jobTotals.ready_for_integration
+      + unresolvedIntegrations + pendingProposalTotal;
     const overview = {
       schema_version: 1,
       health: {
@@ -421,6 +457,7 @@ export class Dispatcher {
         projects: projectTotal,
         jobs_needing_attention: jobTotals.needs_attention,
         jobs_ready_for_integration: jobTotals.ready_for_integration,
+        proposals_awaiting_decision: pendingProposalTotal,
       },
       projects,
       attention,

@@ -67,7 +67,9 @@ test("overview is SQL-bounded, compact, and excludes detailed execution state", 
   const overview = service.overview();
   const serialized = JSON.stringify(overview);
   assert.equal(overview.schema_version, 1);
-  assert.deepEqual(overview.totals, { projects: 25, jobs_needing_attention: 12, jobs_ready_for_integration: 13 });
+  assert.deepEqual(overview.totals, {
+    projects: 25, jobs_needing_attention: 12, jobs_ready_for_integration: 13, proposals_awaiting_decision: 0,
+  });
   assert.ok(overview.projects.length <= 20);
   assert.ok(overview.attention.length <= 20);
   assert.equal(overview.truncated, true);

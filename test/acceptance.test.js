@@ -291,3 +291,47 @@ test("concurrent identical proposals return one proposal identity", async (t) =>
   assert.equal(settled[0].value.id, settled[1].value.id);
   assert.equal((await f.operator.get("/v1/work/proposals")).length, 1);
 });
+
+test("a pending proposal surfaces in overview and attention without an explicit list call", async (t) => {
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "Surface", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+
+  assert.equal((await f.operator.get("/v1/overview")).totals.proposals_awaiting_decision, 0);
+
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "needs a human decision", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  const overview = await f.observer.get("/v1/overview");
+  assert.equal(overview.totals.proposals_awaiting_decision, 1);
+  const surfaced = overview.attention.find((item) => item.kind === "work_proposal");
+  assert.ok(surfaced, "a pending proposal must appear in the bounded overview");
+  assert.equal(surfaced.id, proposal.id);
+  assert.equal(surfaced.status, "AWAITING_DECISION");
+
+  const attention = await f.operator.get("/v1/attention");
+  assert.equal(attention.work_proposals_awaiting_decision.length, 1);
+  assert.equal(attention.work_proposals_awaiting_decision[0].id, proposal.id);
+
+  // Once decided it stops competing for attention.
+  await f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId());
+  assert.equal((await f.operator.get("/v1/overview")).totals.proposals_awaiting_decision, 0);
+  assert.equal((await f.operator.get("/v1/attention")).work_proposals_awaiting_decision.length, 0);
+});
+
+test("an expired proposal stops competing for operator attention", async (t) => {
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "Expiry", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "too late to act on", idempotencyKey: `k-${crypto.randomUUID()}`,
+    expiresAt: new Date(Date.now() - 1000).toISOString(),
+  }, requestId());
+
+  // It can no longer be authorized, so surfacing it would be permanent noise.
+  assert.equal((await f.operator.get("/v1/overview")).totals.proposals_awaiting_decision, 0);
+  assert.equal((await f.operator.get("/v1/attention")).work_proposals_awaiting_decision.length, 0);
+});
