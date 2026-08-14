@@ -30,6 +30,10 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **ATT-007** Bootstrap job claim, conflict detection, epoch acquisition, attempt creation, and job transition to `RUNNING` MUST occur in one immediate transaction.
 
+**ATT-008** A lifecycle-active attempt is one with `terminal_state IS NULL` or with `terminal_state = 'SUCCEEDED'` and `validation_state = 'PENDING'`.
+
+**ATT-009** A job claim MUST refuse while any lifecycle-active attempt or `RUNNING` job exists and MUST NOT advance the scheduler epoch on refusal.
+
 ## Filesystem and Git
 
 **FS-001** Filesystem location MUST NOT determine lifecycle state or authority.
@@ -58,6 +62,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **VAL-004** Automatic integration MUST NOT occur in the bootstrap release.
 
+**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
+
 ## Recovery
 
 **REC-001** Reconciliation MUST be read-only unless the operator explicitly requests application.
@@ -70,6 +76,10 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **REC-005** Applied reconciliation MUST NOT advance the scheduler epoch if any recorded executor is alive.
 
+**REC-006** `doctor` and `reconcile` MUST detect both the executor-running (`terminal_state IS NULL`) and validation-pending (`SUCCEEDED` with `PENDING`) lifecycle phases.
+
+**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as `validation_state = 'FAILED'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to `PENDING` or `NEEDS_ATTENTION` by attempt limit.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
@@ -79,12 +89,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
-| ATT-007 | `runJob` immediate claim transaction | invalid invocation and live executor tests |
+| ATT-007–ATT-009 | `runJob` immediate claim transaction, lifecycle-active predicate | invalid invocation, live executor, blocked validation tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| REC-001–REC-005 | `doctor`, `reconcile`, PID receipt | dead and live reconciliation tests |
+| VAL-005, REC-001–REC-007 | `doctor`, `reconcile`, PID receipt, `VALIDATION_INTERRUPTED` | dead, live, and interrupted validation recovery tests |
 
 ## Known bootstrap limitations
 

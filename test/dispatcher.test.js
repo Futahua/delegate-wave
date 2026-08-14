@@ -231,3 +231,89 @@ test("Windows OpenCode launch bypasses command shims", { skip: process.platform 
   assert.match(backend.prefixArgs[0], /opencode-ai[\\/]bin[\\/]opencode$/);
   assert.equal(fs.existsSync(backend.prefixArgs[0]), true);
 });
+
+async function waitFor(predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("timed out waiting for condition");
+}
+
+test("a blocked validation fences a concurrent claim without epoch movement, then finishes normally", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const waiter = path.join(root, "waiter.js");
+  const release = path.join(root, "release.marker");
+  fs.writeFileSync(waiter, `
+    const fs = require("fs");
+    const target = process.argv[2];
+    while (!fs.existsSync(target)) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+    process.exit(0);
+  `);
+  const quoted = (value) => JSON.stringify(value.replaceAll("\\", "/"));
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "output.txt"), "candidate\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({
+    name: "Fixture",
+    repoPath: repo,
+    validation: [`node ${quoted(waiter)} ${quoted(release)}`],
+  });
+  const first = await service.createJob({ projectId: project.id, goal: "long validation" });
+  const second = await service.createJob({ projectId: project.id, goal: "must wait" });
+  const run = service.runJob(first.id);
+  const attemptId = `${first.id}.1`;
+  await waitFor(() => {
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
+    return attempt && attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING";
+  });
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  await assert.rejects(service.runJob(second.id), /running job|live attempt/);
+  const epochAfter = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  assert.equal(epochAfter, epochBefore);
+  assert.equal(service.getJob(second.id).status, "PENDING");
+  fs.writeFileSync(release, "go\n");
+  const result = await run;
+  assert.equal(result.job.status, "READY_FOR_INTEGRATION");
+  assert.equal(result.attempts[0].terminal_state, "SUCCEEDED");
+  assert.equal(result.attempts[0].validation_state, "PASSED");
+});
+
+test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING validation attempt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "interrupted validation", maxAttempts: 1 });
+  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
+    backend, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?)`).run(
+    "attempt-interrupted", job.id, path.join(root, "interrupted-worktree"), new Date().toISOString(),
+  );
+  const preview = await service.reconcile();
+  assert.equal(preview.applied, false);
+  assert.equal(preview.observations[0].phase, "VALIDATION");
+  assert.equal(preview.observations[0].proposed, "VALIDATION_INTERRUPTED");
+  assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
+  const result = await service.reconcile({ apply: true });
+  assert.equal(result.applied, true);
+  assert.equal(result.results[0].action, "VALIDATION_INTERRUPTED");
+  const state = service.status(job.id);
+  assert.equal(state.job.status, "NEEDS_ATTENTION");
+  assert.equal(state.attempts[0].terminal_state, "SUCCEEDED");
+  assert.equal(state.attempts[0].validation_state, "FAILED");
+  assert.equal(state.attempts[0].quarantined, 1);
+  assert.equal(state.attempts[0].worktree_locked, 1);
+  const interrupted = service.db.prepare(
+    "SELECT COUNT(*) AS count FROM events WHERE kind = 'VALIDATION_INTERRUPTED' AND entity_id = ?",
+  ).get("attempt-interrupted").count;
+  assert.equal(interrupted, 1);
+});

@@ -17,6 +17,11 @@ import { runShell } from "./process.js";
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 
+const lifecycleActive = (alias = "") => {
+  const p = alias ? `${alias}.` : "";
+  return `(${p}terminal_state IS NULL OR (${p}terminal_state = 'SUCCEEDED' AND ${p}validation_state = 'PENDING'))`;
+};
+
 function parseJson(value, fallback = []) {
   try { return JSON.parse(value); } catch { return fallback; }
 }
@@ -107,7 +112,9 @@ export class Dispatcher {
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
         throw new Error(`Job ${jobId} cannot be claimed from ${current?.status ?? "missing"}`);
       }
-      const conflict = this.db.prepare("SELECT id FROM attempts WHERE terminal_state IS NULL LIMIT 1").get();
+      const runningJob = this.db.prepare("SELECT id FROM jobs WHERE status = 'RUNNING' LIMIT 1").get();
+      if (runningJob) throw new Error(`Bootstrap scheduler already has running job ${runningJob.id}`);
+      const conflict = this.db.prepare(`SELECT id FROM attempts WHERE ${lifecycleActive()} LIMIT 1`).get();
       if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
@@ -264,8 +271,9 @@ export class Dispatcher {
     const integrity = this.db.prepare("PRAGMA quick_check").all().map((row) => row.quick_check);
     const running = this.db.prepare(`SELECT a.*, j.project_id, j.status AS job_status
       FROM attempts a JOIN jobs j ON j.id = a.job_id
-      WHERE a.terminal_state IS NULL ORDER BY a.started_at`).all().map((attempt) => ({
+      WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all().map((attempt) => ({
         ...attempt,
+        phase: attempt.terminal_state === "SUCCEEDED" ? "VALIDATION" : "EXECUTOR",
         executor_alive: isProcessAlive(attempt.executor_pid),
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
       }));
@@ -284,28 +292,34 @@ export class Dispatcher {
     const running = this.db.prepare(`SELECT a.*, j.project_id, j.max_attempts,
       (SELECT COUNT(*) FROM attempts x WHERE x.job_id = a.job_id) AS attempt_count
       FROM attempts a JOIN jobs j ON j.id = a.job_id
-      WHERE a.terminal_state IS NULL ORDER BY a.started_at`).all();
-    const observations = running.map((attempt) => ({
-      attempt_id: attempt.id,
-      executor_pid: attempt.executor_pid,
-      executor_alive: isProcessAlive(attempt.executor_pid),
-      worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
-      proposed: isProcessAlive(attempt.executor_pid) ? "LEAVE_RUNNING" : "ORPHAN",
-    }));
+      WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all();
+    const observations = running.map((attempt) => {
+      const phase = attempt.terminal_state === "SUCCEEDED" ? "VALIDATION" : "EXECUTOR";
+      const executorAlive = isProcessAlive(attempt.executor_pid);
+      return {
+        attempt_id: attempt.id,
+        phase,
+        executor_pid: attempt.executor_pid,
+        executor_alive: executorAlive,
+        worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
+        proposed: phase === "VALIDATION" ? "VALIDATION_INTERRUPTED"
+          : (executorAlive ? "LEAVE_RUNNING" : "ORPHAN"),
+      };
+    });
     if (!apply || running.length === 0) return { applied: false, observations };
-    if (observations.some((item) => item.executor_alive)) {
+    if (observations.some((item) => item.phase === "EXECUTOR" && item.executor_alive)) {
       return { applied: false, refused: "LIVE_EXECUTOR", observations };
     }
 
     let epoch;
-    let orphaned;
+    let recovered;
     try {
-      ({ epoch, orphaned } = transaction(this.db, () => {
+      ({ epoch, recovered } = transaction(this.db, () => {
         const candidates = this.db.prepare(`SELECT a.*, j.project_id, j.max_attempts,
           (SELECT COUNT(*) FROM attempts x WHERE x.job_id = a.job_id) AS attempt_count
           FROM attempts a JOIN jobs j ON j.id = a.job_id
-          WHERE a.terminal_state IS NULL ORDER BY a.started_at`).all();
-        if (candidates.some((attempt) => isProcessAlive(attempt.executor_pid))) {
+          WHERE ${lifecycleActive("a")} ORDER BY a.started_at`).all();
+        if (candidates.some((attempt) => attempt.terminal_state === null && isProcessAlive(attempt.executor_pid))) {
           const refusal = new Error("live executor appeared during reconciliation");
           refusal.code = "LIVE_EXECUTOR";
           throw refusal;
@@ -314,27 +328,37 @@ export class Dispatcher {
         const claimedEpoch = currentEpoch + 1;
         this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(claimedEpoch));
         for (const attempt of candidates) {
-        this.db.prepare(`UPDATE attempts SET terminal_state = 'ORPHANED', finished_at = ?,
-          quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), attempt.id);
-        const nextStatus = attempt.attempt_count >= attempt.max_attempts ? "NEEDS_ATTENTION" : "PENDING";
-        this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now(), attempt.job_id);
-          recordEvent(this.db, { kind: "ATTEMPT_ORPHANED", entityType: "attempt", entityId: attempt.id, epoch: claimedEpoch });
+          const interrupted = attempt.terminal_state === "SUCCEEDED";
+          if (interrupted) {
+            this.db.prepare(`UPDATE attempts SET validation_state = 'FAILED', finished_at = ?,
+              quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), attempt.id);
+            recordEvent(this.db, { kind: "VALIDATION_INTERRUPTED", entityType: "attempt", entityId: attempt.id, epoch: claimedEpoch });
+          } else {
+            this.db.prepare(`UPDATE attempts SET terminal_state = 'ORPHANED', finished_at = ?,
+              quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), attempt.id);
+            recordEvent(this.db, { kind: "ATTEMPT_ORPHANED", entityType: "attempt", entityId: attempt.id, epoch: claimedEpoch });
+          }
+          const nextStatus = attempt.attempt_count >= attempt.max_attempts ? "NEEDS_ATTENTION" : "PENDING";
+          this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now(), attempt.job_id);
         }
-        return { epoch: claimedEpoch, orphaned: candidates };
+        return { epoch: claimedEpoch, recovered: candidates };
       }));
     } catch (error) {
       if (error.code === "LIVE_EXECUTOR") return { applied: false, refused: "LIVE_EXECUTOR", observations };
       throw error;
     }
     const applied = [];
-    for (const attempt of orphaned) {
+    for (const attempt of recovered) {
       const project = this.getProject(attempt.project_id);
       try {
         if (attempt.worktree_path && fs.existsSync(attempt.worktree_path)) {
           await lockWorktree(project.repo_path, attempt.worktree_path, `quarantined ${attempt.id}`);
         }
       } catch { /* the database quarantine is authoritative; doctor reports filesystem drift */ }
-      applied.push({ attempt_id: attempt.id, action: "ORPHANED" });
+      applied.push({
+        attempt_id: attempt.id,
+        action: attempt.terminal_state === "SUCCEEDED" ? "VALIDATION_INTERRUPTED" : "ORPHANED",
+      });
     }
     return { applied: true, scheduler_epoch: epoch, observations, results: applied };
   }
