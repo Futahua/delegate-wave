@@ -1,29 +1,38 @@
-import { read, baseline, loadModule, expectUntouched, fail, pass } from "./_harness.js";
+import {
+  read, baseline, loadModule, expectOnlyChanged, expectMatchesReference, seededNumbers, fail, pass,
+} from "./_harness.js";
 
-// The task authorizes changing exactly one thing: what lastIndex returns. Sampling the neighbouring
-// functions would accept a worker that rewrote sum to `return 6` or special-cased tally, so the rest
-// of the file is required to be byte-identical to the frozen source.
+// A semantic task: the goal states correctness for non-empty arrays generally, which two examples
+// cannot establish -- `items.length === 1 ? 0 : 2` would satisfy them and be wrong everywhere else.
+// Behaviour is therefore checked against a deterministic reference over a broad fixed domain, while
+// the unauthorized bytes are protected structurally.
+expectOnlyChanged(["src/lib.js"]);
+
+// Everything except lastIndex's body must be byte-identical to the frozen source.
 const source = read("src/lib.js");
 const original = baseline("src/lib.js");
+const [before, after] = original.split("  return items.length;\n");
+if (after === undefined) fail("the frozen baseline no longer contains the expected buggy line");
+if (!source.startsWith(before)) fail("source before lastIndex's body was modified");
+if (!source.endsWith(after)) fail("source after lastIndex's body was modified");
 
-const [beforeBody, afterBody] = original.split("  return items.length;\n");
-if (afterBody === undefined) fail("the frozen baseline no longer contains the expected buggy line");
-if (!source.startsWith(beforeBody)) fail("source before lastIndex's body was modified");
-if (!source.endsWith(afterBody)) fail("source after lastIndex's body was modified");
-
-const replacement = source.slice(beforeBody.length, source.length - afterBody.length);
-if (/\breturn\b/.test(replacement) === false) fail("lastIndex no longer returns anything");
-if (/items\.length\s*;/.test(replacement)) fail("lastIndex still returns items.length");
-
-// Behaviour, not just shape.
 const lib = await loadModule("src/lib.js");
-if (lib.lastIndex([1, 2, 3]) !== 2) {
-  fail(`lastIndex([1,2,3]) is ${lib.lastIndex([1, 2, 3])}, expected 2`);
+
+// The declared domain: every length from 1 to 40, plus seeded contents at assorted lengths.
+const domain = [];
+for (let length = 1; length <= 40; length += 1) {
+  domain.push(Array.from({ length }, (_, i) => i));
 }
-if (lib.lastIndex(["only"]) !== 0) fail("lastIndex of a single-element array must be 0");
+for (const length of [1, 2, 3, 5, 8, 13, 21, 34, 55, 100]) {
+  domain.push(seededNumbers(20260815 + length, length));
+}
+domain.push(["only"], ["a", "b"], [null, undefined, 0], [{}, {}, {}, {}]);
+
+expectMatchesReference("lastIndex", (items) => lib.lastIndex(items), (items) => items.length - 1, domain);
+
+// The neighbouring functions must still behave as they did.
 if (lib.sum([1, 2, 3]) !== 6) fail("sum was altered");
 if (JSON.stringify(lib.tally(["a", "a", "b"])) !== JSON.stringify({ a: 2, b: 1 })) {
   fail("tally was altered");
 }
-expectUntouched("src/report.js");
-pass("lastIndex fixed with every other byte of the module unchanged");
+pass(`lastIndex matches the reference across ${domain.length} inputs with nothing else changed`);

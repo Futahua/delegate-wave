@@ -7,6 +7,8 @@
     "Verifiers live outside the attempt worktree. A worker must never be able to read the acceptance criteria instead of solving the task.",
     "Validation must exercise the task's own deliverable. A plan that passes without testing what was asked for makes first-pass rate optimistic for both executors.",
     "Where a task has a deterministic output, its verifier derives the complete expected result from the frozen fixture and compares exactly. Sampling properties leaves room for an answer that satisfies the checks while violating the task statement.",
+    "Every task declares allowed_changes. The verifier compares the whole candidate tree against the frozen fixture and rejects any added, deleted, or modified path outside that set: judging only the requested artifact would accept a candidate that produced the right answer while damaging something else.",
+    "Verification kind is explicit. A deterministic artifact is compared exactly against a result derived from the frozen inputs; a structural source edit against the permitted transformation; open-ended behaviour against a hidden deterministic reference over a broad declared domain, because examples cannot prove general correctness.",
     "Validation must reject a plausible wrong answer, not merely a missing file.",
     "No task may be edited after either executor has run it. If a task proves defective, discard the pair and restart it.",
     "None of these tasks may be used for provider or measurement calibration; that uses a separate throwaway task."
@@ -17,70 +19,111 @@
       "goal": "Create TOTALS.md with one line per row of inventory.csv in the form '<item>: <qty>', in the order they appear, and nothing else except a final line 'Total: <sum>' holding the arithmetic sum of the qty column.",
       "deliverable": "TOTALS.md",
       "shape": "arithmetic over a small table",
-      "verifier": "t01.js"
+      "verifier": "t01.js",
+      "allowed_changes": [
+        "TOTALS.md"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t02-filter-select",
       "goal": "Create CHEAP.md listing only the items from catalog.csv whose price is strictly below 5.00, one per line as '<item> <price>', sorted by price ascending.",
       "deliverable": "CHEAP.md",
       "shape": "filter and sort with a boundary condition",
-      "verifier": "t02.js"
+      "verifier": "t02.js",
+      "allowed_changes": [
+        "CHEAP.md"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t03-json-reshape",
       "goal": "Read config.json and write config.summary.json containing an object with keys 'services' (the count of entries in the services array) and 'ports' (an ascending array of every distinct port used).",
       "deliverable": "config.summary.json",
       "shape": "structured read, dedupe, reshape",
-      "verifier": "t03.js"
+      "verifier": "t03.js",
+      "allowed_changes": [
+        "config.summary.json"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t04-bugfix-off-by-one",
       "goal": "The function lastIndex in src/lib.js returns the wrong value for non-empty arrays. Fix it so it returns the index of the final element, and leave every other function unchanged.",
       "deliverable": "src/lib.js",
       "shape": "localized bug fix with regression risk",
-      "verifier": "t04.js"
+      "verifier": "t04.js",
+      "allowed_changes": [
+        "src/lib.js"
+      ],
+      "verification_kind": "semantic-behaviour"
     },
     {
       "id": "t05-add-function",
       "goal": "Append an exported function named median to src/lib.js that returns the median of an array of numbers, averaging the two middle values for even-length input and returning null for an empty array. Append only: do not change any existing content of the file.",
       "deliverable": "src/lib.js",
       "shape": "additive API change with edge cases",
-      "verifier": "t05.js"
+      "verifier": "t05.js",
+      "allowed_changes": [
+        "src/lib.js"
+      ],
+      "verification_kind": "semantic-behaviour"
     },
     {
       "id": "t06-rename-consistent",
       "goal": "Rename the exported function tally in src/lib.js to countItems, updating every reference across src/ so all modules still load and existing behaviour is preserved.",
       "deliverable": "src/lib.js",
       "shape": "multi-site consistent rename",
-      "verifier": "t06.js"
+      "verifier": "t06.js",
+      "allowed_changes": [
+        "src/lib.js",
+        "src/report.js"
+      ],
+      "verification_kind": "structural-source-edit"
     },
     {
       "id": "t07-doc-from-code",
-      "goal": "Create API.md with exactly one '## <name>' section per exported function in src/lib.js and no others. Each section must contain a line 'Parameters: <names>' listing its parameter names in order, and a line 'Returns: <category> - <description>' where category is one of number, string, boolean, object, array, null.",
+      "goal": "Create API.md with exactly one '## <name>' section per exported function in src/lib.js and no others. Each section must contain a line 'Parameters: <names>' listing its parameter names in order, and a line 'Returns: <category>' where category is exactly one of number, string, boolean, object, array, null.",
       "deliverable": "API.md",
       "shape": "read code, produce accurate prose",
-      "verifier": "t07.js"
+      "verifier": "t07.js",
+      "allowed_changes": [
+        "API.md"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t08-text-transform",
       "goal": "Create notes.clean.md from notes.md with every line trimmed of trailing whitespace, all blank runs collapsed to a single blank line, and the original line order preserved.",
       "deliverable": "notes.clean.md",
       "shape": "whitespace-exact transformation",
-      "verifier": "t08.js"
+      "verifier": "t08.js",
+      "allowed_changes": [
+        "notes.clean.md"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t09-two-file-join",
       "goal": "Create REPORT.md joining inventory.csv and catalog.csv on the item name, including only items present in both, in inventory order, one line each as '<item> <qty> x <price> = <total>' with price and total written to exactly two decimals.",
       "deliverable": "REPORT.md",
       "shape": "join across two sources with computation",
-      "verifier": "t09.js"
+      "verifier": "t09.js",
+      "allowed_changes": [
+        "REPORT.md"
+      ],
+      "verification_kind": "deterministic-artifact"
     },
     {
       "id": "t10-constrained-edit",
       "goal": "Append a final line '# end' to notes.md. Change nothing else in the file: every existing byte must be preserved exactly.",
       "deliverable": "notes.md",
       "shape": "minimal edit under a strict no-collateral constraint",
-      "verifier": "t10.js"
+      "verifier": "t10.js",
+      "allowed_changes": [
+        "notes.md"
+      ],
+      "verification_kind": "structural-source-edit"
     }
   ],
   "verifier_root": "experiments/executor-ab-v1/verifiers",

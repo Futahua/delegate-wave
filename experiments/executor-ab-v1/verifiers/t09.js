@@ -1,4 +1,6 @@
-import { csvRows, expectExact, pass } from "./_harness.js";
+import { csvRows, expectExact, expectOnlyChanged, pass } from "./_harness.js";
+
+expectOnlyChanged(["REPORT.md"]);
 
 // Both sides of the join are derived from the frozen sources, and the required format is compared
 // exactly. Searching each line for three numbers would accept 'widget 12 3.5 42', which omits the

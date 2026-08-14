@@ -1,4 +1,6 @@
-import { baseline, expectExact, expectUntouched, pass } from "./_harness.js";
+import { baseline, expectExact, expectOnlyChanged, pass } from "./_harness.js";
+
+expectOnlyChanged(["notes.clean.md"]);
 
 // The transformation is deterministic, so the whole output is derived from the frozen source and
 // compared exactly. Checking only that "there are not too many blank lines" would accept an answer
@@ -11,6 +13,4 @@ const expected = source
   .replace(/\n{3,}/g, "\n\n");
 
 expectExact("notes.clean.md", expected);
-// The task asks for a new file, so the source must survive byte-identically.
-expectUntouched("notes.md");
 pass("notes.clean.md is exactly the trimmed, collapsed source with notes.md untouched");

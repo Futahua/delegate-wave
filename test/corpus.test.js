@@ -244,27 +244,87 @@ test("t06 permits only the rename and rejects any other behavioural change", asy
 test("t07 requires exactly the exports with correct parameters and return categories", async () => {
   const section = (name, parameters, returns) => "## " + name + "\nParameters: " + parameters + "\nReturns: " + returns + "\n";
   const correct = ["# API", "",
-    section("lastIndex", "items", "number - the index of the final element"),
-    section("tally", "items", "object - counts per distinct value"),
-    section("sum", "numbers", "number - the arithmetic total"),
+    section("lastIndex", "items", "number"),
+    section("tally", "items", "object"),
+    section("sum", "numbers", "number"),
   ].join("\n");
   assert.equal((await verify("t07-doc-from-code", (d) => write(d, "API.md", correct))).exitCode, 0);
 
   for (const [label, body] of [
-    ["invented section", correct + "\n" + section("median", "numbers", "number - the middle value")],
+    ["invented section", correct + "\n" + section("median", "numbers", "number")],
     // Any invented name must fail, not merely the one the verifier happens to name.
-    ["differently invented section", correct + "\n" + section("imaginaryFunction", "x", "number - a value")],
-    ["omitted export", ["# API", "", section("lastIndex", "items", "number - the last index"),
-      section("sum", "numbers", "number - the total")].join("\n")],
+    ["differently invented section", correct + "\n" + section("imaginaryFunction", "x", "number")],
+    ["omitted export", ["# API", "", section("lastIndex", "items", "number"),
+      section("sum", "numbers", "number")].join("\n")],
     ["prose instead of the requested fields",
       "# API\n\n## lastIndex\nReturns the last index.\n\n## tally\nCounts.\n\n## sum\nAdds.\n"],
     // 'notitems' contains 'items' as a substring but is not the parameter name.
     ["wrong parameter name", correct.replace("Parameters: items", "Parameters: notitems")],
-    ["vacuous return description", correct.replace("number - the arithmetic total", "does not return anything")],
-    ["wrong return category", correct.replace("object - counts per distinct value", "number - counts per distinct value")],
+    ["wrong return category", correct.replace("Returns: object", "Returns: number")],
+    // Every requested field is graded, so an unrecognised category is not silently accepted.
+    ["free prose in the graded field", correct.replace("Returns: number\n", "Returns: does not return anything\n")],
   ]) {
     assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", body))).exitCode, 0, label);
   }
+});
+
+test("every task rejects a candidate that changed something it did not authorize", async () => {
+  // The corpus-wide boundary: a correct deliverable does not excuse collateral damage. Each case
+  // produces the right answer and then touches one file the task never mentioned.
+  const solutions = {
+    "t01-csv-totals": (d) => write(d, "TOTALS.md", "widget: 12\ngadget: 7\nsprocket: 20\nflange: 5\nTotal: 44\n"),
+    "t02-filter-select": (d) => write(d, "CHEAP.md", "bracket 2.00\nwidget 3.50\nsprocket 4.99\n"),
+    "t03-json-reshape": (d) => write(d, "config.summary.json", JSON.stringify({ services: 3, ports: [8080, 9090] })),
+    "t07-doc-from-code": (d) => write(d, "API.md",
+      "# API\n\n## lastIndex\nParameters: items\nReturns: number\n\n## tally\nParameters: items\nReturns: object\n\n## sum\nParameters: numbers\nReturns: number\n"),
+    "t08-text-transform": (d) => write(d, "notes.clean.md", "first line\n\nsecond line\n\nthird line\n"),
+    "t09-two-file-join": (d) => write(d, "REPORT.md",
+      "widget 12 x 3.50 = 42.00\ngadget 7 x 7.25 = 50.75\nsprocket 20 x 4.99 = 99.80\n"),
+  };
+
+  for (const [taskId, solve] of Object.entries(solutions)) {
+    assert.equal((await verify(taskId, solve)).exitCode, 0, `${taskId}: the correct solution must pass`);
+
+    // Rewriting an input redefines the problem: t02 in particular derives its expectation from
+    // catalog.csv, so a worker could otherwise alter the catalog and satisfy its own version.
+    assert.notEqual((await verify(taskId, (d) => {
+      solve(d);
+      edit(d, "catalog.csv", (b) => b.replace("widget,3.50", "widget,1.00"));
+    })).exitCode, 0, `${taskId}: rewriting an input must fail`);
+
+    // Unrelated source damage alongside a correct deliverable.
+    assert.notEqual((await verify(taskId, (d) => {
+      solve(d);
+      edit(d, "src/lib.js", (b) => b.replace("return numbers.reduce((total, value) => total + value, 0);", "return 0;"));
+    })).exitCode, 0, `${taskId}: damaging an unrelated source file must fail`);
+
+    // Deleting a file the task did not mention.
+    assert.notEqual((await verify(taskId, (d) => {
+      solve(d);
+      fs.rmSync(path.join(d, "config.json"));
+    })).exitCode, 0, `${taskId}: deleting an unrelated file must fail`);
+  }
+});
+
+test("the semantic tasks reject implementations that hardcode the sampled cases", async () => {
+  // Behaviour cannot be established by examples: these implementations satisfy every case an
+  // example-based verifier would plausibly check, and are wrong everywhere else.
+  const hardcodedLastIndex = (b) => b.replace("return items.length;", "return items.length === 1 ? 0 : 2;");
+  assert.notEqual((await verify("t04-bugfix-off-by-one",
+    (d) => edit(d, "src/lib.js", hardcodedLastIndex))).exitCode, 0, "t04 hardcoded to the sampled lengths");
+
+  const hardcodedMedian = (b) => b + [
+    "",
+    "export function median(numbers) {",
+    "  if (!numbers.length) return null;",
+    "  if (numbers.length === 3) return 2;",
+    "  if (numbers.length === 4) return 2.5;",
+    "  return 0;",
+    "}",
+    "",
+  ].join("\n");
+  assert.notEqual((await verify("t05-add-function",
+    (d) => edit(d, "src/lib.js", hardcodedMedian))).exitCode, 0, "t05 hardcoded to the sampled inputs");
 });
 
 test("t08 requires each blank run collapsed to exactly one blank line", async () => {

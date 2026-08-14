@@ -74,10 +74,79 @@ export function expectUntouched(file) {
   if (read(file) !== baseline(file)) fail(`${file} was modified but the task did not authorize it`);
 }
 
+// Deterministic pseudo-random source, so the behavioural domain is large but fixed. A recorded seed
+// keeps every run identical: the corpus must not vary between executors or between repeats.
+export function seededNumbers(seed, count, spread = 200) {
+  let state = seed >>> 0;
+  const values = [];
+  for (let i = 0; i < count; i += 1) {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    values.push((state % (spread * 2 + 1)) - spread);
+  }
+  return values;
+}
+
+// Checks a candidate function against a deterministic reference over a broad fixed domain.
+//
+// An open-ended semantic requirement cannot be proven by two examples: a worker can hardcode the
+// sampled cases and be wrong everywhere else. Exact source comparison is the right tool for
+// structural edits, but for behaviour the honest instrument is a hidden reference oracle over a
+// declared domain.
+export function expectMatchesReference(label, candidate, reference, domain) {
+  for (const input of domain) {
+    const want = reference(input);
+    let got;
+    try {
+      got = candidate(input);
+    } catch (error) {
+      fail(`${label}(${JSON.stringify(input)}) threw: ${error.message}`);
+    }
+    if (!Object.is(got, want) && JSON.stringify(got) !== JSON.stringify(want)) {
+      fail(`${label}(${JSON.stringify(input)}) is ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
+    }
+  }
+}
+
 // Parses a two-column CSV with a header row into ordered [key, value] pairs.
+//
+// Always reads the FROZEN fixture, never the candidate. Deriving expectations from candidate inputs
+// would let a worker rewrite the problem -- editing catalog.csv and then producing a matching answer
+// -- and have the verifier validate its altered problem instead of the preregistered one.
 export function csvRows(file, cast = (v) => v) {
   return lines(baseline(file)).slice(1).map((row) => {
     const [key, value] = row.split(",");
     return [key.trim(), cast(value.trim())];
   });
+}
+
+function walk(root, base = root, found = []) {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (entry.name === ".git") continue;
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) walk(full, base, found);
+    else found.push(path.relative(base, full).split(path.sep).join("/"));
+  }
+  return found;
+}
+
+// Enforces the task's allowed-change boundary over the whole candidate tree.
+//
+// A verifier that only judges the requested artifact will accept a candidate that produced the right
+// answer while damaging something else. Every added, deleted, or modified path outside the declared
+// set is a violation, and so is leaving the declared deliverable untouched when the task required
+// producing it.
+export function expectOnlyChanged(allowed) {
+  const permitted = new Set(allowed);
+  const candidateFiles = new Set(walk(process.cwd()));
+  const baselineFiles = new Set(walk(FIXTURE_ROOT));
+
+  for (const file of candidateFiles) {
+    if (permitted.has(file)) continue;
+    if (!baselineFiles.has(file)) fail(`created ${file}, which this task does not authorize`);
+    if (read(file) !== baseline(file)) fail(`modified ${file}, which this task does not authorize`);
+  }
+  for (const file of baselineFiles) {
+    if (permitted.has(file)) continue;
+    if (!candidateFiles.has(file)) fail(`deleted ${file}, which this task does not authorize`);
+  }
 }

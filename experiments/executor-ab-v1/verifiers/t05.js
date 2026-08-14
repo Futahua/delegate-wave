@@ -1,9 +1,12 @@
-import { read, baseline, loadModule, expectUntouched, fail, pass } from "./_harness.js";
+import {
+  read, baseline, loadModule, expectOnlyChanged, expectMatchesReference, seededNumbers, fail, pass,
+} from "./_harness.js";
 
-// The task says to append without changing the existing content, which is mechanically enforceable:
-// the candidate must start with the frozen source byte-for-byte. Checking that a handful of original
-// lines still appear somewhere would accept a breaking statement inserted inside an existing
-// function, and the existing functions were never executed.
+// A semantic task with a structural constraint. The append-only requirement is enforced exactly;
+// median's general behaviour is checked against a deterministic reference, because a function that
+// hardcodes three sampled cases would otherwise pass while being wrong everywhere else.
+expectOnlyChanged(["src/lib.js"]);
+
 const source = read("src/lib.js");
 const original = baseline("src/lib.js");
 if (!source.startsWith(original)) {
@@ -13,11 +16,28 @@ if (source.length === original.length) fail("nothing was appended");
 
 const lib = await loadModule("src/lib.js");
 if (typeof lib.median !== "function") fail("median is not exported");
-if (lib.median([3, 1, 2]) !== 2) fail(`median([3,1,2]) is ${lib.median([3, 1, 2])}, expected 2`);
-if (lib.median([4, 1, 2, 3]) !== 2.5) {
-  fail(`median([4,1,2,3]) is ${lib.median([4, 1, 2, 3])}, expected 2.5`);
+
+const reference = (numbers) => {
+  if (!numbers.length) return null;
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+};
+
+// The declared domain: empty, singletons, pairs, sorted and reversed runs, duplicates, negatives,
+// and seeded contents across many lengths.
+const domain = [[], [7], [-3], [1, 2], [2, 1], [5, 5], [-1, 1]];
+for (let length = 1; length <= 24; length += 1) {
+  const ascending = Array.from({ length }, (_, i) => i + 1);
+  domain.push(ascending, [...ascending].reverse());
+  domain.push(Array.from({ length }, () => 4));
+  domain.push(Array.from({ length }, (_, i) => -i));
 }
-if (lib.median([]) !== null) fail("median of an empty array must be null");
+for (const length of [2, 3, 6, 9, 15, 32, 64, 101]) {
+  domain.push(seededNumbers(20260815 + length, length));
+}
+
+expectMatchesReference("median", (numbers) => lib.median(numbers), reference, domain);
 
 // The existing functions must still behave as they did.
 if (lib.lastIndex([1, 2, 3]) !== 3) fail("lastIndex's existing behaviour changed");
@@ -25,5 +45,4 @@ if (lib.sum([1, 2, 3]) !== 6) fail("sum's existing behaviour changed");
 if (JSON.stringify(lib.tally(["a", "a", "b"])) !== JSON.stringify({ a: 2, b: 1 })) {
   fail("tally's existing behaviour changed");
 }
-expectUntouched("src/report.js");
-pass("median appended with the existing module content unchanged");
+pass(`median matches the reference across ${domain.length} inputs, appended without other change`);
