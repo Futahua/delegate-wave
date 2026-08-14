@@ -23,7 +23,24 @@ $env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
 delegate-wave serve
 ```
 
-Keep that foreground server running. In another terminal, set the same token and use the CLI:
+For reboot survival, set the credentials transiently for the first installation, then install and
+start the least-privilege logon task. Installation encrypts the Control credentials with Windows
+DPAPI for the current user and removes their persistent Windows user-environment values. A
+duplicate-safe one-minute trigger recovers forced termination even when Windows does not classify it
+for restart-on-failure. The task definition contains paths and execution policy, never token names or
+values:
+
+```powershell
+delegate-wave supervisor install
+delegate-wave supervisor start
+delegate-wave supervisor status
+```
+
+`supervisor stop` first disables future triggers and then ends the running instance. `supervisor
+start` re-enables the task before starting it.
+
+`delegate-wave serve` remains the foreground development path. With either form running, set the
+same operator token in the client terminal and use the CLI:
 
 ```powershell
 $env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
@@ -62,6 +79,10 @@ The CLI is now strictly a Control API client. It does not open SQLite, instantia
 
 The server's Control API bearer token is removed from the inherited environment of OpenCode, validation commands, Git hooks, and other child processes. This is the minimum credential boundary for the bootstrap; validation should eventually use a tighter allowlisted environment for all unrelated provider and user secrets.
 
+DPAPI removes plaintext operator credentials from `HKCU\Environment` and task metadata, but it is not
+a hostile-code sandbox: code running as the same Windows user can potentially exercise that user's
+credential facilities. Untrusted validation still requires a separate OS identity, container, or VM.
+
 `doctor` checks SQLite integrity, missing repositories, lifecycle-active attempts, and integration operations without immutable terminal records. An unresolved integration makes health false. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch only after proving that recorded scheduler, executor, and validator processes are dead; an uncertain executor or validator start fails closed for operator attention.
 
 ## Not implemented yet
@@ -69,9 +90,9 @@ The server's Control API bearer token is removed from the inherited environment 
 - automatic integration (approved integration is intentionally explicit)
 - semantic escalation across jobs
 - persistent OpenCode server lifecycle
-- MCP, Hermes, or T3 adapters
+- Hermes proposal/mutation tools and T3 adapters
 - policy receipts and capability management
 
 Those remain outside the trusted bootstrap rather than being represented as finished.
 
-The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md), and [docs/HERMES-MCP-SPEC.md](docs/HERMES-MCP-SPEC.md). Hermes setup is in [docs/HERMES-MCP.md](docs/HERMES-MCP.md), with local-SDK evidence in [docs/HERMES-MCP-DOGFOOD.md](docs/HERMES-MCP-DOGFOOD.md), initial live measurements in [docs/HERMES-LIVE-DOGFOOD.md](docs/HERMES-LIVE-DOGFOOD.md), and compact-overview economics in [docs/HERMES-OVERVIEW-DOGFOOD.md](docs/HERMES-OVERVIEW-DOGFOOD.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).
+The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md), [docs/HERMES-MCP-SPEC.md](docs/HERMES-MCP-SPEC.md), and [docs/SUPERVISOR-SPEC.md](docs/SUPERVISOR-SPEC.md). Live Windows recovery evidence is in [docs/SUPERVISOR-DOGFOOD.md](docs/SUPERVISOR-DOGFOOD.md), and the current project continuation context is in [docs/DEVELOPMENT-HANDOFF.md](docs/DEVELOPMENT-HANDOFF.md). Hermes setup is in [docs/HERMES-MCP.md](docs/HERMES-MCP.md), with local-SDK evidence in [docs/HERMES-MCP-DOGFOOD.md](docs/HERMES-MCP-DOGFOOD.md), initial live measurements in [docs/HERMES-LIVE-DOGFOOD.md](docs/HERMES-LIVE-DOGFOOD.md), and compact-overview economics in [docs/HERMES-OVERVIEW-DOGFOOD.md](docs/HERMES-OVERVIEW-DOGFOOD.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).

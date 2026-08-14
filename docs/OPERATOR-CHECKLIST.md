@@ -11,7 +11,23 @@ $env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
 delegate-wave serve
 ```
 
-Keep the server running. In a second terminal:
+For normal reboot-surviving operation, set the values in the installing terminal, stop the foreground
+server, and run:
+
+```powershell
+delegate-wave supervisor install
+delegate-wave supervisor start
+delegate-wave supervisor status
+```
+
+Installation encrypts the Control credentials into the managed config directory with Windows DPAPI
+for the current user, then deletes their persistent Windows user-environment values. The task runs
+only in the interactive user's least-privilege session, starts at logon, refuses
+duplicate instances, and checks once per minute that an instance can run. It also requests five
+one-minute retries for failures that Windows classifies as abnormal. Its task XML does not contain
+credentials. `delegate-wave serve` remains useful for foreground diagnosis.
+
+In a client terminal:
 
 ```powershell
 $env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
@@ -60,6 +76,23 @@ delegate-wave doctor
 Checks SQLite integrity, missing repositories, and nonterminal attempts. Investigate any `error` or `warning` before proceeding.
 
 If the Control API is unavailable, CLI commands fail. Do not bypass the API by editing SQLite or invoking dispatcher internals.
+
+If the supervised API does not return after logon:
+
+```powershell
+delegate-wave supervisor status
+delegate-wave supervisor start
+```
+
+Task installation, stopping, and removal are explicit local operator actions and are not exposed to
+Hermes or the Control API.
+
+`supervisor stop` disables the task before ending its current process, so the periodic trigger cannot
+undo an intentional maintenance stop. `supervisor start` enables it again before requesting a run.
+
+DPAPI protects credentials at rest and prevents the plaintext-registry leak; it does not isolate
+hostile code running as the same Windows user. Use a separate identity/container/VM for untrusted
+validation.
 
 ## 6. Reconcile preview
 
