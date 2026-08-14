@@ -6,7 +6,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildUsageReceipt, parseOpenCodeUsage, USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN } from "../src/usage.js";
+import {
+  COST_SOURCE_EXECUTOR, finalizeUsageReceipt, observeOpenCodeArtifact, parseOpenCodeUsage,
+  USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN,
+} from "../src/usage.js";
 import { DEFAULT_PRICING_BASIS, PRICING_BASES, pricedModelName, referenceCostUsd } from "../src/pricing.js";
 
 const stepFinish = (tokens, cost) => JSON.stringify({
@@ -33,7 +36,7 @@ test("four valid step_finish events sum to one COMPLETE receipt", () => {
   assert.equal(usage.reasoning_tokens, 26);
   assert.equal(usage.cache_read_tokens, 22000);
   assert.equal(usage.cache_write_tokens, 0);
-  assert.ok(Math.abs(usage.provider_reported_cost_usd - 0.00046) < 1e-12);
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.00046) < 1e-12);
   assert.equal(usage.malformed_events, 0);
 });
 
@@ -42,7 +45,7 @@ test("an explicit zero-usage receipt is COMPLETE with zeroes, not UNKNOWN", () =
   assert.equal(usage.status, USAGE_COMPLETE);
   assert.equal(usage.input_tokens, 0);
   assert.equal(usage.output_tokens, 0);
-  assert.equal(usage.provider_reported_cost_usd, 0);
+  assert.equal(usage.reported_cost_usd, 0);
   assert.equal(usage.provider_steps, 1);
 });
 
@@ -53,7 +56,7 @@ test("no usage events yields UNKNOWN with null numeric fields, never zero", () =
     assert.equal(usage.input_tokens, null);
     assert.equal(usage.output_tokens, null);
     assert.equal(usage.cache_read_tokens, null);
-    assert.equal(usage.provider_reported_cost_usd, null);
+    assert.equal(usage.reported_cost_usd, null);
     assert.equal(usage.provider_steps, 0);
   }
 });
@@ -81,7 +84,7 @@ test("a step_finish without a tokens object degrades the receipt rather than cou
   assert.equal(usage.status, USAGE_PARTIAL);
   assert.equal(usage.provider_steps, 1);
   assert.equal(usage.input_tokens, 1000);
-  assert.ok(Math.abs(usage.provider_reported_cost_usd - 0.0001) < 1e-12,
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.0001) < 1e-12,
     "cost from an unusable step must not be counted");
 });
 
@@ -92,7 +95,7 @@ test("provider-reported cost is null when absent, never zero", () => {
   const usage = parseOpenCodeUsage(artifact);
   assert.equal(usage.status, USAGE_COMPLETE);
   assert.equal(usage.input_tokens, 100);
-  assert.equal(usage.provider_reported_cost_usd, null, "absent cost must stay distinct from 0");
+  assert.equal(usage.reported_cost_usd, null, "absent cost must stay distinct from 0");
 });
 
 test("the same raw artifact parsed twice yields the same receipt", () => {
@@ -118,6 +121,9 @@ test("reference cost is derived from a pinned basis and prices by model, not rou
     "the same model must price identically regardless of route");
   assert.equal(viaGo.pricing_basis_id, DEFAULT_PRICING_BASIS);
   assert.ok(Math.abs(viaGo.reference_cost_usd - (rates.input_per_mtok + rates.output_per_mtok)) < 1e-12);
+  assert.equal(rates.input_per_mtok, 0.14, "cache-miss input rate");
+  assert.equal(rates.cache_read_per_mtok, 0.0028, "cache-hit input rate");
+  assert.equal(rates.output_per_mtok, 0.28, "output rate");
   assert.equal(pricedModelName("a/b/deepseek-v4-pro"), "deepseek-v4-pro");
 });
 
@@ -135,9 +141,10 @@ test("an unknown model or basis yields a null reference cost rather than a guess
 test("a missing artifact produces an UNKNOWN receipt that preserves its provenance", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-usage-missing-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const receipt = buildUsageReceipt({
+  const receipt = finalizeUsageReceipt({
     attemptId: "attempt-1", backend: "OpenCodeBackend", model: "opencode-go/deepseek-v4-flash",
-    artifactPath: path.join(root, "absent.jsonl"), now: "2026-08-14T00:00:00.000Z",
+    observation: observeOpenCodeArtifact(path.join(root, "absent.jsonl")),
+    now: "2026-08-14T00:00:00.000Z",
   });
   assert.equal(receipt.status, USAGE_UNKNOWN);
   assert.equal(receipt.input_tokens, null);
@@ -157,15 +164,94 @@ test("a complete receipt carries both provider-reported and reference cost as se
     stepFinish(tokens(1000, 100, 10, 5000), 0.000123),
   ].join("\n"));
 
-  const receipt = buildUsageReceipt({
+  const receipt = finalizeUsageReceipt({
     attemptId: "attempt-2", backend: "OpenCodeBackend", model: "opencode-go/deepseek-v4-flash",
-    artifactPath, now: "2026-08-14T00:00:00.000Z",
+    observation: observeOpenCodeArtifact(artifactPath), now: "2026-08-14T00:00:00.000Z",
   });
   assert.equal(receipt.status, USAGE_COMPLETE);
   assert.equal(receipt.provider_steps, 2);
-  assert.ok(Math.abs(receipt.provider_reported_cost_usd - 0.000246) < 1e-12);
+  assert.ok(Math.abs(receipt.reported_cost_usd - 0.000246) < 1e-12);
   assert.ok(receipt.reference_cost_usd > 0);
-  assert.notEqual(receipt.reference_cost_usd, receipt.provider_reported_cost_usd,
+  assert.notEqual(receipt.reference_cost_usd, receipt.reported_cost_usd,
     "reference cost must be its own fact, not a copy of the provider figure");
   assert.equal(receipt.pricing_basis_id, DEFAULT_PRICING_BASIS);
+});
+
+test("cost provenance marks the figure as executor-computed, not a provider bill", () => {
+  const usage = parseOpenCodeUsage(stepFinish(tokens(100, 10, 0, 0), 0.00002));
+  assert.equal(usage.reported_cost_source, COST_SOURCE_EXECUTOR,
+    "OpenCode derives cost locally; it must not be labelled as provider-billed");
+  const absent = parseOpenCodeUsage(JSON.stringify({
+    type: "step_finish", part: { type: "step_finish", tokens: tokens(100, 10, 0, 0) },
+  }));
+  assert.equal(absent.reported_cost_source, null);
+});
+
+test("a missing individual token dimension degrades to PARTIAL rather than counting as zero", () => {
+  // `cache.write` absent: version drift or truncation, not an explicit zero.
+  const artifact = [
+    stepFinish(tokens(1000, 50, 5, 4000), 0.0001),
+    JSON.stringify({
+      type: "step_finish",
+      part: { type: "step_finish", tokens: { input: 500, output: 20, reasoning: 1, cache: { read: 100 } }, cost: 0.00005 },
+    }),
+  ].join("\n");
+  const usage = parseOpenCodeUsage(artifact);
+  assert.equal(usage.status, USAGE_PARTIAL);
+  assert.equal(usage.provider_steps, 1, "the incomplete step must not contribute");
+  assert.equal(usage.input_tokens, 1000);
+  assert.equal(usage.malformed_events, 1);
+});
+
+test("a negative token value is treated as malformed, not summed", () => {
+  const usage = parseOpenCodeUsage([
+    stepFinish(tokens(1000, 50, 5, 4000), 0.0001),
+    stepFinish(tokens(-5, 50, 5, 4000), 0.0001),
+  ].join("\n"));
+  assert.equal(usage.status, USAGE_PARTIAL);
+  assert.equal(usage.provider_steps, 1);
+  assert.equal(usage.input_tokens, 1000);
+});
+
+test("duplicated step events are counted once", () => {
+  const step = JSON.stringify({
+    type: "step_finish",
+    part: { id: "prt_stable", type: "step_finish", tokens: tokens(1000, 50, 5, 4000), cost: 0.0001 },
+  });
+  const usage = parseOpenCodeUsage([step, step, step].join("\n"));
+  assert.equal(usage.provider_steps, 1, "a replayed artifact must not double-count");
+  assert.equal(usage.input_tokens, 1000);
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.0001) < 1e-12);
+});
+
+test("a basis with no cache-write tariff refuses to price cache-write tokens", () => {
+  const withWrites = {
+    input_tokens: 1000, output_tokens: 10, reasoning_tokens: 0,
+    cache_read_tokens: 0, cache_write_tokens: 25,
+  };
+  assert.deepEqual(referenceCostUsd(withWrites, { model: "deepseek-v4-flash" }),
+    { reference_cost_usd: null, pricing_basis_id: null },
+    "an unpriced dimension must yield null rather than an invented rate");
+
+  const withoutWrites = { ...withWrites, cache_write_tokens: 0 };
+  assert.ok(referenceCostUsd(withoutWrites, { model: "deepseek-v4-flash" }).reference_cost_usd > 0);
+});
+
+test("the superseded pricing basis is retained but is not the default", () => {
+  assert.equal(DEFAULT_PRICING_BASIS, "deepseek-direct-2026-08-14-v2");
+  const old = PRICING_BASES["deepseek-direct-2026-08-14-v1"];
+  assert.ok(old, "bases are append-only: a historical receipt may still name the old basis");
+  assert.equal(old.superseded_by, DEFAULT_PRICING_BASIS);
+});
+
+test("reference cost matches DeepSeek published rates for a known observation", () => {
+  // baseline #1 SUMMARY, from the recorded historical artifact.
+  const usage = {
+    input_tokens: 4531, output_tokens: 324, reasoning_tokens: 107,
+    cache_read_tokens: 21376, cache_write_tokens: 0,
+  };
+  const { reference_cost_usd } = referenceCostUsd(usage, { model: "opencode-go/deepseek-v4-flash" });
+  const expected = (4531 * 0.14 + 21376 * 0.0028 + (324 + 107) * 0.28) / 1e6;
+  assert.ok(Math.abs(reference_cost_usd - expected) < 1e-12);
+  assert.ok(Math.abs(reference_cost_usd - 0.000814873) < 1e-9, "matches the hand-checked figure");
 });

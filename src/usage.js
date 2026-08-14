@@ -18,8 +18,30 @@ const EMPTY_TOKENS = Object.freeze({
   cache_write_tokens: null,
 });
 
-function integerOrNull(value) {
-  return Number.isFinite(value) ? Math.trunc(value) : null;
+// Cost provenance. An executor-computed figure is not a provider bill: OpenCode derives its `cost`
+// locally from its own model-cost metadata, so a divergence from a pricing basis may be stale
+// executor metadata rather than a commercial difference.
+export const COST_SOURCE_EXECUTOR = "executor-computed";
+
+const TOKEN_DIMENSIONS = Object.freeze(["input", "output", "reasoning", "cache_read", "cache_write"]);
+
+function nonNegativeInteger(value) {
+  return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : null;
+}
+
+// Every expected dimension must be present and valid. A missing field is evidence of malformed or
+// version-drifted input, not an implicit zero -- the same class of error as UNKNOWN-versus-zero, one
+// level down.
+function readStepTokens(tokens) {
+  if (!tokens || typeof tokens !== "object") return null;
+  const read = {
+    input: nonNegativeInteger(tokens.input),
+    output: nonNegativeInteger(tokens.output),
+    reasoning: nonNegativeInteger(tokens.reasoning),
+    cache_read: nonNegativeInteger(tokens.cache?.read),
+    cache_write: nonNegativeInteger(tokens.cache?.write),
+  };
+  return TOKEN_DIMENSIONS.every((dimension) => read[dimension] !== null) ? read : null;
 }
 
 // Sums every step_finish event in one OpenCode session artifact.
@@ -31,6 +53,7 @@ export function parseOpenCodeUsage(text) {
   const lines = String(text ?? "").split(/\r?\n/);
   let malformed = 0;
   const steps = [];
+  const seen = new Set();
   for (const line of lines) {
     if (!line.trim()) continue;
     let event;
@@ -41,7 +64,14 @@ export function parseOpenCodeUsage(text) {
       continue;
     }
     if (event?.type !== "step_finish") continue;
-    steps.push(event.part ?? event);
+    const step = event.part ?? event;
+    // Deduplicate by stable identity so a replayed or duplicated artifact cannot double-count.
+    const identity = step?.id ?? event?.id ?? null;
+    if (identity !== null) {
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+    }
+    steps.push(step);
   }
 
   if (!steps.length) {
@@ -49,7 +79,8 @@ export function parseOpenCodeUsage(text) {
       status: USAGE_UNKNOWN,
       ...EMPTY_TOKENS,
       provider_steps: 0,
-      provider_reported_cost_usd: null,
+      reported_cost_usd: null,
+      reported_cost_source: null,
       malformed_events: malformed,
     };
   }
@@ -58,15 +89,15 @@ export function parseOpenCodeUsage(text) {
   const totals = { input: 0, output: 0, reasoning: 0, read: 0, write: 0 };
   let usable = 0;
   for (const step of steps) {
-    const tokens = step?.tokens;
-    if (!tokens || typeof tokens !== "object") { malformed += 1; continue; }
+    const tokens = readStepTokens(step?.tokens);
+    if (!tokens) { malformed += 1; continue; }
     usable += 1;
-    totals.input += integerOrNull(tokens.input) ?? 0;
-    totals.output += integerOrNull(tokens.output) ?? 0;
-    totals.reasoning += integerOrNull(tokens.reasoning) ?? 0;
-    totals.read += integerOrNull(tokens.cache?.read) ?? 0;
-    totals.write += integerOrNull(tokens.cache?.write) ?? 0;
-    if (Number.isFinite(step.cost)) cost = (cost ?? 0) + step.cost;
+    totals.input += tokens.input;
+    totals.output += tokens.output;
+    totals.reasoning += tokens.reasoning;
+    totals.read += tokens.cache_read;
+    totals.write += tokens.cache_write;
+    if (Number.isFinite(step.cost) && step.cost >= 0) cost = (cost ?? 0) + step.cost;
   }
 
   if (!usable) {
@@ -74,7 +105,8 @@ export function parseOpenCodeUsage(text) {
       status: USAGE_UNKNOWN,
       ...EMPTY_TOKENS,
       provider_steps: 0,
-      provider_reported_cost_usd: null,
+      reported_cost_usd: null,
+      reported_cost_source: null,
       malformed_events: malformed,
     };
   }
@@ -89,55 +121,71 @@ export function parseOpenCodeUsage(text) {
     cache_read_tokens: totals.read,
     cache_write_tokens: totals.write,
     provider_steps: usable,
-    provider_reported_cost_usd: cost,
+    reported_cost_usd: cost,
+    reported_cost_source: cost === null ? null : COST_SOURCE_EXECUTOR,
     malformed_events: malformed,
   };
 }
 
-// Builds the persisted receipt for one attempt. Returns an UNKNOWN receipt rather than throwing when
-// the artifact is missing or unreadable: absence of evidence is itself the evidence.
-export function buildUsageReceipt({
-  attemptId, backend, model, artifactPath, format = "opencode-events-jsonl",
-  basisId, now = new Date().toISOString(),
-}) {
-  let parsed;
-  if (artifactPath && fs.existsSync(artifactPath)) {
-    try {
-      parsed = parseOpenCodeUsage(fs.readFileSync(artifactPath, "utf8"));
-    } catch {
-      parsed = null;
-    }
-  }
-  if (!parsed) {
-    parsed = {
-      status: USAGE_UNKNOWN,
-      ...EMPTY_TOKENS,
-      provider_steps: 0,
-      provider_reported_cost_usd: null,
-      malformed_events: 0,
-    };
-  }
+// An observation carrying no usable evidence. Used whenever a backend supplies nothing.
+export function unknownObservation({ artifact = null, format = "none", malformed = 0 } = {}) {
+  return {
+    status: USAGE_UNKNOWN,
+    ...EMPTY_TOKENS,
+    provider_steps: 0,
+    reported_cost_usd: null,
+    reported_cost_source: null,
+    malformed_events: malformed,
+    source_artifact: artifact,
+    source_format: format,
+  };
+}
 
-  const priced = parsed.status === USAGE_UNKNOWN
+// Reads an OpenCode session artifact into a neutral observation. Absence of evidence is itself
+// evidence, so a missing or unreadable artifact yields UNKNOWN rather than throwing.
+export function observeOpenCodeArtifact(artifactPath) {
+  const format = "opencode-events-jsonl";
+  if (!artifactPath || !fs.existsSync(artifactPath)) {
+    return unknownObservation({ artifact: artifactPath ?? null, format });
+  }
+  try {
+    const parsed = parseOpenCodeUsage(fs.readFileSync(artifactPath, "utf8"));
+    return { ...parsed, source_artifact: artifactPath, source_format: format };
+  } catch {
+    return unknownObservation({ artifact: artifactPath, format });
+  }
+}
+
+// The single place a receipt is finalized, for every backend.
+//
+// Pricing is applied here rather than in any backend: an executor must never compute delegate-wave's
+// comparator, or measurement policy leaks back into the thing being measured. A backend's only job
+// is to produce a neutral observation of what its provider reported.
+export function finalizeUsageReceipt({
+  attemptId, backend, model, observation, basisId, now = new Date().toISOString(),
+}) {
+  const observed = observation ?? unknownObservation();
+  const priced = observed.status === USAGE_UNKNOWN
     ? { reference_cost_usd: null, pricing_basis_id: null }
-    : referenceCostUsd(parsed, { model, ...(basisId ? { basisId } : {}) });
+    : referenceCostUsd(observed, { model, ...(basisId ? { basisId } : {}) });
 
   return {
     attempt_id: attemptId,
-    status: parsed.status,
-    input_tokens: parsed.input_tokens,
-    output_tokens: parsed.output_tokens,
-    reasoning_tokens: parsed.reasoning_tokens,
-    cache_read_tokens: parsed.cache_read_tokens,
-    cache_write_tokens: parsed.cache_write_tokens,
-    provider_steps: parsed.provider_steps,
-    provider_reported_cost_usd: parsed.provider_reported_cost_usd,
+    status: observed.status,
+    input_tokens: observed.input_tokens,
+    output_tokens: observed.output_tokens,
+    reasoning_tokens: observed.reasoning_tokens,
+    cache_read_tokens: observed.cache_read_tokens,
+    cache_write_tokens: observed.cache_write_tokens,
+    provider_steps: observed.provider_steps,
+    reported_cost_usd: observed.reported_cost_usd,
+    reported_cost_source: observed.reported_cost_source,
     reference_cost_usd: priced.reference_cost_usd,
     pricing_basis_id: priced.pricing_basis_id,
     source_backend: backend,
-    source_artifact: artifactPath ?? null,
-    source_format: format,
-    malformed_events: parsed.malformed_events,
+    source_artifact: observed.source_artifact ?? null,
+    source_format: observed.source_format ?? "none",
+    malformed_events: observed.malformed_events ?? 0,
     observed_at: now,
   };
 }

@@ -72,11 +72,18 @@ provider receipt explicitly reporting no usage is `COMPLETE` with zeroes. Usage 
 malformed or truncated accounting is `PARTIAL`, retaining what was observed. If normalization fails,
 the raw artifact MUST be preserved and the receipt MUST record `UNKNOWN` rather than guessed numbers.
 
-**WRK-008** Provider-reported cost and reference cost MUST remain distinct facts. Provider-reported
-cost MUST be null when the provider does not report one, never zero. Reference cost MUST be derived
-from observed tokens against a pinned, append-only pricing basis whose identifier is stored beside
-the number, so historical receipts stay reproducible after prices change. A reference cost MUST NOT
-overwrite a provider-reported cost.
+**WRK-008** Reported cost and reference cost MUST remain distinct facts. A reported cost MUST carry
+its provenance, because an executor-computed figure is not a provider bill; it MUST be null when
+none is reported, never zero. Reference cost MUST be derived by delegate-wave, never by a backend,
+from observed tokens against a pinned append-only pricing basis whose identifier is stored beside the
+number. A basis MUST NOT invent a rate for a dimension its provider does not publish: an observation
+using an unpriced dimension MUST yield a null reference cost. A reference cost MUST NOT overwrite a
+reported cost.
+
+**WRK-009** A usage-capture failure MUST NOT fail the attempt, and MUST NOT be silent. It MUST leave
+a durable record, and measurement health MUST be checkable: every attempt that started an executor
+must carry either a usage receipt or an explicit capture-failure record. A cost-per-validated-
+candidate result MUST NOT be accepted over a dataset that fails that check.
 
 **WRK-004** Every executor attempt MUST have a dispatcher-resolved, provider-qualified model
 persisted before the attempt launches. An execution backend MUST fail closed rather than fall back to
@@ -137,7 +144,8 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | WRK-005 | `recordAttemptUsage` runs immediately after the backend returns, before failure conversion | failed-attempt usage test; validation-failure retention test; immutability triggers |
 | WRK-006 | receipts live in their own table and are never read by acceptance logic | failed-attempt test asserting the attempt stays FAILED; idempotent re-record test |
 | WRK-007 | `parseOpenCodeUsage` status states with null numeric fields under UNKNOWN, enforced by a schema CHECK | UNKNOWN/PARTIAL/COMPLETE parser tests; missing-artifact test; live historical normalization |
-| WRK-008 | `pricing.js` pinned bases; separate provider and reference columns | separate-facts receipt test; unknown-model and unknown-basis null tests; recorded 4.9x divergence in the baseline |
+| WRK-008 | `pricing.js` pinned append-only bases; separate reported and reference columns with cost provenance | separate-facts receipt test; unknown-model, unknown-basis, and unpriced-cache-write null tests; published-rate check; superseded-basis test |
+| WRK-009 | `recordAttemptUsage` emits `USAGE_RECEIPT_FAILED`; `usageCoverage` reports attempts with no evidence | capture-failure visibility test; coverage-gap test |
 | VAL-004 | absence of integration command | interface conformance review |
 | VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 

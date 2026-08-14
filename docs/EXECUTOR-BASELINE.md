@@ -131,33 +131,47 @@ suite           117/117
 
 ## Historical normalization through the production parser
 
-The five baseline attempts were re-read through `parseOpenCodeUsage`/`buildUsageReceipt` rather than
-by hand, to prove the evidence contract reproduces the recorded figures. Nothing was rerun.
+The five baseline attempts were re-read through the production parser and finalizer rather than by
+hand. Nothing was rerun.
 
 ```text
-attempt                status    steps   input  cacheRd    provider$    reference$
-hermes #1 TOTALS       COMPLETE      4    4665    20992  0.000397799   0.002019556
+attempt                status    steps   input  cacheRd    executor$    reference$
+hermes #1 TOTALS       COMPLETE      4    4665    20992  0.000397799   0.000795598
 hermes #1 attempt 1    UNKNOWN       0       -        -       absent        absent
-hermes #2 CONTRIBUTING COMPLETE      4    4576    21248  0.000400607   0.002027844
-baseline #1 SUMMARY    COMPLETE      4    4531    21376  0.000407436   0.002048228
-baseline #2 REVENUE    COMPLETE      3    4511    14848  0.000387937   0.001832964
-baseline #3 PRICING    COMPLETE      4    5217    22400  0.000498610   0.002394140
+hermes #2 CONTRIBUTING COMPLETE      4    4576    21248  0.000400607   0.000801214
+baseline #1 SUMMARY    COMPLETE      4    4531    21376  0.000407436   0.000814873
+baseline #2 REVENUE    COMPLETE      3    4511    14848  0.000387937   0.000775874
+baseline #3 PRICING    COMPLETE      4    5217    22400  0.000498610   0.000997220
 
-provider-reported total   0.002092390   (matches the hand-computed total exactly)
-reference total           0.010322732   basis deepseek-direct-2026-08-14-v1
+executor-computed total   0.002092390   matches the hand-computed total exactly
+reference total           0.004184779   basis deepseek-direct-2026-08-14-v2
+ratio                     2.000
 ```
 
 The failed provider-auth attempt normalizes to `UNKNOWN` with null numeric fields, not to five
 zeroes, which is the distinction the contract exists to preserve.
 
-### The two cost figures differ by roughly 4.9x
+### Correction: the earlier 4.9x figure was wrong
 
-This is the clearest argument yet for keeping them separate. The `opencode-go` subscription route
-reports about one fifth of what the same token counts would cost at DeepSeek direct list pricing.
-Neither number is wrong; they measure different things.
+An earlier version of this document reported a 4.9x gap between the two cost figures. That number
+came from an incorrect pricing basis. DeepSeek publishes cache-miss input, cache-hit input, and
+output rates, with no separate cache-write tariff; the first basis recorded different rates and
+invented a cache-write price. Corrected to the published rates, the gap is 2.0x.
 
-For the A/B this means a naive comparison of provider-reported cost between an `opencode-go` run and
-a direct-DeepSeek Harness run would be dominated by the commercial arrangement rather than by
-executor efficiency. The paired experiment must compare reference cost computed on one pinned basis,
-with both executors on the same DeepSeek route, and treat provider-reported cost as a separate
-operational fact.
+This is worth stating plainly because a precise wrong number is more dangerous than an obviously
+missing one: the experiment would have produced a confident answer to the wrong question.
+
+### The two figures are not the same kind of fact
+
+`step_finish.cost` is computed by OpenCode from its own model-cost metadata. It is not a provider
+bill, so it is recorded as `reported_cost_usd` with `reported_cost_source = executor-computed` rather
+than as a provider-reported figure.
+
+That matters for interpreting the 2.0x gap. An exact factor of two across five independent attempts
+looks far more like stale or differently-scaled model pricing metadata in the OpenCode build that
+produced these artifacts than like a commercial discount. Either way it cannot be attributed without
+evidence, which is precisely why the comparator is a reference cost computed by delegate-wave from a
+pinned basis rather than any executor's own number.
+
+For the A/B this means both executors must run the same DeepSeek route and be compared on reference
+cost from one basis, with each executor's self-reported cost kept as a separate operational fact.

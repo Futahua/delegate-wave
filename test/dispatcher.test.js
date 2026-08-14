@@ -734,7 +734,7 @@ test("usage is persisted for a failed attempt and never affects acceptance", asy
   assert.equal(usage.status, "COMPLETE");
   assert.equal(usage.provider_steps, 2);
   assert.equal(usage.input_tokens, 1700);
-  assert.ok(Math.abs(usage.provider_reported_cost_usd - 0.00017) < 1e-12);
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.00017) < 1e-12);
   // Evidence must not launder a failure into success.
   assert.notEqual(attempt.terminal_state, "SUCCEEDED");
   assert.equal(result.job.status, "NEEDS_ATTENTION");
@@ -780,7 +780,7 @@ test("an attempt with no usage artifact records UNKNOWN rather than zero", async
   const usage = service.getAttemptUsage(result.attempts.at(-1).id);
   assert.equal(usage.status, "UNKNOWN");
   assert.equal(usage.input_tokens, null, "absent usage must never be recorded as zero");
-  assert.equal(usage.provider_reported_cost_usd, null);
+  assert.equal(usage.reported_cost_usd, null);
   assert.equal(usage.reference_cost_usd, null);
   assert.equal(usage.provider_steps, 0);
 });
@@ -833,4 +833,136 @@ test("usage receipts are immutable once written", async (t) => {
     () => service.db.prepare("DELETE FROM attempt_usage_receipts WHERE attempt_id = ?").run(attemptId),
     /immutable/,
   );
+});
+
+test("a backend that throws after emitting usage still records its receipt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Provider work happened, then the runtime failed: the tokens were still spent.
+  const backend = new FakeBackend(async ({ artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 600, output: 30, reasoning: 2, cache: { read: 1200, write: 0 } }, cost: 0.00006 } }),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 400, output: 20, reasoning: 1, cache: { read: 800, write: 0 } }, cost: 0.00004 } }),
+    ].join("\n"));
+    throw new Error("transport died after the model calls");
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "ThrowUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "throws late", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.terminal_state, "FAILED");
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "a throwing backend must not lose its usage evidence");
+  assert.equal(usage.status, "COMPLETE");
+  assert.equal(usage.input_tokens, 1000);
+  assert.equal(usage.provider_steps, 2);
+  assert.equal(usage.reported_cost_source, "executor-computed");
+});
+
+test("a backend that throws before any model call records UNKNOWN", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async () => { throw new Error("spawn failed"); });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "ThrowEarly", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "dies at spawn", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const usage = service.getAttemptUsage(result.attempts.at(-1).id);
+  assert.equal(usage.status, "UNKNOWN");
+  assert.equal(usage.input_tokens, null);
+  assert.equal(usage.provider_steps, 0);
+});
+
+test("a backend may supply its own observation without computing the reference cost", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Models a non-OpenCode backend: it reports what its provider said and nothing more.
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return {
+      exitCode: 0, stdout: "ok", stderr: "",
+      usage: {
+        status: "COMPLETE",
+        input_tokens: 2000, output_tokens: 100, reasoning_tokens: 10,
+        cache_read_tokens: 5000, cache_write_tokens: 0,
+        provider_steps: 3, reported_cost_usd: null, reported_cost_source: null,
+        malformed_events: 0, source_artifact: "harness-session.jsonl", source_format: "harness-events",
+      },
+    };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "OwnUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const usage = service.getAttemptUsage((await service.runJob(job.id)).attempts.at(-1).id);
+
+  assert.equal(usage.source_format, "harness-events", "backend provenance must survive");
+  assert.equal(usage.input_tokens, 2000);
+  assert.equal(usage.reported_cost_usd, null);
+  // Pricing is applied centrally, so a backend that reports no cost still gets a reference cost.
+  assert.ok(usage.reference_cost_usd > 0, "delegate-wave prices the observation, not the backend");
+  assert.equal(usage.pricing_basis_id, "deepseek-direct-2026-08-14-v2");
+});
+
+test("a usage capture failure is visible and breaks measurement health, not the attempt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  // Simulate a normalization/schema defect.
+  const realFinalize = service.recordAttemptUsage.bind(service);
+  service.recordAttemptUsage = (args) => realFinalize({
+    ...args,
+    backend: { constructor: { name: "Broken" }, observeUsage: () => { throw new Error("injected parser fault"); } },
+  });
+
+  const project = await service.addProject({ name: "Unhealthy", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+  const attemptId = result.attempts.at(-1).id;
+
+  // The product task still succeeds.
+  assert.equal(result.attempts.at(-1).terminal_state, "SUCCEEDED");
+  assert.equal(service.getAttemptUsage(attemptId), null);
+
+  // But the failure is durable and the dataset is not healthy-by-silence.
+  const failure = service.db.prepare(
+    "SELECT * FROM events WHERE kind = 'USAGE_RECEIPT_FAILED' AND entity_id = ?",
+  ).get(attemptId);
+  assert.ok(failure, "a capture failure must leave a durable record");
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.healthy, true, "an explicitly recorded failure is accounted for");
+  assert.equal(coverage.missing_receipts.length, 0);
+});
+
+test("usage coverage reports an attempt with neither a receipt nor a failure record", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Coverage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const attemptId = (await service.runJob(job.id)).attempts.at(-1).id;
+  assert.equal(service.usageCoverage({ jobIds: [job.id] }).healthy, true);
+
+  // An attempt with no evidence at all must be reported, or a cost result would silently omit it.
+  service.db.exec("DROP TRIGGER trg_usage_receipts_immutable_delete");
+  service.db.prepare("DELETE FROM attempt_usage_receipts WHERE attempt_id = ?").run(attemptId);
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.healthy, false);
+  assert.deepEqual(coverage.missing_receipts, [attemptId]);
 });

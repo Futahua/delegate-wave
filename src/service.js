@@ -18,7 +18,7 @@ import {
   updateRefCas,
 } from "./git.js";
 import { runShell } from "./process.js";
-import { buildUsageReceipt } from "./usage.js";
+import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -533,14 +533,25 @@ export class Dispatcher {
         this.db.prepare("UPDATE attempts SET executor_intent_id = ?, executor_pid = NULL WHERE id = ?").run(executorIntentId, attemptId);
         recordEvent(this.db, { kind: "EXECUTOR_INTENDED", entityType: "attempt", entityId: attemptId, epoch, payload: { executorIntentId } });
       }, { terminalState: null, validationState: "NOT_RUN" });
-      const backendResult = await this.backend.run({
-        attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
-        onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
-      });
-      // Record usage before any failure becomes a lifecycle outcome. A timeout, nonzero exit,
+      // A backend that throws may still have consumed tokens before failing, so the throw is held
+      // until usage is captured. Jumping straight to the failure handler would lose exactly the
+      // evidence that WRK-005 exists to preserve.
+      let backendResult = null;
+      let backendError = null;
+      try {
+        backendResult = await this.backend.run({
+          attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
+          onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
+        });
+      } catch (error) {
+        backendError = error;
+      }
+
+      // Record usage before any failure becomes a lifecycle outcome. A throw, timeout, nonzero exit,
       // protected-path rejection, empty diff, or failed validation still consumed tokens, and those
       // attempts belong in the denominator of cost per validated candidate.
-      this.recordAttemptUsage({ attemptId, artifactDir, model, backendResult });
+      this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult });
+      if (backendError) throw backendError;
 
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
@@ -627,36 +638,63 @@ export class Dispatcher {
   //
   // Failures here are swallowed deliberately. Losing an observation must not fail an attempt that
   // otherwise succeeded, and re-recording is a no-op so a retry cannot double-count usage.
-  recordAttemptUsage({ attemptId, artifactDir, model, backendResult = null, backend = this.backend }) {
+  recordAttemptUsage({ attemptId, epoch = null, artifactDir, model, backendResult = null, backend = this.backend }) {
+    const backendName = backend?.constructor?.name ?? "UnknownBackend";
     try {
       if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(attemptId)) return null;
-      const backendName = backend?.constructor?.name ?? "UnknownBackend";
-      const receipt = buildUsageReceipt({
-        attemptId,
-        backend: backendName,
-        model,
-        artifactPath: artifactDir ? path.join(artifactDir, "opencode-events.jsonl") : null,
-        format: "opencode-events-jsonl",
-      });
-      // A backend may report usage directly rather than through an artifact; prefer that when given.
-      if (backendResult?.usage) {
-        Object.assign(receipt, backendResult.usage, { attempt_id: attemptId, source_backend: backendName });
-      }
+
+      // A backend that reports usage directly is preferred over artifact scraping. Either way it
+      // supplies only a neutral observation; pricing is applied centrally by the finalizer, so no
+      // executor computes delegate-wave's comparator.
+      const observation = backendResult?.usage
+        ?? (typeof backend?.observeUsage === "function"
+          ? backend.observeUsage({ attemptId, artifactDir, backendResult })
+          : observeOpenCodeArtifact(artifactDir ? path.join(artifactDir, "opencode-events.jsonl") : null));
+
+      const receipt = finalizeUsageReceipt({ attemptId, backend: backendName, model, observation });
       this.db.prepare(`INSERT INTO attempt_usage_receipts(
         attempt_id, status, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
-        cache_write_tokens, provider_steps, provider_reported_cost_usd, reference_cost_usd,
-        pricing_basis_id, source_backend, source_artifact, source_format, malformed_events, observed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cache_write_tokens, provider_steps, reported_cost_usd, reported_cost_source,
+        reference_cost_usd, pricing_basis_id, source_backend, source_artifact, source_format,
+        malformed_events, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         receipt.attempt_id, receipt.status, receipt.input_tokens, receipt.output_tokens,
         receipt.reasoning_tokens, receipt.cache_read_tokens, receipt.cache_write_tokens,
-        receipt.provider_steps, receipt.provider_reported_cost_usd, receipt.reference_cost_usd,
-        receipt.pricing_basis_id, receipt.source_backend, receipt.source_artifact,
-        receipt.source_format, receipt.malformed_events, receipt.observed_at,
+        receipt.provider_steps, receipt.reported_cost_usd, receipt.reported_cost_source,
+        receipt.reference_cost_usd, receipt.pricing_basis_id, receipt.source_backend,
+        receipt.source_artifact, receipt.source_format, receipt.malformed_events, receipt.observed_at,
       );
       return receipt;
-    } catch {
+    } catch (error) {
+      // A measurement failure must not fail a product task, but it must not vanish either: a silent
+      // parser or schema bug would erase expensive attempts from the experiment. The attempt
+      // proceeds; the dataset is marked unhealthy.
+      try {
+        recordEvent(this.db, {
+          kind: "USAGE_RECEIPT_FAILED", entityType: "attempt", entityId: attemptId, epoch,
+          payload: { backend: backendName, message: String(error?.message ?? error).slice(0, 500) },
+        });
+      } catch { /* the audit write is best effort; never propagate into the run */ }
       return null;
     }
+  }
+
+  // Measurement health for an experiment dataset. Every attempt that started an executor must carry
+  // either a usage receipt or an explicit capture-failure record; otherwise a cost-per-validated-
+  // candidate result computed over it would silently omit attempts.
+  usageCoverage({ jobIds = null } = {}) {
+    const attempts = jobIds?.length
+      ? this.db.prepare(`SELECT id FROM attempts WHERE job_id IN (${jobIds.map(() => "?").join(",")})`).all(...jobIds)
+      : this.db.prepare("SELECT id FROM attempts").all();
+    const missing = [];
+    for (const { id } of attempts) {
+      if (this.db.prepare("SELECT 1 FROM attempt_usage_receipts WHERE attempt_id = ?").get(id)) continue;
+      const failed = this.db.prepare(
+        "SELECT 1 FROM events WHERE kind = 'USAGE_RECEIPT_FAILED' AND entity_id = ?",
+      ).get(id);
+      if (!failed) missing.push(id);
+    }
+    return { attempts: attempts.length, missing_receipts: missing, healthy: missing.length === 0 };
   }
 
   getAttemptUsage(attemptId) {
