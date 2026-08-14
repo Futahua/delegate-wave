@@ -1,6 +1,6 @@
-import { fail, pass } from "./_harness.js";
+import { fail, pass, loadModule } from "./_harness.js";
 
-const lib = await import(`../src/lib.js?t=${Date.now()}`);
+const lib = await loadModule("src/lib.js");
 if (lib.lastIndex([1, 2, 3]) !== 2) {
   fail(`lastIndex([1,2,3]) is ${lib.lastIndex([1, 2, 3])}, expected 2`);
 }

@@ -9,8 +9,18 @@ without increasing failures or weakening the worker confinement boundary?
 
 ## Corpus
 
-Ten tasks in `tasks.json`, digest recorded in `DIGEST`. Each has a fixed goal, a deliverable, and a
-verifier under `fixture/verify/`.
+Ten tasks in `tasks.json`. Each has a fixed goal, a deliverable, and a verifier under `verifiers/`.
+
+Verifiers live **outside** the fixture. If they shipped inside the attempt repository, a worker could
+read the acceptance criteria instead of solving the task, and because the fixture is copied whole,
+the first worker would also see the criteria for every later pair. The runner resolves the verifier
+root to an absolute path outside the worktree and runs it with the worktree as the working directory.
+
+`DIGEST` covers the entire apparatus -- tasks, protocol, fixture inputs, verifiers, and the
+line-ending rule -- hashed by sorted path and bytes. Hashing `tasks.json` alone would leave a later
+edit to a fixture or verifier invisible, which defeats preregistration. The merged corpus commit SHA
+is recorded alongside results, so Git provides an independent second identity for the frozen
+apparatus.
 
 Every verifier is proven bidirectional in `test/corpus.test.js`: it accepts a correct solution and
 rejects at least two plausible wrong answers. A verifier that passes whatever it is given makes
@@ -57,6 +67,16 @@ filter.
 
 Each task runs once per executor from the same base commit, with the same goal and the same
 validation plan, in a fresh worktree. Twenty runs total.
+
+Execution order is precommitted and balanced, because provider latency and cache state drift during a
+run and always running one backend first would confound the comparison:
+
+```text
+OpenCode first   t01  t03  t05  t07  t09
+Harness first    t02  t04  t06  t08  t10
+```
+
+The two-pair pilot uses t01 and t02, one of each order.
 
 A pilot of two pairs runs first. Its purpose is instrumentation, not performance: it must show that
 both executors produce complete usage receipts, that cache-read units mean the same thing on both

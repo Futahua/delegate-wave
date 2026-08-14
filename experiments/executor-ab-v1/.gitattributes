@@ -1,5 +1,0 @@
-# The paired-task fixture is measurement apparatus, not source. Two tasks compare bytes exactly:
-# t08 asserts trailing whitespace and blank runs, t10 asserts every original line survives unchanged.
-# If git rewrote line endings on checkout, those tasks would fail for reasons unrelated to the
-# executor under test, and the failure would look like a model error.
-* -text

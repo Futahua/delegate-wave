@@ -4,6 +4,7 @@
   "purpose": "Paired OpenCode/Harness executor comparison on cost per validated candidate.",
   "rules": [
     "Each task is run once per executor from the same base commit, goal, and validation plan.",
+    "Verifiers live outside the attempt worktree. A worker must never be able to read the acceptance criteria instead of solving the task.",
     "Validation must exercise the task's own deliverable. A plan that passes without testing what was asked for makes first-pass rate optimistic for both executors.",
     "Validation must reject a plausible wrong answer, not merely a missing file.",
     "No task may be edited after either executor has run it. If a task proves defective, discard the pair and restart it.",
@@ -14,71 +15,78 @@
       "id": "t01-csv-totals",
       "goal": "Create TOTALS.md containing one line per row of inventory.csv in the form '<item>: <qty>', then a final line 'Total: <sum>' with the arithmetic sum of the qty column.",
       "deliverable": "TOTALS.md",
-      "validate": "node verify/t01.js",
-      "shape": "arithmetic over a small table"
+      "shape": "arithmetic over a small table",
+      "verifier": "t01.js"
     },
     {
       "id": "t02-filter-select",
       "goal": "Create CHEAP.md listing only the items from catalog.csv whose price is strictly below 5.00, one per line as '<item> <price>', sorted by price ascending.",
       "deliverable": "CHEAP.md",
-      "validate": "node verify/t02.js",
-      "shape": "filter and sort with a boundary condition"
+      "shape": "filter and sort with a boundary condition",
+      "verifier": "t02.js"
     },
     {
       "id": "t03-json-reshape",
       "goal": "Read config.json and write config.summary.json containing an object with keys 'services' (the count of entries in the services array) and 'ports' (an ascending array of every distinct port used).",
       "deliverable": "config.summary.json",
-      "validate": "node verify/t03.js",
-      "shape": "structured read, dedupe, reshape"
+      "shape": "structured read, dedupe, reshape",
+      "verifier": "t03.js"
     },
     {
       "id": "t04-bugfix-off-by-one",
       "goal": "The function lastIndex in src/lib.js returns the wrong value for non-empty arrays. Fix it so it returns the index of the final element, and leave every other function unchanged.",
       "deliverable": "src/lib.js",
-      "validate": "node verify/t04.js",
-      "shape": "localized bug fix with regression risk"
+      "shape": "localized bug fix with regression risk",
+      "verifier": "t04.js"
     },
     {
       "id": "t05-add-function",
       "goal": "Add an exported function named median to src/lib.js that returns the median of an array of numbers, averaging the two middle values for even-length input and returning null for an empty array. Do not modify existing functions.",
       "deliverable": "src/lib.js",
-      "validate": "node verify/t05.js",
-      "shape": "additive API change with edge cases"
+      "shape": "additive API change with edge cases",
+      "verifier": "t05.js"
     },
     {
       "id": "t06-rename-consistent",
-      "goal": "Rename the exported function tally in src/lib.js to countItems, updating every reference in src/ so the module still loads and all existing behaviour is preserved.",
+      "goal": "Rename the exported function tally in src/lib.js to countItems, updating every reference across src/ so all modules still load and existing behaviour is preserved.",
       "deliverable": "src/lib.js",
-      "validate": "node verify/t06.js",
-      "shape": "multi-site consistent rename"
+      "shape": "multi-site consistent rename",
+      "verifier": "t06.js"
     },
     {
       "id": "t07-doc-from-code",
-      "goal": "Create API.md documenting every exported function in src/lib.js, one section per function with its name, its parameters, and one sentence describing what it returns.",
+      "goal": "Create API.md with one '## <name>' section per exported function in src/lib.js. Each section must contain a line 'Parameters: <names>' listing its parameter names and a line 'Returns: <description>' describing what it returns.",
       "deliverable": "API.md",
-      "validate": "node verify/t07.js",
-      "shape": "read code, produce accurate prose"
+      "shape": "read code, produce accurate prose",
+      "verifier": "t07.js"
     },
     {
       "id": "t08-text-transform",
       "goal": "Create notes.clean.md from notes.md with every line trimmed of trailing whitespace, all blank runs collapsed to a single blank line, and the original line order preserved.",
       "deliverable": "notes.clean.md",
-      "validate": "node verify/t08.js",
-      "shape": "whitespace-exact transformation"
+      "shape": "whitespace-exact transformation",
+      "verifier": "t08.js"
     },
     {
       "id": "t09-two-file-join",
       "goal": "Create REPORT.md joining inventory.csv and catalog.csv on the item name, one line per item present in both as '<item> <qty> x <price> = <total>' with total rounded to two decimals.",
       "deliverable": "REPORT.md",
-      "validate": "node verify/t09.js",
-      "shape": "join across two sources with computation"
+      "shape": "join across two sources with computation",
+      "verifier": "t09.js"
     },
     {
       "id": "t10-constrained-edit",
       "goal": "Add a trailing newline and a final line '# end' to notes.md without altering any existing line of that file.",
       "deliverable": "notes.md",
-      "validate": "node verify/t10.js",
-      "shape": "minimal edit under a strict no-collateral constraint"
+      "shape": "minimal edit under a strict no-collateral constraint",
+      "verifier": "t10.js"
     }
+  ],
+  "verifier_root": "experiments/executor-ab-v1/verifiers",
+  "fixture_root": "experiments/executor-ab-v1/fixture",
+  "validation_command_template": "node <VERIFIER_ROOT>/<verifier>",
+  "notes": [
+    "The runner resolves <VERIFIER_ROOT> to an absolute path outside the attempt worktree and runs the command with the worktree as the working directory.",
+    "A relative validate command is deliberately not stored here: it would encode an assumption about where the worktree sits relative to the verifiers, which does not hold for a real attempt worktree."
   ]
 }
