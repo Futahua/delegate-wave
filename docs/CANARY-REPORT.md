@@ -113,3 +113,17 @@ cost    $0.0025635652
 The audit changed no files and identified two real remaining blockers. Process probing treated every error, including Windows access denial, as proof of death; it now treats only `ESRCH`/`ENOENT` as dead and fails closed for all other probe errors. Validation intent was durable only as an event, leaving a spawn-to-PID receipt ambiguity; it is now persisted on the attempt row before spawn, and reconciliation refuses an intent without a PID receipt instead of advancing the epoch.
 
 Regression coverage now includes fail-closed liveness probes, scheduler ownership before executor publication, the genuine live validator receipt, stale validation with no spawned side effect, and uncertain validation-start recovery. The full suite passes 18 tests. Total reported OpenCode Go cost through this audit is `$0.0180219200`.
+
+## Final merge-blocker audit
+
+The resulting pushed head `f2a2e71` received one final fresh-clone, read-only DeepSeek audit:
+
+```text
+job     job_a906166b-ce6e-40d9-9edf-e2357b6e889f
+attempt job_a906166b-ce6e-40d9-9edf-e2357b6e889f.1
+session ses_001124962ffeHl4uhaGnlWdfrJ
+epoch   8
+cost    $0.0018791472
+```
+
+The audit returned `NO BLOCKERS`. It independently verified fail-closed liveness behavior, row-level intent before spawn, both reconciliation refusal checks, validation intent/PID matching, the genuine live-validator and uncertain-start tests, and additive schema migration safety. It changed no files. Total reported OpenCode Go cost through the final audit is `$0.0199010672`.
