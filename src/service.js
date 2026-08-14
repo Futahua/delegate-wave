@@ -370,31 +370,33 @@ export class Dispatcher {
       baseSha: job.base_sha, candidateCommit: candidate.result_commit,
       integrationBranch: project.integration_branch, expectedHead, planDigest,
     });
-    const existing = this.db.prepare("SELECT * FROM integration_proposals WHERE attempt_id = ?").get(candidate.id);
-    if (existing) {
-      if (existing.action_digest !== digest) {
-        throw new Error(`Existing proposal ${existing.id} has a different action digest for attempt ${candidate.id}`);
+    return transaction(this.db, () => {
+      const existing = this.db.prepare("SELECT * FROM integration_proposals WHERE attempt_id = ?").get(candidate.id);
+      if (existing) {
+        if (existing.action_digest !== digest) {
+          throw new Error(`Existing proposal ${existing.id} has a different action digest for attempt ${candidate.id}`);
+        }
+        if (existing.validation_plan_digest !== planDigest) {
+          throw new Error(`Existing proposal ${existing.id} has a different validation plan digest for attempt ${candidate.id}`);
+        }
+        return existing;
       }
-      if (existing.validation_plan_digest !== planDigest) {
-        throw new Error(`Existing proposal ${existing.id} has a different validation plan digest for attempt ${candidate.id}`);
-      }
-      return this.getProposal(existing.id);
-    }
-    const proposalId = id("proposal");
-    const timestamp = now();
-    this.db.prepare(`INSERT INTO integration_proposals(
-      id, project_id, job_id, attempt_id, base_sha, candidate_commit, integration_branch,
-      expected_integration_head, validation_plan_json, validation_plan_digest, action_digest,
-      state, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
-      proposalId, project.id, jobId, candidate.id, job.base_sha, candidate.result_commit,
-      project.integration_branch, expectedHead, planJson, planDigest, digest, timestamp, timestamp,
-    );
-    recordEvent(this.db, {
-      kind: "INTEGRATION_PROPOSED", entityType: "proposal", entityId: proposalId,
-      payload: { jobId, attemptId: candidate.id, digest },
+      const proposalId = id("proposal");
+      const timestamp = now();
+      this.db.prepare(`INSERT INTO integration_proposals(
+        id, project_id, job_id, attempt_id, base_sha, candidate_commit, integration_branch,
+        expected_integration_head, validation_plan_json, validation_plan_digest, action_digest,
+        state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
+        proposalId, project.id, jobId, candidate.id, job.base_sha, candidate.result_commit,
+        project.integration_branch, expectedHead, planJson, planDigest, digest, timestamp, timestamp,
+      );
+      recordEvent(this.db, {
+        kind: "INTEGRATION_PROPOSED", entityType: "proposal", entityId: proposalId,
+        payload: { jobId, attemptId: candidate.id, digest },
+      });
+      return this.getProposal(proposalId);
     });
-    return this.getProposal(proposalId);
   }
 
   grantApproval({ proposalId, principal, origin, expiresAt = null, idempotencyKey = null, maximumCost = null }) {
@@ -415,39 +417,45 @@ export class Dispatcher {
       if (parsed.getTime() <= Date.now()) throw new Error(`Approval already expired at ${parsed.toISOString()}`);
       expiresAt = parsed.toISOString();
     }
-    if (idempotencyKey) {
-      const keyed = this.db.prepare("SELECT * FROM approval_receipts WHERE idempotency_key = ?").get(idempotencyKey);
-      if (keyed) {
-        if (keyed.proposal_id !== proposalId || keyed.granted_digest !== proposal.action_digest) {
-          throw new Error(`Idempotency key ${idempotencyKey} was already used for a different approval`);
+    return transaction(this.db, () => {
+      const integratedNow = this.db.prepare(
+        "SELECT 1 FROM integration_records WHERE proposal_id = ? AND kind = 'PROPOSAL_INTEGRATED' LIMIT 1",
+      ).get(proposalId);
+      if (integratedNow) throw new Error(`Proposal ${proposalId} is INTEGRATED`);
+      if (idempotencyKey) {
+        const keyed = this.db.prepare("SELECT * FROM approval_receipts WHERE idempotency_key = ?").get(idempotencyKey);
+        if (keyed) {
+          if (keyed.proposal_id !== proposalId || keyed.granted_digest !== proposal.action_digest) {
+            throw new Error(`Idempotency key ${idempotencyKey} was already used for a different approval`);
+          }
+          return keyed;
         }
-        return keyed;
       }
-    }
-    const existing = this.db.prepare(`SELECT * FROM approval_receipts
-      WHERE proposal_id = ? AND principal = ?
-        AND (expires_at IS NULL OR expires_at > ?)
-      ORDER BY granted_at DESC LIMIT 1`).get(proposalId, principal, now());
-    if (existing) {
-      if (existing.granted_digest !== proposal.action_digest) {
-        throw new Error(`Existing approval ${existing.id} grants a different digest`);
+      const existing = this.db.prepare(`SELECT * FROM approval_receipts
+        WHERE proposal_id = ? AND principal = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY granted_at DESC LIMIT 1`).get(proposalId, principal, now());
+      if (existing) {
+        if (existing.granted_digest !== proposal.action_digest) {
+          throw new Error(`Existing approval ${existing.id} grants a different digest`);
+        }
+        const consumed = this.db.prepare("SELECT 1 FROM integration_operations WHERE approval_receipt_id = ? LIMIT 1").get(existing.id);
+        if (!consumed) return existing;
       }
-      const consumed = this.db.prepare("SELECT 1 FROM integration_operations WHERE approval_receipt_id = ? LIMIT 1").get(existing.id);
-      if (!consumed) return existing;
-    }
-    const receiptId = id("approval");
-    this.db.prepare(`INSERT INTO approval_receipts(
-      id, proposal_id, principal, origin, expires_at, idempotency_key, granted_digest,
-      expected_state_version, granted_scope, maximum_cost, granted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'integration', ?, ?)`).run(
-      receiptId, proposalId, principal, origin, expiresAt, idempotencyKey, proposal.action_digest,
-      proposal.action_digest, maximumCost === null ? null : Number(maximumCost), now(),
-    );
-    recordEvent(this.db, {
-      kind: "APPROVAL_GRANTED", entityType: "approval", entityId: receiptId,
-      payload: { proposalId, principal, origin, digest: proposal.action_digest },
+      const receiptId = id("approval");
+      this.db.prepare(`INSERT INTO approval_receipts(
+        id, proposal_id, principal, origin, expires_at, idempotency_key, granted_digest,
+        expected_state_version, granted_scope, maximum_cost, granted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'integration', ?, ?)`).run(
+        receiptId, proposalId, principal, origin, expiresAt, idempotencyKey, proposal.action_digest,
+        proposal.action_digest, maximumCost === null ? null : Number(maximumCost), now(),
+      );
+      recordEvent(this.db, {
+        kind: "APPROVAL_GRANTED", entityType: "approval", entityId: receiptId,
+        payload: { proposalId, principal, origin, digest: proposal.action_digest },
+      });
+      return this.db.prepare("SELECT * FROM approval_receipts WHERE id = ?").get(receiptId);
     });
-    return this.db.prepare("SELECT * FROM approval_receipts WHERE id = ?").get(receiptId);
   }
 
   recordIntegrationRecord(operationId, proposalId, kind, detail = "") {
@@ -524,6 +532,21 @@ export class Dispatcher {
       if (!current) throw new Error(`Proposal ${proposalId} no longer exists`);
       if (current.action_digest !== proposal.action_digest) {
         throw new Error(`Proposal ${proposalId} action digest mismatch`);
+      }
+      const integratedNow = this.db.prepare(
+        "SELECT 1 FROM integration_records WHERE proposal_id = ? AND kind = 'PROPOSAL_INTEGRATED' LIMIT 1",
+      ).get(proposalId);
+      if (integratedNow) throw new Error(`Proposal ${proposalId} is already integrated`);
+      const unresolved = this.db.prepare(`SELECT o.id, o.proposal_id
+        FROM integration_operations o
+        WHERE NOT EXISTS (
+          SELECT 1 FROM integration_records r
+          WHERE r.operation_id = o.id
+            AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
+        )
+        ORDER BY o.created_at LIMIT 1`).get();
+      if (unresolved) {
+        throw new Error(`Integration operation ${unresolved.id} for proposal ${unresolved.proposal_id} is unresolved`);
       }
       const receipt = this.db.prepare(`SELECT r.* FROM approval_receipts r
         WHERE r.proposal_id = ?
@@ -677,11 +700,29 @@ export class Dispatcher {
     const missingRepositories = this.listProjects()
       .filter((project) => !fs.existsSync(project.repo_path))
       .map((project) => ({ id: project.id, repo_path: project.repo_path }));
+    const unresolvedIntegrations = this.db.prepare(`SELECT
+        o.id AS operation_id,
+        o.proposal_id,
+        o.integration_branch,
+        o.created_at,
+        EXISTS (
+          SELECT 1 FROM integration_records r
+          WHERE r.operation_id = o.id AND r.kind = 'BRANCH_ADVANCE_INTENDED'
+        ) AS branch_advance_intended
+      FROM integration_operations o
+      WHERE NOT EXISTS (
+        SELECT 1 FROM integration_records r
+        WHERE r.operation_id = o.id
+          AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
+      )
+      ORDER BY o.created_at`).all();
     return {
-      healthy: integrity.length === 1 && integrity[0] === "ok" && running.length === 0 && missingRepositories.length === 0,
+      healthy: integrity.length === 1 && integrity[0] === "ok" && running.length === 0
+        && missingRepositories.length === 0 && unresolvedIntegrations.length === 0,
       database_integrity: integrity,
       running_attempts: running,
       missing_repositories: missingRepositories,
+      unresolved_integrations: unresolvedIntegrations,
     };
   }
 

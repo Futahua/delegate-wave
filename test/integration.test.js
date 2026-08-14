@@ -3,16 +3,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { initializeDataRoot } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { updateRefCas } from "../src/git.js";
 import { runProcess } from "../src/process.js";
 
+const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+
 async function command(name, args, cwd) {
   const result = await runProcess(name, args, { cwd });
   assert.equal(result.exitCode, 0, result.stderr);
   return result.stdout.trim();
+}
+
+async function cli(root, args) {
+  return runProcess(process.execPath, [cliPath, ...args], {
+    env: { DELEGATE_WAVE_DATA_ROOT: root },
+    timeoutMs: 30_000,
+  });
 }
 
 async function fixture(t) {
@@ -389,6 +399,13 @@ test("an operation intent without a terminal record fails closed", async (t) => 
   );
   await assert.rejects(service.runIntegration(proposal.id), /stuck without a terminal outcome/);
   assert.equal(service.integrationStatus(proposal.id).operations[0].state, "INTENDED");
+  const health = service.doctor();
+  assert.equal(health.healthy, false);
+  assert.equal(health.unresolved_integrations.length, 1);
+  assert.equal(health.unresolved_integrations[0].operation_id, "operation-stuck");
+  assert.equal(health.unresolved_integrations[0].proposal_id, proposal.id);
+  assert.equal(health.unresolved_integrations[0].integration_branch, "integration");
+  assert.equal(health.unresolved_integrations[0].branch_advance_intended, 0);
 });
 
 test("a receipt failure after CAS remains uncertain instead of being mislabeled failed", async (t) => {
@@ -458,4 +475,59 @@ test("malformed project validation config is rejected before worker claim", asyn
   await assert.rejects(service.runJob(job.id), /Stored validation plan is not valid JSON/);
   assert.equal(service.status(job.id).attempts.length, 0);
   assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+});
+
+test("concurrent CLI proposal creation returns one immutable proposal identity", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "concurrent proposal" });
+  assert.equal((await service.runJob(job.id)).job.status, "READY_FOR_INTEGRATION");
+  const results = await Promise.all([
+    cli(root, ["integration", "propose", "--job", job.id]),
+    cli(root, ["integration", "propose", "--job", job.id]),
+  ]);
+  for (const result of results) assert.equal(result.exitCode, 0, result.stderr);
+  const proposals = results.map((result) => JSON.parse(result.stdout));
+  assert.equal(proposals[0].id, proposals[1].id);
+  assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM integration_proposals WHERE job_id = ?").get(job.id).count, 1);
+});
+
+test("concurrent CLI approval grants return one effective receipt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  const args = ["approval", "grant", "--proposal", proposal.id, "--principal", "human-1", "--origin", "concurrency-test"];
+  const results = await Promise.all([cli(root, args), cli(root, args)]);
+  for (const result of results) assert.equal(result.exitCode, 0, result.stderr);
+  const receipts = results.map((result) => JSON.parse(result.stdout));
+  assert.equal(receipts[0].id, receipts[1].id);
+  assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM approval_receipts WHERE proposal_id = ?").get(proposal.id).count, 1);
+});
+
+test("concurrent CLI integrations create one operation and preserve the second approval", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({
+    name: "Fixture",
+    repoPath: repo,
+    branch: "integration",
+    validation: ['node -e "setTimeout(() => {}, 1200)"'],
+  });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  service.grantApproval({ proposalId: proposal.id, principal: "human-2", origin: "terminal" });
+  const args = ["integration", "run", "--proposal", proposal.id];
+  const results = await Promise.all([cli(root, args), cli(root, args)]);
+  assert.equal(results.filter((result) => result.exitCode === 0).length, 1);
+  assert.equal(results.filter((result) => result.exitCode !== 0).length, 1);
+  assert.match(results.find((result) => result.exitCode !== 0).stderr, /is unresolved/);
+  const status = service.integrationStatus(proposal.id);
+  assert.equal(status.operations.length, 1);
+  assert.equal(status.operations[0].state, "SUCCEEDED");
+  assert.deepEqual(status.approvals.map((approval) => approval.consumed).sort(), [0, 1]);
 });

@@ -1,13 +1,15 @@
 # Approved-integration dogfood report
 
 Date: 2026-08-14  
-Candidate: `bc205948faef32ebae2608cf82717f6c06967322`
+Initial reviewed candidate: `bc205948faef32ebae2608cf82717f6c06967322`
 
 ## Outcome
 
 The approved-integration vertical slice was built with `delegate-wave` workers, repaired under its
 quarantine boundary, and independently audited with Luna. The final local conformance run passes
-38/38 tests. The final fresh Luna audit returned `NO BLOCKERS`.
+41/41 tests. A fresh Luna audit of the preceding 38-test candidate returned `NO BLOCKERS`; remote
+human review then found a cross-process claim race and two related transactional/health gaps. Those
+findings were fixed without another model call and are covered by real multi-process CLI tests.
 
 This version was not allowed to integrate itself. It must be reviewed and merged through the
 normal GitHub path. After that merge, a small documentation change can be the first candidate
@@ -47,6 +49,10 @@ after the executor exited.
    handling, plus missing adversarial coverage.
 8. The final fresh Luna audit, against the corrected commit and 38-test suite, returned
    `NO BLOCKERS`.
+9. Remote review found non-atomic integration claim, proposal/approval idempotency races, and a
+   false-green doctor result for unresolved integration intent.
+10. Final lookup/inserts now use immediate transactions, integration is globally serialized while
+    any operation is unresolved, and doctor reports those operations as unhealthy.
 
 ## Cost accounting
 
@@ -78,7 +84,7 @@ architecture / conflicts / acceptance -> Codex or human
 
 ## Final evidence
 
-- `npm run check`: 38 passed, 0 failed.
+- `npm run check`: 41 passed, 0 failed.
 - `git diff --check`: clean.
 - Real temporary Git repositories, linked worktrees, local receive-pack, force-with-lease, SQLite,
   shell validation, and injected crash/acknowledgement failures are exercised.
@@ -90,6 +96,9 @@ architecture / conflicts / acceptance -> Codex or human
 - Ambiguous or post-CAS receipt failures remain fail-closed and are never mislabeled as ordinary
   failed operations.
 - The user's checkout is not modified by successful integration.
+- Separate CLI processes prove concurrent proposal and approval calls return one identity, while
+  concurrent integration runs create one operation and preserve the unused approval.
+- `doctor` reports unhealthy for an unterminated integration operation.
 
 ## Deliberately deferred
 

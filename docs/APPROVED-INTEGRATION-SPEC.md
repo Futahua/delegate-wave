@@ -27,7 +27,8 @@ change the commands executed for the proposal.
 claimed. Malformed proposal validation JSON MUST be rejected rather than interpreted as no checks.
 
 **INT-007** One attempt MUST have at most one proposal. Re-proposing the same candidate MUST
-return the existing proposal unchanged and MUST refuse if the derivable digest differs.
+return the existing proposal unchanged and MUST refuse if the derivable digest differs. The final
+lookup and insert MUST occur in one immediate transaction.
 
 ## Approvals
 
@@ -40,7 +41,8 @@ version is the action digest and the only granted scope is `integration`.
 
 **APP-003** Repeating a grant for the same principal and unconsumed proposal MUST return the
 existing receipt. Reusing an idempotency key MUST return the existing receipt and MUST refuse if
-the key was used for a different digest or proposal.
+the key was used for a different digest or proposal. Idempotency lookup, consumption lookup, and
+receipt insertion MUST occur in one immediate transaction.
 
 **APP-004** A proposal MUST NOT be integrated without at least one unconsumed, unexpired
 approval whose granted digest equals the proposal's action digest.
@@ -51,7 +53,9 @@ approval whose granted digest equals the proposal's action digest.
 record durable immutable operation intent in one immediate transaction. The operation's reference
 to that receipt constitutes consumption.
 
-**INT-RUN-002** A run MUST refuse while any `INTENDED` operation exists for the proposal.
+**INT-RUN-002** The bootstrap MUST serialize integration globally. Inside the immediate claim
+transaction, a run MUST refuse while any integration operation lacks an immutable
+`INTEGRATION_SUCCEEDED` or `INTEGRATION_FAILED` terminal record, even for another proposal.
 
 **INT-RUN-003** A run MUST refuse if the integration branch is checked out in any worktree.
 
@@ -93,20 +97,23 @@ append `INTEGRATION_FAILED` only when the ref still equals the expected old head
 advanced, diverged, cannot be read, or a later receipt write fails, it MUST NOT append
 `INTEGRATION_FAILED`; the operation remains uncertain and requires deterministic reconciliation.
 
+**INT-RUN-015** `doctor` MUST report every operation without an immutable success/failure terminal
+record and MUST report unhealthy while any such operation exists.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
 | INT-001–INT-007 | strict plan parsing, `Dispatcher.proposeIntegration`, `UNIQUE(attempt_id)`, action digest | malformed-config, proposal readiness, snapshot, and happy-path tests |
-| APP-001–APP-004 | `Dispatcher.grantApproval`, stored `granted_digest`, `UNIQUE(idempotency_key)` | missing-approval and expired-approval tests |
-| INT-RUN-001–INT-RUN-002 | immediate claim transaction with approval consumption and `INTENDED` operation | happy-path and validation-failure tests |
+| APP-001–APP-004 | immediate grant transaction, stored `granted_digest`, `UNIQUE(idempotency_key)` | missing, expired, and concurrent approval tests |
+| INT-RUN-001–INT-RUN-002 | immediate globally serialized claim transaction with approval consumption and `INTENDED` operation | happy-path, validation-failure, and concurrent CLI integration tests |
 | INT-RUN-003 | `git worktree list --porcelain` branch check | checked-out-elsewhere test |
 | INT-RUN-004 | `resolveRevision` comparison | stale-head test |
 | INT-RUN-005 | stored plan snapshot and re-derived digest comparison | snapshot and tamper tests |
 | INT-RUN-006 | `git merge-base --is-ancestor` | happy-path test |
 | INT-RUN-007–INT-RUN-008 | integration-root detached worktree, cherry-pick, validation re-run | happy-path and validation-failure tests |
 | INT-RUN-009–INT-RUN-010 | guarded local receive-pack CAS, immutable failure record | checked-out-branch, stale-head, ancestry, validation-failure, and no-branch-movement tests |
-| INT-RUN-011–INT-RUN-014 | immutable terminal records, derived status, post-CAS fail-closed handling, idempotent early return | happy-path, immutability, stuck-intent, post-CAS failure, and idempotency tests |
+| INT-RUN-011–INT-RUN-015 | immutable terminal records, derived status, post-CAS fail-closed handling, doctor visibility, idempotent early return | happy-path, immutability, stuck-intent/doctor, post-CAS failure, and idempotency tests |
 
 ## Out of scope for this slice
 
