@@ -6,10 +6,19 @@ Concise daily operating checklist. Shell access is out of scope; run every comma
 
 ```powershell
 npm link
+$env:DELEGATE_WAVE_CONTROL_TOKEN = '<generate-a-local-secret>'
+$env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
+delegate-wave serve
+```
+
+Keep the server running. In a second terminal:
+
+```powershell
+$env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
 delegate-wave init
 ```
 
-Data root defaults to `D:\AssistantSystem\delegate-wave`. Override for a scratch run with `$env:DELEGATE_WAVE_DATA_ROOT = 'D:\path\wave-test'`.
+Data root defaults to `D:\AssistantSystem\delegate-wave`. Set `DELEGATE_WAVE_DATA_ROOT` on the server for a scratch run. CLI mutations print their request ID before sending. If a failure says the outcome may be uncertain, rerun the exact command with the printed `--request-id`; do not issue a fresh request.
 
 ## 2. Register a project
 
@@ -49,6 +58,8 @@ delegate-wave doctor
 ```
 
 Checks SQLite integrity, missing repositories, and nonterminal attempts. Investigate any `error` or `warning` before proceeding.
+
+If the Control API is unavailable, CLI commands fail. Do not bypass the API by editing SQLite or invoking dispatcher internals.
 
 ## 6. Reconcile preview
 

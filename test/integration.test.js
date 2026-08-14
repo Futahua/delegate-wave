@@ -3,26 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { initializeDataRoot } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { updateRefCas } from "../src/git.js";
 import { runProcess } from "../src/process.js";
 
-const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-
 async function command(name, args, cwd) {
   const result = await runProcess(name, args, { cwd });
   assert.equal(result.exitCode, 0, result.stderr);
   return result.stdout.trim();
-}
-
-async function cli(root, args) {
-  return runProcess(process.execPath, [cliPath, ...args], {
-    env: { DELEGATE_WAVE_DATA_ROOT: root },
-    timeoutMs: 30_000,
-  });
 }
 
 async function waitForFile(filename, timeoutMs = 10_000) {
@@ -485,7 +475,7 @@ test("malformed project validation config is rejected before worker claim", asyn
   assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
 });
 
-test("concurrent CLI proposal creation returns one immutable proposal identity", async (t) => {
+test("concurrent proposal creation returns one immutable proposal identity", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
   t.after(async () => { service.close(); await cleanup(); });
@@ -493,30 +483,28 @@ test("concurrent CLI proposal creation returns one immutable proposal identity",
   const job = await service.createJob({ projectId: project.id, goal: "concurrent proposal" });
   assert.equal((await service.runJob(job.id)).job.status, "READY_FOR_INTEGRATION");
   const results = await Promise.all([
-    cli(root, ["integration", "propose", "--job", job.id]),
-    cli(root, ["integration", "propose", "--job", job.id]),
+    service.proposeIntegration({ jobId: job.id }),
+    service.proposeIntegration({ jobId: job.id }),
   ]);
-  for (const result of results) assert.equal(result.exitCode, 0, result.stderr);
-  const proposals = results.map((result) => JSON.parse(result.stdout));
-  assert.equal(proposals[0].id, proposals[1].id);
+  assert.equal(results[0].id, results[1].id);
   assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM integration_proposals WHERE job_id = ?").get(job.id).count, 1);
 });
 
-test("concurrent CLI approval grants return one effective receipt", async (t) => {
+test("concurrent approval grants return one effective receipt", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
   t.after(async () => { service.close(); await cleanup(); });
   const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
   const { proposal } = await readyProposal(service, project.id, service.backend);
-  const args = ["approval", "grant", "--proposal", proposal.id, "--principal", "human-1", "--origin", "concurrency-test"];
-  const results = await Promise.all([cli(root, args), cli(root, args)]);
-  for (const result of results) assert.equal(result.exitCode, 0, result.stderr);
-  const receipts = results.map((result) => JSON.parse(result.stdout));
+  const grant = () => service.grantApproval({
+    proposalId: proposal.id, principal: "human-1", origin: "concurrency-test", idempotencyKey: "same-grant",
+  });
+  const receipts = await Promise.all([grant(), grant()]);
   assert.equal(receipts[0].id, receipts[1].id);
   assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM approval_receipts WHERE proposal_id = ?").get(proposal.id).count, 1);
 });
 
-test("concurrent CLI integrations create one operation and preserve the second approval", async (t) => {
+test("concurrent integrations create one operation and preserve the second approval", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
   t.after(async () => { service.close(); await cleanup(); });
@@ -544,15 +532,11 @@ test("concurrent CLI integrations create one operation and preserve the second a
   const proposal = await service.proposeIntegration({ jobId: job.id });
   service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
   service.grantApproval({ proposalId: proposal.id, principal: "human-2", origin: "terminal" });
-  const args = ["integration", "run", "--proposal", proposal.id];
-  const firstPromise = cli(root, args);
+  const firstPromise = service.runIntegration(proposal.id);
   await waitForFile(validationStarted);
-  const second = await cli(root, args);
+  await assert.rejects(service.runIntegration(proposal.id), /(is unresolved|stuck without a terminal outcome)/);
   fs.writeFileSync(validationRelease, "release");
-  const first = await firstPromise;
-  assert.notEqual(second.exitCode, 0);
-  assert.match(second.stderr, /(is unresolved|stuck without a terminal outcome)/);
-  assert.equal(first.exitCode, 0, first.stderr);
+  await firstPromise;
   const status = service.integrationStatus(proposal.id);
   assert.equal(status.operations.length, 1);
   assert.equal(status.operations[0].state, "SUCCEEDED");

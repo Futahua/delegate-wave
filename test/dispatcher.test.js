@@ -58,6 +58,38 @@ test("successful worker produces a validated candidate commit", async (t) => {
   assert.match(result.attempts[0].result_commit, /^[a-f0-9]{40,64}$/);
 });
 
+test("child processes exclude the Control API authority token unless explicitly supplied", async (t) => {
+  const original = process.env.DELEGATE_WAVE_CONTROL_TOKEN;
+  process.env.DELEGATE_WAVE_CONTROL_TOKEN = "must-not-inherit";
+  t.after(() => {
+    if (original === undefined) delete process.env.DELEGATE_WAVE_CONTROL_TOKEN;
+    else process.env.DELEGATE_WAVE_CONTROL_TOKEN = original;
+  });
+  const script = "process.stdout.write(process.env.DELEGATE_WAVE_CONTROL_TOKEN || 'absent')";
+  const scrubbed = await runProcess(process.execPath, ["-e", script]);
+  assert.equal(scrubbed.stdout, "absent");
+  const explicit = await runProcess(process.execPath, ["-e", script], {
+    env: { DELEGATE_WAVE_CONTROL_TOKEN: "explicit-test-token" },
+  });
+  assert.equal(explicit.stdout, "explicit-test-token");
+});
+
+test("project and job rows roll back when their event receipt fails", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  service.db.exec(`CREATE TRIGGER injected_event_failure BEFORE INSERT ON events
+    BEGIN SELECT RAISE(ABORT, 'injected event failure'); END`);
+  await assert.rejects(service.addProject({ name: "Rollback", repoPath: repo }), /injected event failure/);
+  assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM projects").get().count, 0);
+  service.db.exec("DROP TRIGGER injected_event_failure");
+  const project = await service.addProject({ name: "Rollback", repoPath: repo });
+  service.db.exec(`CREATE TRIGGER injected_event_failure BEFORE INSERT ON events
+    BEGIN SELECT RAISE(ABORT, 'injected event failure'); END`);
+  await assert.rejects(service.createJob({ projectId: project.id, goal: "must roll back" }), /injected event failure/);
+  assert.equal(service.db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count, 0);
+});
+
 test("failed workers stop after the bounded attempt count", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const backend = new FakeBackend(async () => ({ exitCode: 7, stdout: "", stderr: "same failure 123" }));

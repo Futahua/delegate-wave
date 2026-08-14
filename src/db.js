@@ -139,6 +139,24 @@ CREATE TABLE IF NOT EXISTS integration_records (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS control_request_intents (
+  request_id TEXT PRIMARY KEY,
+  command TEXT NOT NULL,
+  args_digest TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  origin_channel TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS control_request_results (
+  request_id TEXT PRIMARY KEY REFERENCES control_request_intents(request_id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('SUCCEEDED', 'FAILED')),
+  response_json TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS trg_proposals_immutable_update
 BEFORE UPDATE ON integration_proposals
 BEGIN SELECT RAISE(ABORT, 'integration_proposals is immutable'); END;
@@ -163,6 +181,18 @@ BEGIN SELECT RAISE(ABORT, 'integration_records is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_records_immutable_delete
 BEFORE DELETE ON integration_records
 BEGIN SELECT RAISE(ABORT, 'integration_records is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_control_intents_immutable_update
+BEFORE UPDATE ON control_request_intents
+BEGIN SELECT RAISE(ABORT, 'control_request_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_control_intents_immutable_delete
+BEFORE DELETE ON control_request_intents
+BEGIN SELECT RAISE(ABORT, 'control_request_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_control_results_immutable_update
+BEFORE UPDATE ON control_request_results
+BEGIN SELECT RAISE(ABORT, 'control_request_results is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_control_results_immutable_delete
+BEFORE DELETE ON control_request_results
+BEGIN SELECT RAISE(ABORT, 'control_request_results is immutable'); END;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_job ON attempts(job_id, ordinal);
@@ -172,6 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_proposals_state ON integration_proposals(state);
 CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_ops_proposal ON integration_operations(proposal_id, state);
 CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operation_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_control_intents_created ON control_request_intents(created_at);
 `;
 
 export function initializeDataRoot(root) {
@@ -204,7 +235,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '8')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '9')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -256,7 +287,7 @@ function migrate(db) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
-  db.prepare("UPDATE metadata SET value = '8' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE metadata SET value = '9' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

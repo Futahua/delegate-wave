@@ -116,4 +116,4 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 - The scheduler runs one CLI-owned attempt at a time; wave concurrency is not implemented.
 - PID liveness cannot prove that a remote or attached OpenCode session has stopped. Reconciliation therefore refuses live recorded processes and never attaches a replacement mid-attempt.
 - Candidate integration remains a human/Codex operation.
-- Approval receipts, semantic blockers, the Control API, and Hermes/T3 adapters are not part of this baseline.
+- Semantic blockers and Hermes/T3 adapters are not part of this baseline. Approved integration and the local Control API are specified separately.
