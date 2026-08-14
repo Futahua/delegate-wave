@@ -9,7 +9,8 @@ import { managedPaths } from "./paths.js";
 // 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
 // 12: usage receipts record cost provenance and enforce their value invariants.
 // 13: durable cancellation intents and results.
-export const SCHEMA_VERSION = "13";
+// 14: jobs carry an enforced cost ceiling.
+export const SCHEMA_VERSION = "14";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -38,6 +39,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   )),
   base_sha TEXT NOT NULL,
   max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
+  -- A recorded ceiling in reference dollars. NULL means no ceiling; a value is enforced before each
+  -- attempt starts, and unaccounted spend blocks rather than passes.
+  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -390,6 +394,10 @@ export function openDatabase(filename) {
 }
 
 function migrate(db) {
+  const jobColumns = db.prepare("PRAGMA table_info(jobs)").all().map((column) => column.name);
+  if (!jobColumns.includes("maximum_cost")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN maximum_cost REAL");
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   if (!attemptColumns.includes("validation_state")) {
     db.exec("ALTER TABLE attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT 'NOT_RUN'");

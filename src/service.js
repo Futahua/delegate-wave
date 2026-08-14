@@ -120,24 +120,24 @@ export class Dispatcher {
 
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
-  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }) {
+  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null }) {
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
-      id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
-      jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
+      id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)`).run(
+      jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost, timestamp, timestamp,
     );
     recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
     return this.getJob(jobId);
   }
 
-  async createJob({ projectId, goal, mode = "write", maxAttempts = 2 }) {
+  async createJob({ projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
-    return transaction(this.db, () => this.insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }));
+    return transaction(this.db, () => this.insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost }));
   }
 
   // --- Proposal-only work authority -------------------------------------------------------------
@@ -283,8 +283,11 @@ export class Dispatcher {
       }
       this.assertAuthorizable(proposal);
 
+      // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
+      // bound the scheduler keeps, not a note.
       const job = this.insertJobRow({
         projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
+        maximumCost: proposal.maximum_cost,
       });
       this.db.prepare(`INSERT INTO work_proposal_decisions(
         proposal_id, decision, job_id, decided_by, decided_origin, action_digest, created_at
@@ -506,6 +509,8 @@ export class Dispatcher {
       if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
+      // Checked inside the claim transaction, so a ceiling cannot be raced by two starts.
+      this.assertWithinBudget(jobId, current.maximum_cost);
       const ordinal = previousAttempts + 1;
       const attemptId = `${job.id}.${ordinal}`;
       const worktreePath = path.join(this.paths.worktrees, project.id, `attempt-${ordinal}-${job.id.slice(-8)}`);
@@ -780,6 +785,59 @@ export class Dispatcher {
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
+  }
+
+  // --- Budget -----------------------------------------------------------------------------------
+  //
+  // A cost ceiling that is recorded but never checked is not a ceiling. Spend is summed from the
+  // usage receipts, which means it inherits their honesty: an UNKNOWN receipt has no cost, and
+  // treating that as zero would let unmeasured work slip under a budget indefinitely.
+
+  // Total reference cost already spent on a job, plus what could not be priced.
+  //
+  // `unpriced` is not a rounding detail. Attempts whose usage is UNKNOWN or unpriceable consumed
+  // real tokens that this figure cannot account for, so a caller comparing `spent` against a ceiling
+  // must know the comparison is incomplete.
+  jobSpend(jobId) {
+    const rows = this.db.prepare(`SELECT r.status, r.reference_cost_usd
+      FROM attempt_usage_receipts r JOIN attempts a ON a.id = r.attempt_id
+      WHERE a.job_id = ?`).all(jobId);
+    const attempts = this.db.prepare(`SELECT COUNT(*) AS count FROM attempts a
+      JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'
+      WHERE a.job_id = ?`).get(jobId).count;
+
+    let spent = 0;
+    let priced = 0;
+    for (const row of rows) {
+      if (row.status !== "UNKNOWN" && row.reference_cost_usd !== null) {
+        spent += row.reference_cost_usd;
+        priced += 1;
+      }
+    }
+    // Every attempt that ran but produced no priceable receipt is unaccounted spend.
+    const unpriced = Math.max(0, attempts - priced);
+    return { spent, priced_attempts: priced, unpriced_attempts: unpriced, complete: unpriced === 0 };
+  }
+
+  // Refuses to start work that a recorded ceiling cannot cover.
+  //
+  // Unaccounted spend blocks rather than passes: if an earlier attempt's cost is unknown, the honest
+  // answer is that the budget cannot be shown to be intact, not that it is.
+  assertWithinBudget(jobId, ceiling) {
+    if (ceiling === null || ceiling === undefined) return null;
+    const spend = this.jobSpend(jobId);
+    if (!spend.complete) {
+      throw new Error(
+        `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
+        + `the ${ceiling} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
+      );
+    }
+    if (spend.spent >= ceiling) {
+      throw new Error(
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling; refusing to start more work`,
+      );
+    }
+    return spend;
   }
 
   // --- Cancellation -----------------------------------------------------------------------------
