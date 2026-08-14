@@ -7,7 +7,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
-  "work.propose", "work.proposal.authorize", "work.proposal.reject",
+  "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
 ]);
 
 function canonical(value) {
@@ -153,6 +153,12 @@ export class ControlService {
       "project.create": () => this.dispatcher.addProject(args),
       "job.create": () => this.dispatcher.createJob(args),
       "job.run": () => this.dispatcher.runJob(args.jobId, { model: args.model || null }),
+      "job.cancel": () => this.dispatcher.cancelJob({
+        jobId: args.jobId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        reason: args.reason || "",
+      }),
       "integration.propose": () => this.dispatcher.proposeIntegration({ jobId: args.jobId }),
       "approval.grant": () => this.dispatcher.grantApproval({
         proposalId: args.proposalId,

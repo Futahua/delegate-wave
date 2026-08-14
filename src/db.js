@@ -8,7 +8,8 @@ import { managedPaths } from "./paths.js";
 // 10: work_proposals and work_proposal_decisions, with their immutability triggers and indexes.
 // 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
 // 12: usage receipts record cost provenance and enforce their value invariants.
-export const SCHEMA_VERSION = "12";
+// 13: durable cancellation intents and results.
+export const SCHEMA_VERSION = "13";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -193,6 +194,45 @@ CREATE TABLE IF NOT EXISTS work_proposal_decisions (
   created_at TEXT NOT NULL
 );
 
+-- A durable cancellation intent. Recorded before anything is killed, so a crash between the request
+-- and its effect leaves evidence that cancellation was asked for rather than losing it.
+--
+-- Cancellation is a request, not an outcome: the job's terminal state still comes from the normal
+-- lifecycle, and a worker that finished before the kill landed is not retroactively unfinished.
+CREATE TABLE IF NOT EXISTS cancellation_intents (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  attempt_id TEXT REFERENCES attempts(id),
+  scheduler_epoch INTEGER NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_origin TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+-- The terminal record of what a cancellation actually achieved. Separate from the intent because the
+-- intent is immutable evidence of the request, while the outcome is discovered afterwards.
+CREATE TABLE IF NOT EXISTS cancellation_results (
+  intent_id TEXT PRIMARY KEY REFERENCES cancellation_intents(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('CANCELLED', 'ALREADY_TERMINAL', 'NOTHING_RUNNING')),
+  killed_pid INTEGER,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_cancel_intents_immutable_update
+BEFORE UPDATE ON cancellation_intents
+BEGIN SELECT RAISE(ABORT, 'cancellation_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_intents_immutable_delete
+BEFORE DELETE ON cancellation_intents
+BEGIN SELECT RAISE(ABORT, 'cancellation_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_results_immutable_update
+BEFORE UPDATE ON cancellation_results
+BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_results_immutable_delete
+BEFORE DELETE ON cancellation_results
+BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
+
 -- One immutable receipt per executor run, describing what was observed of its provider usage.
 -- Deliberately separate from the attempts table: an attempt's lifecycle changes over time, while a
 -- receipt records one observation and never changes. Evidence only; MUST NOT influence acceptance.
@@ -310,6 +350,7 @@ CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operatio
 CREATE INDEX IF NOT EXISTS idx_control_intents_created ON control_request_intents(created_at);
 CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
+CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
 `;
 
 export function initializeDataRoot(root) {

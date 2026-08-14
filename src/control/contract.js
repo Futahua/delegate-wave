@@ -29,6 +29,7 @@ export const ROUTES = Object.freeze([
   { method: "POST", pattern: /^\/v1\/integration\/([^/]+)\/run$/, command: "integration.run", params: ["proposalId"], mutation: true, scope: SCOPES.OPERATE },
   { method: "GET", pattern: /^\/v1\/attention$/, command: "attention", scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/reconcile$/, command: "reconcile", mutation: true, scope: SCOPES.OPERATE },
+  { method: "POST", pattern: /^\/v1\/jobs\/([^/]+)\/cancel$/, command: "job.cancel", params: ["jobId"], mutation: true, scope: SCOPES.OPERATE },
 
   // Proposal-only authority: creating and reading bounded work requests.
   { method: "POST", pattern: /^\/v1\/work\/proposals$/, command: "work.propose", mutation: true, scope: SCOPES.PROPOSE },

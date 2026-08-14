@@ -50,6 +50,7 @@ Commands:
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
   supervisor add-role --role proposer   seal one new credential role into the existing store
+  job cancel --job ID [--reason TEXT] stop a running job; records durable intent and outcome
   proposal list [--project ID]        list Hermes work proposals awaiting a decision
   proposal show --proposal ID
   proposal authorize --proposal ID    authorize one proposal into a job (operator only)
@@ -157,6 +158,11 @@ async function main() {
     print(await client.get("/v1/attention"));
   } else if (resource === "reconcile") {
     print(await client.post("/v1/reconcile", { apply: options.apply === true }, requestId(options)));
+  } else if (resource === "job" && action === "cancel") {
+    print(await client.post(
+      `/v1/jobs/${encodeURIComponent(required(options, "job"))}/cancel`,
+      { reason: options.reason || "" }, requestId(options),
+    ));
   } else if (resource === "proposal" && action === "list") {
     const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";
     print(await client.get(`/v1/work/proposals${query}`));

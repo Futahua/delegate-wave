@@ -553,6 +553,11 @@ export class Dispatcher {
       this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult });
       if (backendError) throw backendError;
 
+      // A cancellation that arrived while the worker ran stops here, at a boundary, rather than
+      // leaving a killed process to be interpreted as an ordinary failure. Usage is already
+      // recorded above, so cancelled work still counts toward cost.
+      if (this.isCancellationRequested(jobId, epoch)) throw new Error("cancelled by operator");
+
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
 
@@ -775,6 +780,113 @@ export class Dispatcher {
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
+  }
+
+  // --- Cancellation -----------------------------------------------------------------------------
+  //
+  // Cancellation is a request against a running attempt, not a state a caller can assert. The intent
+  // is recorded durably first, so a crash between the request and the kill leaves evidence rather
+  // than losing it, and the outcome is discovered afterwards.
+
+  cancellationIntents(jobId) {
+    return this.db.prepare(`SELECT i.*, r.outcome, r.killed_pid, r.detail
+      FROM cancellation_intents i LEFT JOIN cancellation_results r ON r.intent_id = i.id
+      WHERE i.job_id = ? ORDER BY i.created_at`).all(jobId);
+  }
+
+  // True when an unresolved cancellation exists for this attempt's epoch. The running loop checks
+  // this between stages so a cancel lands at a safe boundary rather than mid-write.
+  isCancellationRequested(jobId, epoch) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM cancellation_intents i
+      LEFT JOIN cancellation_results r ON r.intent_id = i.id
+      WHERE i.job_id = ? AND i.scheduler_epoch = ? AND r.intent_id IS NULL`).get(jobId, epoch));
+  }
+
+  async cancelJob({ jobId, principal, origin, reason = "" }) {
+    const job = this.getJob(jobId);
+    if (!job) throw new Error(`Unknown job: ${jobId}`);
+    if (!principal || !origin) throw new Error("Cancelling identity is required");
+
+    const epoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+    const active = this.db.prepare(`SELECT * FROM attempts WHERE job_id = ?
+      AND terminal_state IS NULL ORDER BY ordinal DESC LIMIT 1`).get(jobId);
+
+    // Record the intent before touching any process.
+    const intentId = id("cancel");
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO cancellation_intents(
+        id, job_id, attempt_id, scheduler_epoch, requested_by, requested_origin, reason, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        intentId, jobId, active?.id ?? null, epoch, principal, origin, String(reason).slice(0, 500), now(),
+      );
+      recordEvent(this.db, {
+        kind: "CANCELLATION_REQUESTED", entityType: "job", entityId: jobId, epoch,
+        payload: { intentId, attemptId: active?.id ?? null, requestedBy: principal },
+      });
+    });
+
+    const settle = (outcome, detail, killedPid = null) => transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO cancellation_results(
+        intent_id, outcome, killed_pid, detail, created_at
+      ) VALUES (?, ?, ?, ?, ?)`).run(intentId, outcome, killedPid, detail, now());
+      recordEvent(this.db, {
+        kind: "CANCELLATION_SETTLED", entityType: "job", entityId: jobId, epoch,
+        payload: { intentId, outcome, killedPid },
+      });
+      return { intent_id: intentId, outcome, killed_pid: killedPid, detail };
+    });
+
+    if (!active) {
+      // READY_FOR_INTEGRATION counts as finished work: the attempt succeeded and produced a
+      // candidate, so cancelling must not read as "nothing happened here".
+      const finished = ["SUCCEEDED", "FAILED", "CANCELLED", "READY_FOR_INTEGRATION"].includes(job.status);
+      return settle(finished ? "ALREADY_TERMINAL" : "NOTHING_RUNNING", `job status ${job.status}`);
+    }
+
+    // Kill the executor if one is running. A missing PID is not an error: the attempt may not have
+    // spawned yet, and the loop's boundary check will still stop it.
+    let killedPid = null;
+    if (active.executor_pid) {
+      // Never signal this process or its scheduler. A corrupt or misreported PID must not let a
+      // cancel take down the control plane; the attempt is still marked cancelled below.
+      const forbidden = [process.pid, active.scheduler_pid].filter(Boolean);
+      if (forbidden.includes(active.executor_pid)) {
+        recordEvent(this.db, {
+          kind: "CANCELLATION_KILL_REFUSED", entityType: "attempt", entityId: active.id, epoch,
+          payload: { intentId, pid: active.executor_pid, reason: "pid is the scheduler or this process" },
+        });
+      } else {
+        try {
+          process.kill(active.executor_pid);
+          killedPid = active.executor_pid;
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+    }
+
+    // Mark the attempt cancelled under the same fencing every other transition uses. If the attempt
+    // reached a terminal state first, the cancellation is a no-op against a finished attempt rather
+    // than a retroactive undo.
+    const applied = transaction(this.db, () => {
+      const current = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(active.id);
+      const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+      if (!current || current.scheduler_epoch !== epoch || currentEpoch !== epoch) return false;
+      if (current.terminal_state !== null) return false;
+      this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
+        executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
+        WHERE id = ?`).run(now(), active.id);
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), jobId);
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: active.id, epoch,
+        payload: { intentId, killedPid },
+      });
+      return true;
+    });
+
+    return applied
+      ? settle("CANCELLED", `attempt ${active.id} cancelled`, killedPid)
+      : settle("ALREADY_TERMINAL", `attempt ${active.id} reached a terminal state first`, killedPid);
   }
 
   async failAttempt({ attemptId, jobId, epoch, project, worktreePath, executorIntentId = null, error }) {
