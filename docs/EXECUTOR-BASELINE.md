@@ -27,18 +27,24 @@ baseline-v1 #3             1         SUCCEEDED   PASSED      13.2     opencode-g
 ```
 
 ```text
-jobs                          5
-first-pass validation success 4 / 5
-attempts per validated job    1.2 mean
-executor wall time            10.5 - 13.2 s, mean 11.9 s
-integration success           5 / 5
-rework after integration      0
+jobs                                       5
+attempts                                   6
+executor completion rate                   5 / 6
+first-attempt candidate success            4 / 5 jobs
+validation pass given a candidate          5 / 5
+integration success given validated        5 / 5
+attempts per validated job                 1.2 mean
+executor wall time                         10.5 - 13.2 s, mean 11.9 s
+rework after integration                   0
 ```
 
-The single retry was the pre-routing-fix attempt that selected OpenCode's ambient Google provider and
-failed with `ProviderAuthError`. It is counted because failed attempts cost real time, but it is an
-environment defect that WRK-004 has since made unreachable, not a model failure. Excluding it,
-first-pass validation success is 4/4.
+These are deliberately separate rates rather than one "first-pass success" figure. The single extra
+attempt was the pre-routing-fix run that selected OpenCode's ambient Google provider and died with
+`ProviderAuthError` before any model call, so it is an executor completion failure, not a validation
+failure: it never produced a candidate to validate. Collapsing that into the same number as "the
+model produced a bad candidate that failed its tests" would hide the difference between an
+environment defect and a capability limit, and the A/B needs to tell those apart. WRK-004 has since
+made that particular failure unreachable.
 
 ## Output correctness
 
@@ -69,23 +75,30 @@ was rerun to obtain it.
 Totalled across `step_finish` events per attempt:
 
 ```text
-job                   steps   input  output  reason  cacheRd    cost($)
-hermes #1 TOTALS          4    4665     282      17    20992   0.000398
-hermes #1 attempt 1       0       0       0       0        0   absent
-hermes #2 CONTRIBUTING    4    4576     349      12    21248   0.000401
-baseline #1 SUMMARY       4    4531     324     107    21376   0.000407
-baseline #2 REVENUE       3    4511     242     125    14848   0.000388
-baseline #3 PRICING       4    5217     548     181    22400   0.000499
+job                   steps   input  output  reason  cacheRd      cost($)
+hermes #1 TOTALS          4    4665     282      17    20992  0.000397799
+hermes #1 attempt 1       0       -       -       -        -      absent
+hermes #2 CONTRIBUTING    4    4576     349      12    21248  0.000400607
+baseline #1 SUMMARY       4    4531     324     107    21376  0.000407436
+baseline #2 REVENUE       3    4511     242     125    14848  0.000387937
+baseline #3 PRICING       4    5217     548     181    22400  0.000498610
 
-total                         23500    1745     442   100864   0.002092
+total                         23500    1745     442   100864  0.002092390
 ```
 
 ```text
-validated candidates            5
-provider-reported cost total    $0.002092
-provider-reported cost each     $0.000398 mean
+attempts with a usage receipt   5
+provider-reported cost total    $0.002092390
+provider-reported cost mean     $0.000418478
 cache-read tokens               100,864 (4.3x the uncached input total)
+provider steps per attempt      3 - 4
 ```
+
+Totals are computed from the raw unrounded event values and rounded only for presentation. Summing
+the per-row figures after rounding each to six decimal places yields `$0.002093`, a micro-dollar
+above the rounded raw total, which is why the derived totals must come from raw values rather than
+from the displayed rows. An earlier draft of this document also reported the mean as `$0.000398`,
+which was the first row's cost rather than a mean.
 
 Two cautions on these numbers.
 
