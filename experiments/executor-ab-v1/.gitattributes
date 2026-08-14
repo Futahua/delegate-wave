@@ -1,0 +1,11 @@
+# The whole apparatus is hashed byte-for-byte into DIGEST, so Git must not rewrite any of it.
+#
+# `-text` disables end-of-line normalization, so committed bytes survive checkout unchanged rather
+# than being rewritten to the platform convention. Without this rule the recorded digest would not
+# reproduce on a fresh clone, which would make the preregistered freeze unverifiable by anyone else --
+# and two tasks additionally compare bytes exactly, so they would fail for reasons unrelated to the
+# executor under test.
+#
+# fixture/.gitattributes repeats the rule so it still applies when the runner copies the fixture into
+# a standalone repository for an attempt worktree.
+* -text
