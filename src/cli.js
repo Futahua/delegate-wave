@@ -41,6 +41,10 @@ Commands:
   supervisor stop
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
+  proposal list [--project ID]   list Hermes work proposals awaiting a decision
+  proposal show --id ID
+  proposal authorize --id ID     authorize one proposal into a job (operator only)
+  proposal reject --id ID
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
@@ -131,6 +135,19 @@ async function main() {
     print(await client.get("/v1/attention"));
   } else if (resource === "reconcile") {
     print(await client.post("/v1/reconcile", { apply: options.apply === true }, requestId(options)));
+  } else if (resource === "proposal" && action === "list") {
+    const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";
+    print(await client.get(`/v1/work/proposals${query}`));
+  } else if (resource === "proposal" && action === "show") {
+    print(await client.get(`/v1/work/proposals/${encodeURIComponent(required(options, "id"))}`));
+  } else if (resource === "proposal" && action === "authorize") {
+    print(await client.post(
+      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/authorize`, {}, requestId(options),
+    ));
+  } else if (resource === "proposal" && action === "reject") {
+    print(await client.post(
+      `/v1/work/proposals/${encodeURIComponent(required(options, "id"))}/reject`, {}, requestId(options),
+    ));
   } else if (resource === "project" && action === "add") {
     print(await client.post("/v1/projects", {
       name: required(options, "name"), repoPath: required(options, "path"), branch: options.branch || "HEAD",

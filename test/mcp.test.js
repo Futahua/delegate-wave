@@ -15,8 +15,15 @@ test("Hermes adapter exposes only bounded read tools", async () => {
   const adapter = new HermesMcpAdapter({ client });
   assert.deepEqual(adapter.listTools().map((tool) => tool.name), [
     "get_overview", "list_projects", "get_project_summary", "get_job", "get_attention_needed", "get_integration",
+    "propose_work", "list_work_proposals", "get_work_proposal",
   ]);
-  assert.equal(adapter.listTools().some((tool) => /create|run|approve|grant|reconcile/.test(tool.name)), false);
+  // Hermes may propose bounded work, but exposes no tool that approves, runs, integrates, or
+  // reconciles. propose_work creates a request that a human must authorize before anything runs.
+  assert.equal(adapter.listTools().some((tool) => /approve|authorize|grant|run|integrate|reconcile/.test(tool.name)), false);
+  assert.match(
+    adapter.listTools().find((tool) => tool.name === "propose_work").description,
+    /does NOT start work/,
+  );
   assert.deepEqual(await adapter.callTool("get_project_summary", { project_id: "p1" }), {
     project: { id: "p1" }, recent_jobs: jobs.slice(0, 20), total_jobs: 23, truncated: true,
   });
@@ -93,9 +100,28 @@ test("stdio MCP lifecycle and tool calls use newline-delimited JSON-RPC", async 
   assert.equal(responses.length, 4);
   assert.equal(responses[0].result.protocolVersion, "2025-06-18");
   assert.equal(responses[0].result.capabilities.tools.listChanged, false);
-  assert.equal(responses[1].result.tools.length, 6);
+  assert.equal(responses[1].result.tools.length, 9);
   assert.deepEqual(responses[2].result.structuredContent, { result: [{ id: "project-one" }] });
   assert.equal(responses[3].result.content[0].text, "3 projects; jobs needing attention: 2; jobs awaiting integration: 1.");
   assert.doesNotMatch(responses[3].result.content[0].text, /structured-only-marker/);
   assert.deepEqual(responses[3].result.structuredContent, { result: overview });
+});
+
+test("the Hermes MCP adapter cannot reach any operator-scoped route", async () => {
+  const attempted = [];
+  const client = {
+    get: async (p) => { attempted.push(`GET ${p}`); return p === "/v1/projects" ? [{ id: "p" }] : []; },
+    post: async (p) => { attempted.push(`POST ${p}`); return {}; },
+  };
+  const adapter = new HermesMcpAdapter({ client });
+  for (const tool of adapter.listTools()) {
+    const args = {
+      project_id: "p", job_id: "j", proposal_id: "x", goal: "g", idempotency_key: "k",
+    };
+    await adapter.callTool(tool.name, args);
+  }
+  // The only mutation the adapter can perform is creating a work proposal.
+  const posts = attempted.filter((call) => call.startsWith("POST "));
+  assert.deepEqual(posts, ["POST /v1/work/proposals"]);
+  assert.equal(attempted.some((call) => /approvals|\/run|reconcile|\/authorize|\/reject/.test(call)), false);
 });

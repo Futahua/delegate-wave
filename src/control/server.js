@@ -5,7 +5,7 @@ import { initializeDataRoot } from "../db.js";
 import { dataRoot } from "../paths.js";
 import { Dispatcher } from "../service.js";
 import { OpenCodeBackend } from "../backend.js";
-import { matchRoute } from "./contract.js";
+import { matchRoute, PRINCIPAL_SCOPES, SCOPES } from "./contract.js";
 import { ControlError, asControlError } from "./errors.js";
 import { ControlService } from "./service.js";
 
@@ -45,22 +45,45 @@ function send(res, status, payload) {
 export function createControlServer({
   service, token, principalId, originChannel = "local-cli",
   observerToken = null, observerPrincipalId = "hermes", observerOriginChannel = "hermes-mcp",
+  proposerToken = null, proposerPrincipalId = "hermes-proposer", proposerOriginChannel = "hermes-mcp-proposal",
 }) {
   if (!token) throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required");
   if (!principalId) throw new Error("Control server principal identity is required");
   if (observerToken && observerToken === token) throw new Error("Observer and operator control tokens must be distinct");
+  if (proposerToken && proposerToken === token) throw new Error("Proposer and operator control tokens must be distinct");
+  if (proposerToken && observerToken && proposerToken === observerToken) {
+    throw new Error("Proposer and observer control tokens must be distinct");
+  }
+
+  // Ordered most- to least-privileged. Each credential resolves to a fixed scope set; a request can
+  // never select or widen its own scopes.
+  const credentials = [
+    { token, principalId, originChannel, scopes: PRINCIPAL_SCOPES.operator },
+    observerToken
+      ? { token: observerToken, principalId: observerPrincipalId, originChannel: observerOriginChannel, scopes: PRINCIPAL_SCOPES.observer }
+      : null,
+    proposerToken
+      ? { token: proposerToken, principalId: proposerPrincipalId, originChannel: proposerOriginChannel, scopes: PRINCIPAL_SCOPES.proposer }
+      : null,
+  ].filter(Boolean);
+
   return http.createServer(async (req, res) => {
     try {
-      const identity = tokenMatches(req.headers.authorization, token)
-        ? { principalId, originChannel, readOnly: false }
-        : (observerToken && tokenMatches(req.headers.authorization, observerToken)
-          ? { principalId: observerPrincipalId, originChannel: observerOriginChannel, readOnly: true }
-          : null);
+      const matched = credentials.find((candidate) => tokenMatches(req.headers.authorization, candidate.token));
+      const identity = matched
+        ? { principalId: matched.principalId, originChannel: matched.originChannel, scopes: matched.scopes }
+        : null;
       if (!identity) throw new ControlError("UNAUTHORIZED", "Invalid control token", 401);
       const url = new URL(req.url, "http://localhost");
       const route = matchRoute(req.method, url.pathname);
-      if (identity.readOnly && route.mutation) {
-        throw new ControlError("READ_ONLY_CREDENTIAL", "Observer credential cannot invoke mutations", 403);
+      // Fail closed: a route without a declared scope requires full operator authority.
+      const requiredScope = route.scope || SCOPES.OPERATE;
+      if (!identity.scopes.includes(requiredScope)) {
+        throw new ControlError(
+          "INSUFFICIENT_SCOPE",
+          `Credential lacks the ${requiredScope} scope required by ${route.command}`,
+          403,
+        );
       }
       const body = route.method === "POST" ? await readJson(req) : {};
       const args = { ...body, ...route.params };
@@ -91,12 +114,16 @@ export async function startControlServer({
   principalId = process.env.DELEGATE_WAVE_CONTROL_PRINCIPAL || os.userInfo().username,
   observerToken = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN || null,
   observerPrincipalId = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL || "hermes",
+  proposerToken = process.env.DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN || null,
+  proposerPrincipalId = process.env.DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL || "hermes-proposer",
   backend = new OpenCodeBackend({ attach: process.env.DELEGATE_WAVE_OPENCODE_ATTACH }),
 } = {}) {
   initializeDataRoot(root);
   const dispatcher = new Dispatcher({ root, backend });
   const service = new ControlService({ dispatcher });
-  const server = createControlServer({ service, token, principalId, observerToken, observerPrincipalId });
+  const server = createControlServer({
+    service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
+  });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);

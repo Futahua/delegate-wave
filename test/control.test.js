@@ -13,6 +13,7 @@ import { runProcess } from "../src/process.js";
 import { ControlClient } from "../src/control/client.js";
 import { ControlService } from "../src/control/service.js";
 import { createControlServer, startControlServer } from "../src/control/server.js";
+import { PRINCIPAL_SCOPES, ROUTES, SCOPES } from "../src/control/contract.js";
 
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,12 +46,14 @@ async function fixture(t, overrides = {}, root = null) {
   const dispatcher = fakeDispatcher(dataRoot, overrides);
   const token = `token-${crypto.randomUUID()}`;
   const observerToken = `observer-${crypto.randomUUID()}`;
+  const proposerToken = `proposer-${crypto.randomUUID()}`;
   const service = new ControlService({ dispatcher, pendingWaitMs: 2000 });
   const server = createControlServer({
     service,
     token,
     principalId: "john",
     observerToken,
+    proposerToken,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -66,7 +69,7 @@ async function fixture(t, overrides = {}, root = null) {
   };
   if (t) t.after(close);
   return {
-    root: dataRoot, dispatcher, service, server, token, observerToken, url,
+    root: dataRoot, dispatcher, service, server, token, observerToken, proposerToken, url,
     client: new ControlClient({ baseUrl: url, token }), close,
   };
 }
@@ -310,7 +313,7 @@ test("Hermes observer credential can query but cannot mutate", async (t) => {
   assert.deepEqual(await observer.get("/v1/overview"), overview);
   await assert.rejects(
     observer.post("/v1/jobs", { projectId: "p", goal: "no", mode: "write", maxAttempts: 1 }, requestId()),
-    (error) => error.code === "READ_ONLY_CREDENTIAL",
+    (error) => error.code === "INSUFFICIENT_SCOPE",
   );
   assert.equal(calls, 0);
   assert.equal(f.dispatcher.db.prepare("SELECT COUNT(*) AS count FROM control_request_intents").get().count, 0);
@@ -360,4 +363,97 @@ test("CLI unavailable fails closed and contains no dispatcher storage imports", 
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
+});
+
+// --- Proposal-only authority --------------------------------------------------------------------
+
+// Every operator-scoped route the proposal credential must never reach. Driven off the route table
+// so a newly added mutation cannot quietly become proposer-reachable.
+const OPERATOR_ONLY = ROUTES.filter((route) => (route.scope || SCOPES.OPERATE) === SCOPES.OPERATE);
+
+test("the proposal credential is rejected on every operator-scoped route", async (t) => {
+  const f = await fixture(t);
+  assert.ok(OPERATOR_ONLY.length >= 7, "expected the operator surface to be non-trivial");
+  for (const route of OPERATOR_ONLY) {
+    // Rebuild a concrete path from the route pattern: strip the anchors, substitute a placeholder
+    // for each capture group, and unescape the separators.
+    const pathname = route.pattern.source
+      .replace(/^\^/, "")
+      .replace(/\$$/, "")
+      .replace(/\(\[\^\\?\/\]\+\)/g, "sample")
+      .replaceAll("\\/", "/");
+    assert.ok(
+      pathname.startsWith("/v1/") && !/[[\]()+^$\\]/.test(pathname),
+      `route path did not resolve to a concrete URL: ${pathname}`,
+    );
+    const response = await fetch(`${f.url}${pathname}`, {
+      method: route.method,
+      headers: {
+        authorization: `Bearer ${f.proposerToken}`,
+        "content-type": "application/json",
+        "x-request-id": `req_${crypto.randomUUID()}`,
+      },
+      body: route.method === "POST" ? JSON.stringify({}) : undefined,
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 403, `${route.command} must refuse the proposal credential`);
+    assert.equal(payload.error.code, "INSUFFICIENT_SCOPE", `${route.command} must fail on scope`);
+  }
+});
+
+test("the observer credential cannot create work proposals", async (t) => {
+  const f = await fixture(t);
+  const response = await fetch(`${f.url}/v1/work/proposals`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${f.observerToken}`,
+      "content-type": "application/json",
+      "x-request-id": `req_${crypto.randomUUID()}`,
+    },
+    body: JSON.stringify({ projectId: "p", goal: "g", idempotencyKey: "k" }),
+  });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).error.code, "INSUFFICIENT_SCOPE");
+});
+
+test("a route with no declared scope fails closed to operator authority", () => {
+  for (const route of ROUTES) {
+    assert.ok(route.scope, `${route.command} must declare a scope`);
+  }
+  // The server treats a missing scope as OPERATE; proposer and observer never hold it.
+  assert.equal(PRINCIPAL_SCOPES.proposer.includes(SCOPES.OPERATE), false);
+  assert.equal(PRINCIPAL_SCOPES.observer.includes(SCOPES.OPERATE), false);
+  assert.equal(PRINCIPAL_SCOPES.observer.includes(SCOPES.PROPOSE), false);
+});
+
+test("proposal creation records server-bound origin identity and rejects spoofing", async (t) => {
+  let received;
+  const f = await fixture(t, {
+    proposeWork: (args) => { received = args; return { id: "wprop_1", ...args }; },
+  });
+  const proposer = new ControlClient({ baseUrl: f.url, token: f.proposerToken });
+  await proposer.post("/v1/work/proposals", {
+    projectId: "p", goal: "add a test", idempotencyKey: "k1",
+  }, `req_${crypto.randomUUID()}`);
+  assert.equal(received.principal, "hermes-proposer");
+  assert.equal(received.origin, "hermes-mcp-proposal");
+
+  await assert.rejects(
+    proposer.post("/v1/work/proposals", {
+      projectId: "p", goal: "g", idempotencyKey: "k2", principal: "john",
+    }, `req_${crypto.randomUUID()}`),
+    (error) => error.code === "IDENTITY_SPOOFING",
+  );
+});
+
+test("distinct tokens are required across all three principals", async () => {
+  const dispatcher = fakeDispatcher(fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-distinct-")));
+  const service = new ControlService({ dispatcher });
+  assert.throws(() => createControlServer({
+    service, token: "same", proposerToken: "same", principalId: "john",
+  }), /Proposer and operator control tokens must be distinct/);
+  assert.throws(() => createControlServer({
+    service, token: "op", observerToken: "shared", proposerToken: "shared", principalId: "john",
+  }), /Proposer and observer control tokens must be distinct/);
+  dispatcher.db.close();
 });
