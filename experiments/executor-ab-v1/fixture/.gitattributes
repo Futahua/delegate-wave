@@ -1,0 +1,11 @@
+# This fixture is measurement apparatus, not source. Two tasks compare bytes exactly: t08 asserts
+# trailing whitespace and blank runs, t10 asserts every original line survives unchanged.
+#
+# `-text` disables Git's end-of-line normalization, so the committed bytes survive checkout unchanged
+# rather than being rewritten to the platform convention. Without it, a fresh clone on Windows would
+# fail those two tasks for reasons unrelated to the executor under test, and the failure would be
+# indistinguishable from a model error.
+#
+# This file lives at the fixture root so it travels with the fixture when the runner copies it into a
+# standalone repository for an attempt worktree.
+* -text

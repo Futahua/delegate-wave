@@ -1,0 +1,7 @@
+{
+  "services": [
+    { "name": "api", "port": 8080 },
+    { "name": "worker", "port": 9090 },
+    { "name": "metrics", "port": 8080 }
+  ]
+}
