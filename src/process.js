@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 export function childEnvironment(extra = {}) {
   const environment = { ...process.env };
   delete environment.DELEGATE_WAVE_CONTROL_TOKEN;
+  delete environment.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
+  delete environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
   return { ...environment, ...extra };
 }
 

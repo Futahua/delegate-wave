@@ -23,6 +23,9 @@ server configuration or local operating-system identity, never from CLI argument
 validation commands, Git hooks, or other child processes. A caller MAY explicitly supply a token
 only for a process whose purpose is to act as a Control API client.
 
+**CTL-AUTH-006** A configured observer credential MUST be distinct from the operator credential and
+MUST be rejected on all mutating routes. Its identity is server-bound, not caller-supplied.
+
 ## Explicit command surface
 
 **CTL-CMD-001** The HTTP adapter MUST expose an explicit allowlist of commands. It MUST NOT expose
@@ -95,6 +98,7 @@ exposure, TLS termination, token provisioning, and multi-user authentication are
 | CTL-AUTH-001 | `ControlClient`-only CLI imports and no fallback | unavailable-API/static-import test |
 | CTL-AUTH-002–004 | bearer check and server context | spoofing and bound-identity tests |
 | CTL-AUTH-005 | scrubbed generic child environment | subprocess and full validation/integration tests |
+| CTL-AUTH-006 | observer authentication scope | observer query/mutation and equal-token tests |
 | CTL-CMD-001–003 | route and command allowlists | malformed/unknown/no-dispatch tests |
 | CTL-REQ-001–008 | immutable intent/result tables, split receipt handling, and visible CLI request IDs | duplicate, concurrent, disconnect, conflict, restart, receipt-fault, uncertain-error, and CLI retry tests |
 | CTL-HTTP-001–003 | local HTTP server and bounded parser | HTTP contract tests and full integration flow |

@@ -18,6 +18,7 @@ No npm dependencies are required.
 cd 'D:\Letters\MatTroiSeConMoc\delegate-wave'
 npm link
 $env:DELEGATE_WAVE_CONTROL_TOKEN = '<generate-a-local-secret>'
+$env:DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = '<generate-a-different-read-only-secret>'
 $env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
 delegate-wave serve
 ```
@@ -73,4 +74,4 @@ The server's Control API bearer token is removed from the inherited environment 
 
 Those remain outside the trusted bootstrap rather than being represented as finished.
 
-The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), and [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).
+The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md), and [docs/HERMES-MCP-SPEC.md](docs/HERMES-MCP-SPEC.md). Hermes setup is in [docs/HERMES-MCP.md](docs/HERMES-MCP.md), with real local-SDK evidence in [docs/HERMES-MCP-DOGFOOD.md](docs/HERMES-MCP-DOGFOOD.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).

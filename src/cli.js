@@ -35,6 +35,7 @@ function help() {
 
 Commands:
   serve
+  mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
   project list
@@ -74,6 +75,11 @@ async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   if (!positional[0] || options.help) { help(); return; }
   if (positional[0] === "serve") { await serve(); return; }
+  if (positional[0] === "mcp") {
+    const { runMcpStdio } = await import("./mcp/server.js");
+    runMcpStdio();
+    return;
+  }
   const client = new ControlClient();
   const [resource, action] = positional;
   if (resource === "init" || resource === "doctor") {
