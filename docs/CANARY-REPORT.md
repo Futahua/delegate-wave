@@ -150,3 +150,20 @@ An equivalent Codex CLI trial permitting read-only shell inspection completed in
 The `Array.some` callback defect is now covered by recovery of an actual exited child PID. The executor lifecycle is also symmetric with validation: `executor_intent_id` is durable before backend launch, spawn and result receipts must match it, and intent-without-PID makes reconciliation refuse without epoch movement. The existing scheduler-gap test now exercises this production `runJob` path and isolates the executor-intent fence before releasing the backend.
 
 Reported OpenCode-client model cost is now `$0.0206882672`. Including the two Codex CLI trials at token-rate estimates, total observed model spend is approximately `$0.0341475872`.
+
+## Final executor audit
+
+The pushed executor-symmetry fix at `c775457` received a fresh-clone read-only Luna audit:
+
+```text
+job     job_31fa6267-777a-4edc-96ff-f83c65da4897
+attempt job_31fa6267-777a-4edc-96ff-f83c65da4897.1
+epoch   10
+cost    $0.00056206
+time    43.956 seconds
+tokens  37,864 total; 445 uncached input; 37,176 cache-read; 243 output
+```
+
+The audit returned `NO BLOCKERS`. It verified durable executor intent before backend launch, matching PID/success/failure attribution, both reconciliation refusal checks, the explicit PID callback fix, actual exited-PID recovery, additive migration, and targeted executor-intent tests. It changed no files and ran no shell commands.
+
+Reported OpenCode-client model cost is now `$0.0212503272`. Including the two Codex CLI trials at token-rate estimates, total observed model spend is approximately `$0.0347096472`.
