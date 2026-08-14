@@ -15,10 +15,14 @@ The Control API response contains totals, compact per-project latest-job state, 
 queue. SQLite applies `COUNT`, status predicates, and `LIMIT` before results reach the adapter. The
 final byte fitter is capped at 3 KiB and removes non-actionable project rows before attention evidence.
 
-The installed Hermes SDK discovered the tool and consumed its result successfully. The final live
-response was 2,712 serialized bytes: five project rows, three attention rows, and `truncated: true`.
-MCP text content was only a compact totals sentence; the full object appeared once in
-`structuredContent`.
+The installed Hermes SDK discovered the tool and consumed its result successfully. The economic
+acceptance response was 2,712 serialized bytes: five project rows, three attention rows, and
+`truncated: true`. MCP text content was only a compact totals sentence; the full object appeared once
+in `structuredContent`.
+
+After review, overview health was hardened to derive from authoritative `doctor()` state and gained a
+`missing_repositories` count. The repeated live response was 2,737 bytes. Both measurements are
+historical evidence and both remain below the 3-KiB limit.
 
 ## Economic acceptance
 
