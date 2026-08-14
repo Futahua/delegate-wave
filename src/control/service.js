@@ -8,6 +8,7 @@ const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
+  "backup.create", "integration.rollback",
 ]);
 
 function canonical(value) {
@@ -49,6 +50,7 @@ export class ControlService {
       "job.get": () => this.dispatcher.status(args.jobId),
       "proposal.get": () => this.dispatcher.integrationStatus(args.proposalId),
       "work.proposal.list": () => this.dispatcher.listWorkProposals(args.projectId || null),
+      "backup.list": () => this.dispatcher.listBackups(),
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       attention: () => this.dispatcher.attention(),
@@ -153,6 +155,12 @@ export class ControlService {
       "project.create": () => this.dispatcher.addProject(args),
       "job.create": () => this.dispatcher.createJob(args),
       "job.run": () => this.dispatcher.runJob(args.jobId, { model: args.model || null }),
+      "backup.create": () => this.dispatcher.backup(args.label || "manual"),
+      "integration.rollback": () => this.dispatcher.rollbackIntegration({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+      }),
       "job.cancel": () => this.dispatcher.cancelJob({
         jobId: args.jobId,
         principal: context.principalId,

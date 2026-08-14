@@ -51,6 +51,9 @@ Commands:
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
   supervisor add-role --role proposer   seal one new credential role into the existing store
   job cancel --job ID [--reason TEXT] stop a running job; records durable intent and outcome
+  backup create [--label TEXT]        snapshot the operational database with a checksummed manifest
+  backup list
+  integration rollback --proposal ID  move an integration branch back, compare-and-swap
   proposal list [--project ID]        list Hermes work proposals awaiting a decision
   proposal show --proposal ID
   proposal authorize --proposal ID    authorize one proposal into a job (operator only)
@@ -162,6 +165,14 @@ async function main() {
     print(await client.post(
       `/v1/jobs/${encodeURIComponent(required(options, "job"))}/cancel`,
       { reason: options.reason || "" }, requestId(options),
+    ));
+  } else if (resource === "backup" && action === "create") {
+    print(await client.post("/v1/backups", { label: options.label || "manual" }, requestId(options)));
+  } else if (resource === "backup" && action === "list") {
+    print(await client.get("/v1/backups"));
+  } else if (resource === "integration" && action === "rollback") {
+    print(await client.post(
+      `/v1/proposals/${encodeURIComponent(required(options, "proposal"))}/rollback`, {}, requestId(options),
     ));
   } else if (resource === "proposal" && action === "list") {
     const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";

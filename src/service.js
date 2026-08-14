@@ -19,6 +19,7 @@ import {
 } from "./git.js";
 import { runShell } from "./process.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
+import { createBackup, listBackups, verifyBackup, rollbackIntegration } from "./recovery.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -81,6 +82,7 @@ function compactOverviewText(value) {
 
 export class Dispatcher {
   constructor({ root, backend, updateRef = updateRefCas }) {
+    this.root = root;
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
     this.backend = backend;
@@ -785,6 +787,52 @@ export class Dispatcher {
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
+  }
+
+  // --- Recovery ---------------------------------------------------------------------------------
+
+  backup(label = "manual") {
+    return createBackup({ root: this.root, database: this.db, label });
+  }
+
+  listBackups() {
+    return listBackups(this.root);
+  }
+
+  verifyBackup(backupDirectory) {
+    return verifyBackup(backupDirectory);
+  }
+
+  // Rolls an integration branch back to the state before a recorded integration.
+  //
+  // The target comes from the recorded operation, not from the caller: asking an operator to supply
+  // a SHA under stress is how the wrong commit gets typed. The operation's expected head is what the
+  // branch pointed at before that integration, so that is where it returns to.
+  async rollbackIntegration({ proposalId, principal, origin }) {
+    if (!principal || !origin) throw new Error("Rolling back requires an authorizing identity");
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    const project = this.getProject(proposal.project_id);
+    if (!project) throw new Error(`Unknown project: ${proposal.project_id}`);
+
+    const succeeded = this.db.prepare(`SELECT r.*, o.expected_integration_head, o.integration_branch
+      FROM integration_records r JOIN integration_operations o ON o.id = r.operation_id
+      WHERE r.proposal_id = ? AND r.kind = 'INTEGRATION_SUCCEEDED'
+      ORDER BY r.sequence DESC LIMIT 1`).get(proposalId);
+    if (!succeeded) throw new Error(`Proposal ${proposalId} has no succeeded integration to roll back`);
+
+    const result = await rollbackIntegration({
+      repoPath: project.repo_path,
+      branch: succeeded.integration_branch,
+      toSha: succeeded.expected_integration_head,
+      expectedCurrentSha: succeeded.detail,
+    });
+
+    recordEvent(this.db, {
+      kind: "INTEGRATION_ROLLED_BACK", entityType: "proposal", entityId: proposalId,
+      payload: { ...result, principal, origin },
+    });
+    return result;
   }
 
   // --- Budget -----------------------------------------------------------------------------------

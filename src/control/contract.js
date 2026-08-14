@@ -30,6 +30,10 @@ export const ROUTES = Object.freeze([
   { method: "GET", pattern: /^\/v1\/attention$/, command: "attention", scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/reconcile$/, command: "reconcile", mutation: true, scope: SCOPES.OPERATE },
   { method: "POST", pattern: /^\/v1\/jobs\/([^/]+)\/cancel$/, command: "job.cancel", params: ["jobId"], mutation: true, scope: SCOPES.OPERATE },
+  // Recovery: explicit operator operations so a problem never requires editing SQLite or Git by hand.
+  { method: "POST", pattern: /^\/v1\/backups$/, command: "backup.create", mutation: true, scope: SCOPES.OPERATE },
+  { method: "GET", pattern: /^\/v1\/backups$/, command: "backup.list", scope: SCOPES.READ },
+  { method: "POST", pattern: /^\/v1\/proposals\/([^/]+)\/rollback$/, command: "integration.rollback", params: ["proposalId"], mutation: true, scope: SCOPES.OPERATE },
 
   // Proposal-only authority: creating and reading bounded work requests.
   { method: "POST", pattern: /^\/v1\/work\/proposals$/, command: "work.propose", mutation: true, scope: SCOPES.PROPOSE },
