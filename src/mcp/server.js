@@ -170,7 +170,9 @@ export function runMcpStdio({
       else if (request.method === "tools/call") {
         const value = await adapter.callTool(request.params?.name, request.params?.arguments || {});
         const text = request.params?.name === "get_overview"
-          ? `${value.totals.projects} projects; jobs needing attention: ${value.totals.jobs_needing_attention}; jobs awaiting integration: ${value.totals.jobs_ready_for_integration}.`
+          ? `${value.totals.projects} projects; jobs needing attention: ${value.totals.jobs_needing_attention}; `
+            + `jobs awaiting integration: ${value.totals.jobs_ready_for_integration}; `
+            + `proposals awaiting decision: ${value.totals.proposals_awaiting_decision ?? 0}.`
           : JSON.stringify(value);
         result = {
           content: [{ type: "text", text }],
