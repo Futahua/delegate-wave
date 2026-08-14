@@ -1,0 +1,242 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { initializeDataRoot } from "../src/db.js";
+import { FakeBackend } from "../src/backend.js";
+import { Dispatcher } from "../src/service.js";
+import { runProcess } from "../src/process.js";
+
+async function command(name, args, cwd) {
+  const result = await runProcess(name, args, { cwd });
+  assert.equal(result.exitCode, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+async function fixture(t) {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-integration-"));
+  const root = path.join(temp, "data");
+  const repo = path.join(temp, "repo");
+  fs.mkdirSync(repo);
+  await command("git", ["init", "-b", "main"], repo);
+  await command("git", ["config", "user.name", "Test"], repo);
+  await command("git", ["config", "user.email", "test@example.invalid"], repo);
+  fs.writeFileSync(path.join(repo, "input.txt"), "before\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "initial"], repo);
+  await command("git", ["branch", "integration"], repo);
+  initializeDataRoot(root);
+  const cleanup = async () => {
+    const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+    const worktrees = listed.stdout.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter((worktree) => path.resolve(worktree) !== path.resolve(repo));
+    for (const worktree of worktrees) {
+      await runProcess("git", ["-C", repo, "worktree", "unlock", worktree]);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    }
+    fs.rmSync(temp, { recursive: true, force: true });
+  };
+  return { temp, root, repo, cleanup };
+}
+
+function writeCandidateBackend(content) {
+  return new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "output.txt"), content);
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+}
+
+async function readyProposal(service, projectId, backend, goal = "create output") {
+  const job = await service.createJob({ projectId, goal });
+  const ready = await service.runJob(job.id);
+  assert.equal(ready.job.status, "READY_FOR_INTEGRATION");
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  return { job, proposal };
+}
+
+test("approved integration cherry-picks the candidate and advances the branch", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { job, proposal } = await readyProposal(service, project.id, service.backend);
+  assert.equal(proposal.state, "OPEN");
+  assert.equal(proposal.integration_branch, "integration");
+  assert.equal(proposal.expected_integration_head, proposal.base_sha);
+  assert.equal(proposal.candidate_commit, service.status(job.id).attempts[0].result_commit);
+
+  const repeated = await service.proposeIntegration({ jobId: job.id });
+  assert.equal(repeated.id, proposal.id);
+
+  const approval = service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  assert.equal(approval.granted_digest, proposal.action_digest);
+  const repeatedApproval = service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  assert.equal(repeatedApproval.id, approval.id);
+
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  const result = await service.runIntegration(proposal.id);
+  assert.equal(result.proposal.state, "INTEGRATED");
+  assert.equal(result.operations.length, 1);
+  assert.equal(result.operations[0].state, "SUCCEEDED");
+  const after = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  assert.notEqual(after, before);
+  assert.equal(after, result.operations[0].new_head);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", `${after}^`]), before);
+  assert.equal(service.status(job.id).job.status, "SUCCEEDED");
+  assert.ok(fs.existsSync(path.join(root, "integration", project.id, proposal.id)));
+});
+
+test("re-running a successful integration is idempotent and consumes nothing extra", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const first = await service.runIntegration(proposal.id);
+  const headAfterFirst = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  const second = await service.runIntegration(proposal.id);
+  assert.equal(second.proposal.state, "INTEGRATED");
+  assert.equal(second.operations.length, 1);
+  assert.equal(second.operations[0].state, "SUCCEEDED");
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), headAfterFirst);
+  const receipts = service.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ?").all(proposal.id);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].consumed, 1);
+});
+
+test("integration refuses without an unexpired approval and leaves the branch untouched", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /No unexpired approval/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+  assert.equal(service.getProposal(proposal.id).state, "OPEN");
+  const operations = service.db.prepare("SELECT * FROM integration_operations WHERE proposal_id = ?").all(proposal.id);
+  assert.equal(operations.length, 0);
+});
+
+test("integration refuses an expired approval", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({
+    proposalId: proposal.id, principal: "human-1", origin: "terminal",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  service.db.prepare("UPDATE approval_receipts SET expires_at = ? WHERE proposal_id = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), proposal.id);
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /expired/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+});
+
+test("integration refuses when the expected head changed and recovers once it matches again", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+
+  const tree = await command("git", ["-C", repo, "write-tree"]);
+  const manual = await command("git", ["-C", repo, "commit-tree", tree, "-p", "integration", "-m", "manual advance"]);
+  await command("git", ["-C", repo, "update-ref", "refs/heads/integration", manual]);
+  await assert.rejects(service.runIntegration(proposal.id), /Integration head changed/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), manual);
+
+  await command("git", ["-C", repo, "update-ref", "refs/heads/integration", proposal.expected_integration_head]);
+  const result = await service.runIntegration(proposal.id);
+  assert.equal(result.proposal.state, "INTEGRATED");
+  assert.equal(result.operations[0].state, "SUCCEEDED");
+});
+
+test("integration refuses when the validation plan changed since proposal", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  service.db.prepare("UPDATE projects SET validation_json = ? WHERE id = ?")
+    .run(JSON.stringify(["exit 0"]), project.id);
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /Validation plan changed/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+  assert.equal(service.getProposal(proposal.id).state, "OPEN");
+});
+
+test("failed integration validation records failure without moving the branch, then retries", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const marker = path.join(root, "validation-marker.txt");
+  const checker = path.join(root, "checker.js");
+  fs.writeFileSync(checker, "const fs = require('fs'); if (!fs.existsSync(process.argv[2])) process.exit(1);\n");
+  const quoted = (value) => JSON.stringify(value.replaceAll("\\", "/"));
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({
+    name: "Fixture", repoPath: repo, branch: "integration",
+    validation: [`node ${quoted(checker)} ${quoted(marker)}`],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "gated candidate" });
+  fs.writeFileSync(marker, "present\n");
+  assert.equal((await service.runJob(job.id)).job.status, "READY_FOR_INTEGRATION");
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+
+  fs.rmSync(marker, { force: true });
+  await assert.rejects(service.runIntegration(proposal.id), /integration validation failed/);
+  const after = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  assert.equal(after, before);
+  const failed = service.integrationStatus(proposal.id);
+  assert.equal(failed.proposal.state, "OPEN");
+  assert.equal(failed.operations.length, 1);
+  assert.equal(failed.operations[0].state, "FAILED");
+  assert.equal(service.status(job.id).job.status, "READY_FOR_INTEGRATION");
+
+  fs.writeFileSync(marker, "present\n");
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const retry = await service.runIntegration(proposal.id);
+  assert.equal(retry.proposal.state, "INTEGRATED");
+  assert.equal(retry.operations.length, 2);
+  assert.equal(retry.operations[1].state, "SUCCEEDED");
+  assert.notEqual(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+});
+
+test("integration refuses when the branch is checked out in another worktree", async (t) => {
+  const { temp, root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const other = path.join(temp, "other-checkout");
+  await command("git", ["-C", repo, "worktree", "add", other, "integration"]);
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  await assert.rejects(service.runIntegration(proposal.id), /checked out in another worktree/);
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), before);
+
+  await command("git", ["-C", repo, "worktree", "remove", "--force", other]);
+  const result = await service.runIntegration(proposal.id);
+  assert.equal(result.proposal.state, "INTEGRATED");
+});
+
+test("proposal creation refuses a non-ready or non-write job", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const pending = await service.createJob({ projectId: project.id, goal: "still pending" });
+  await assert.rejects(service.proposeIntegration({ jobId: pending.id }), /expected READY_FOR_INTEGRATION/);
+  const read = await service.createJob({ projectId: project.id, goal: "read only", mode: "read" });
+  await assert.rejects(service.proposeIntegration({ jobId: read.id }), /only write jobs/);
+});

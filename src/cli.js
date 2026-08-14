@@ -42,6 +42,11 @@ Commands:
   job run --job ID [--model provider/model]
   job status --job ID
   job list [--project ID]
+  integration propose --job ID
+  integration run --proposal ID
+  integration show --proposal ID
+  approval grant --proposal ID --principal ID --origin CHANNEL [--expires-at ISO] [--idempotency-key KEY]
+  approval list [--proposal ID]
   doctor
   reconcile [--apply]
 
@@ -93,6 +98,22 @@ async function main() {
       print(dispatcher.status(required(options, "job")));
     } else if (resource === "job" && action === "list") {
       print(dispatcher.listJobs(options.project || null));
+    } else if (resource === "integration" && action === "propose") {
+      print(await dispatcher.proposeIntegration({ jobId: required(options, "job") }));
+    } else if (resource === "integration" && action === "run") {
+      print(await dispatcher.runIntegration(required(options, "proposal")));
+    } else if (resource === "integration" && action === "show") {
+      print(dispatcher.integrationStatus(required(options, "proposal")));
+    } else if (resource === "approval" && action === "grant") {
+      print(dispatcher.grantApproval({
+        proposalId: required(options, "proposal"),
+        principal: required(options, "principal"),
+        origin: required(options, "origin"),
+        expiresAt: options["expires-at"] || null,
+        idempotencyKey: options["idempotency-key"] || null,
+      }));
+    } else if (resource === "approval" && action === "list") {
+      print(dispatcher.listApprovals(options.proposal || null));
     } else {
       throw new Error(`Unknown command: ${positional.join(" ")}`);
     }

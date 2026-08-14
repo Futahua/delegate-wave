@@ -83,9 +83,65 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS integration_proposals (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  base_sha TEXT NOT NULL,
+  candidate_commit TEXT NOT NULL,
+  integration_branch TEXT NOT NULL,
+  expected_integration_head TEXT NOT NULL,
+  validation_plan_digest TEXT NOT NULL,
+  action_digest TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'OPEN' CHECK (state IN ('OPEN', 'INTEGRATED', 'CANCELLED')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(attempt_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_receipts (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
+  principal TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  expires_at TEXT,
+  idempotency_key TEXT UNIQUE,
+  granted_digest TEXT NOT NULL,
+  granted_at TEXT NOT NULL,
+  consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
+  consumed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS integration_operations (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
+  approval_receipt_id TEXT NOT NULL REFERENCES approval_receipts(id),
+  state TEXT NOT NULL CHECK (state IN ('INTENDED', 'SUCCEEDED', 'FAILED')),
+  worktree_path TEXT,
+  expected_integration_head TEXT NOT NULL,
+  new_head TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS integration_records (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id TEXT NOT NULL REFERENCES integration_operations(id),
+  proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
+  kind TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_job ON attempts(job_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_type, entity_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_proposals_job ON integration_proposals(job_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_state ON integration_proposals(state);
+CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id, consumed);
+CREATE INDEX IF NOT EXISTS idx_ops_proposal ON integration_operations(proposal_id, state);
+CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operation_id, sequence);
 `;
 
 export function initializeDataRoot(root) {
@@ -118,7 +174,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '5')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '6')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -144,7 +200,7 @@ function migrate(db) {
   if (!attemptColumns.includes("executor_intent_id")) {
     db.exec("ALTER TABLE attempts ADD COLUMN executor_intent_id TEXT");
   }
-  db.prepare("UPDATE metadata SET value = '5' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE metadata SET value = '6' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

@@ -6,11 +6,16 @@ import { managedPaths } from "./paths.js";
 import {
   assertRepository,
   changedFiles,
+  cherryPick,
   commitAll,
   createDetachedWorktree,
   git,
+  isAncestor,
+  listWorktrees,
   lockWorktree,
+  removeWorktree,
   resolveRevision,
+  updateRefCas,
 } from "./git.js";
 import { runShell } from "./process.js";
 
@@ -297,6 +302,258 @@ export class Dispatcher {
     const validations = this.db.prepare(`SELECT v.* FROM validation_runs v
       JOIN attempts a ON a.id = v.attempt_id WHERE a.job_id = ? ORDER BY v.started_at`).all(jobId);
     return { job, attempts, validations };
+  }
+
+  validationPlanDigest(project) {
+    const commands = parseJson(project.validation_json);
+    const canonical = [...commands].sort().join("\n");
+    return crypto.createHash("sha256").update(canonical).digest("hex");
+  }
+
+  actionDigest(fields) {
+    const canonical = [
+      fields.projectId, fields.jobId, fields.attemptId, fields.baseSha,
+      fields.candidateCommit, fields.integrationBranch, fields.expectedHead, fields.planDigest,
+    ].join("\n");
+    return crypto.createHash("sha256").update(canonical).digest("hex");
+  }
+
+  getProposal(proposalId) {
+    return this.db.prepare("SELECT * FROM integration_proposals WHERE id = ?").get(proposalId);
+  }
+
+  listProposals(jobId = null) {
+    if (jobId) return this.db.prepare("SELECT * FROM integration_proposals WHERE job_id = ? ORDER BY created_at DESC").all(jobId);
+    return this.db.prepare("SELECT * FROM integration_proposals ORDER BY created_at DESC").all();
+  }
+
+  listApprovals(proposalId = null) {
+    if (proposalId) return this.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at").all(proposalId);
+    return this.db.prepare("SELECT * FROM approval_receipts ORDER BY granted_at").all();
+  }
+
+  async proposeIntegration({ jobId }) {
+    const job = this.getJob(jobId);
+    if (!job) throw new Error(`Unknown job: ${jobId}`);
+    if (job.mode !== "write") throw new Error(`Job ${jobId} is a ${job.mode} job; only write jobs can be proposed`);
+    if (job.status !== "READY_FOR_INTEGRATION") {
+      throw new Error(`Job ${jobId} is ${job.status}, expected READY_FOR_INTEGRATION`);
+    }
+    const candidates = this.db.prepare(
+      "SELECT * FROM attempts WHERE job_id = ? AND terminal_state = 'SUCCEEDED' AND validation_state = 'PASSED' ORDER BY ordinal",
+    ).all(jobId);
+    if (candidates.length !== 1) {
+      throw new Error(`Job ${jobId} must have exactly one SUCCEEDED/PASSED candidate attempt, found ${candidates.length}`);
+    }
+    const candidate = candidates[0];
+    if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
+    const project = this.getProject(job.project_id);
+    const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);
+    const planDigest = this.validationPlanDigest(project);
+    const digest = this.actionDigest({
+      projectId: project.id, jobId, attemptId: candidate.id,
+      baseSha: job.base_sha, candidateCommit: candidate.result_commit,
+      integrationBranch: project.integration_branch, expectedHead, planDigest,
+    });
+    const existing = this.db.prepare("SELECT * FROM integration_proposals WHERE attempt_id = ?").get(candidate.id);
+    if (existing) {
+      if (existing.action_digest !== digest) {
+        throw new Error(`Existing proposal ${existing.id} has a different action digest for attempt ${candidate.id}`);
+      }
+      return this.getProposal(existing.id);
+    }
+    const proposalId = id("proposal");
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO integration_proposals(
+      id, project_id, job_id, attempt_id, base_sha, candidate_commit, integration_branch,
+      expected_integration_head, validation_plan_digest, action_digest, state, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
+      proposalId, project.id, jobId, candidate.id, job.base_sha, candidate.result_commit,
+      project.integration_branch, expectedHead, planDigest, digest, timestamp, timestamp,
+    );
+    recordEvent(this.db, {
+      kind: "INTEGRATION_PROPOSED", entityType: "proposal", entityId: proposalId,
+      payload: { jobId, attemptId: candidate.id, digest },
+    });
+    return this.getProposal(proposalId);
+  }
+
+  grantApproval({ proposalId, principal, origin, expiresAt = null, idempotencyKey = null }) {
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    if (proposal.state !== "OPEN") throw new Error(`Proposal ${proposalId} is ${proposal.state}`);
+    if (!principal || !principal.trim()) throw new Error("principal is required");
+    if (!origin || !origin.trim()) throw new Error("origin is required");
+    if (expiresAt) {
+      const parsed = new Date(expiresAt);
+      if (Number.isNaN(parsed.getTime())) throw new Error(`Invalid --expires-at: ${expiresAt}`);
+      if (parsed.getTime() <= Date.now()) throw new Error(`Approval already expired at ${parsed.toISOString()}`);
+      expiresAt = parsed.toISOString();
+    }
+    if (idempotencyKey) {
+      const keyed = this.db.prepare("SELECT * FROM approval_receipts WHERE idempotency_key = ?").get(idempotencyKey);
+      if (keyed) {
+        if (keyed.proposal_id !== proposalId || keyed.granted_digest !== proposal.action_digest) {
+          throw new Error(`Idempotency key ${idempotencyKey} was already used for a different approval`);
+        }
+        return keyed;
+      }
+    }
+    const existing = this.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ? AND principal = ?").get(proposalId, principal);
+    if (existing) {
+      if (existing.granted_digest !== proposal.action_digest) {
+        throw new Error(`Existing approval ${existing.id} grants a different digest`);
+      }
+      if (existing.consumed === 0) return existing;
+    }
+    const receiptId = id("approval");
+    this.db.prepare(`INSERT INTO approval_receipts(
+      id, proposal_id, principal, origin, expires_at, idempotency_key, granted_digest, granted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      receiptId, proposalId, principal, origin, expiresAt, idempotencyKey, proposal.action_digest, now(),
+    );
+    recordEvent(this.db, {
+      kind: "APPROVAL_GRANTED", entityType: "approval", entityId: receiptId,
+      payload: { proposalId, principal, origin, digest: proposal.action_digest },
+    });
+    return this.db.prepare("SELECT * FROM approval_receipts WHERE id = ?").get(receiptId);
+  }
+
+  recordIntegrationRecord(operationId, proposalId, kind, detail = "") {
+    this.db.prepare(`INSERT INTO integration_records(operation_id, proposal_id, kind, detail, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run(
+      operationId, proposalId, kind, typeof detail === "string" ? detail : JSON.stringify(detail), now(),
+    );
+  }
+
+  async runIntegrationValidation(project, worktreePath, operationId, proposalId) {
+    const commands = parseJson(project.validation_json);
+    for (const command of commands) {
+      const result = await runShell(command, { cwd: worktreePath, timeoutMs: 15 * 60_000 });
+      this.recordIntegrationRecord(operationId, proposalId, "VALIDATION_RUN", `${command} => ${result.exitCode}`);
+      if (result.exitCode !== 0) throw new Error(`integration validation failed (${result.exitCode}): ${command}`);
+    }
+    this.recordIntegrationRecord(operationId, proposalId, "VALIDATION_PASSED", String(commands.length));
+  }
+
+  async runIntegration(proposalId) {
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    const project = this.getProject(proposal.project_id);
+    if (!project) throw new Error(`Unknown project: ${proposal.project_id}`);
+
+    const succeeded = this.db.prepare(
+      "SELECT * FROM integration_operations WHERE proposal_id = ? AND state = 'SUCCEEDED' ORDER BY created_at DESC LIMIT 1",
+    ).get(proposalId);
+    if (succeeded) {
+      if (proposal.state !== "INTEGRATED") {
+        throw new Error(`Proposal ${proposalId} is ${proposal.state} despite a successful operation`);
+      }
+      return this.integrationStatus(proposalId);
+    }
+    if (proposal.state !== "OPEN") throw new Error(`Proposal ${proposalId} is ${proposal.state}`);
+    const intended = this.db.prepare(
+      "SELECT * FROM integration_operations WHERE proposal_id = ? AND state = 'INTENDED' LIMIT 1",
+    ).get(proposalId);
+    if (intended) throw new Error(`Integration already in progress for proposal ${proposalId} (operation ${intended.id})`);
+
+    const planDigest = this.validationPlanDigest(project);
+    if (planDigest !== proposal.validation_plan_digest) {
+      throw new Error(`Validation plan changed since proposal ${proposalId}`);
+    }
+    const branchRef = `refs/heads/${proposal.integration_branch}`;
+    const checkedOut = (await listWorktrees(project.repo_path)).some((entry) => entry.branch === branchRef);
+    if (checkedOut) {
+      throw new Error(`Integration branch ${proposal.integration_branch} is checked out in another worktree`);
+    }
+    const currentHead = await resolveRevision(project.repo_path, proposal.integration_branch);
+    if (currentHead !== proposal.expected_integration_head) {
+      throw new Error(`Integration head changed: expected ${proposal.expected_integration_head}, found ${currentHead}`);
+    }
+    if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
+      throw new Error(`Candidate ${proposal.candidate_commit} does not descend from base ${proposal.base_sha}`);
+    }
+
+    const claim = transaction(this.db, () => {
+      const current = this.getProposal(proposalId);
+      if (!current || current.state !== "OPEN") throw new Error(`Proposal ${proposalId} is no longer open`);
+      if (current.action_digest !== proposal.action_digest) {
+        throw new Error(`Proposal ${proposalId} action digest mismatch`);
+      }
+      const receipt = this.db.prepare(
+        "SELECT * FROM approval_receipts WHERE proposal_id = ? AND consumed = 0 ORDER BY granted_at LIMIT 1",
+      ).get(proposalId);
+      if (!receipt) throw new Error(`No unexpired approval for proposal ${proposalId}`);
+      if (receipt.granted_digest !== current.action_digest) {
+        throw new Error(`Approval ${receipt.id} grants a digest different from proposal ${proposalId}`);
+      }
+      if (receipt.expires_at && new Date(receipt.expires_at).getTime() <= Date.now()) {
+        throw new Error(`Approval ${receipt.id} expired at ${receipt.expires_at}`);
+      }
+      this.db.prepare("UPDATE approval_receipts SET consumed = 1, consumed_at = ? WHERE id = ?").run(now(), receipt.id);
+      const operationId = id("integration_op");
+      const worktreePath = path.join(this.paths.integration, project.id, proposal.id);
+      this.db.prepare(`INSERT INTO integration_operations(
+        id, proposal_id, approval_receipt_id, state, worktree_path, expected_integration_head, created_at, updated_at
+      ) VALUES (?, ?, ?, 'INTENDED', ?, ?, ?, ?)`).run(
+        operationId, proposalId, receipt.id, worktreePath, current.expected_integration_head, now(), now(),
+      );
+      recordEvent(this.db, {
+        kind: "INTEGRATION_INTENDED", entityType: "operation", entityId: operationId,
+        payload: { proposalId, approvalId: receipt.id },
+      });
+      return { operationId, worktreePath };
+    });
+
+    const { operationId, worktreePath } = claim;
+    try {
+      await removeWorktree(project.repo_path, worktreePath);
+      await createDetachedWorktree(project.repo_path, worktreePath, proposal.expected_integration_head);
+      this.recordIntegrationRecord(operationId, proposalId, "WORKTREE_CREATED", worktreePath);
+      const newHead = await cherryPick(worktreePath, proposal.candidate_commit);
+      this.recordIntegrationRecord(operationId, proposalId, "CANDIDATE_CHERRY_PICKED", newHead);
+      await this.runIntegrationValidation(project, worktreePath, operationId, proposalId);
+      await updateRefCas(project.repo_path, branchRef, newHead, proposal.expected_integration_head);
+      this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCED", newHead);
+      transaction(this.db, () => {
+        const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
+        if (!operation || operation.state !== "INTENDED") {
+          throw new Error(`Operation ${operationId} state mismatch`);
+        }
+        this.db.prepare(
+          "UPDATE integration_operations SET state = 'SUCCEEDED', new_head = ?, updated_at = ? WHERE id = ?",
+        ).run(newHead, now(), operationId);
+        this.db.prepare(
+          "UPDATE integration_proposals SET state = 'INTEGRATED', updated_at = ? WHERE id = ? AND state = 'OPEN'",
+        ).run(now(), proposalId);
+        this.db.prepare(
+          "UPDATE jobs SET status = 'SUCCEEDED', updated_at = ? WHERE id = ? AND status = 'READY_FOR_INTEGRATION'",
+        ).run(now(), proposal.job_id);
+        recordEvent(this.db, { kind: "INTEGRATION_SUCCEEDED", entityType: "operation", entityId: operationId, payload: { newHead } });
+        return true;
+      });
+      return this.integrationStatus(proposalId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      transaction(this.db, () => {
+        const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
+        if (operation && operation.state === "INTENDED") {
+          this.db.prepare("UPDATE integration_operations SET state = 'FAILED', updated_at = ? WHERE id = ?").run(now(), operationId);
+          this.recordIntegrationRecord(operationId, proposalId, "INTEGRATION_FAILED", message);
+          recordEvent(this.db, { kind: "INTEGRATION_FAILED", entityType: "operation", entityId: operationId, payload: { message } });
+        }
+      });
+      throw error;
+    }
+  }
+
+  integrationStatus(proposalId) {
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    const approvals = this.db.prepare("SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at").all(proposalId);
+    const operations = this.db.prepare("SELECT * FROM integration_operations WHERE proposal_id = ? ORDER BY created_at").all(proposalId);
+    const records = this.db.prepare("SELECT * FROM integration_records WHERE proposal_id = ? ORDER BY sequence").all(proposalId);
+    return { proposal, approvals, operations, records };
   }
 
   doctor() {

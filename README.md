@@ -2,7 +2,7 @@
 
 `delegate-wave` is a small deterministic dispatcher for bounded coding jobs. SQLite owns operational state, Git owns candidate code, and OpenCode sessions are disposable executors.
 
-This bootstrap release deliberately **does not integrate candidate commits automatically**. A successful write job stops at `READY_FOR_INTEGRATION` so a human or Codex can inspect it first.
+A successful write job stops at `READY_FOR_INTEGRATION` so a human or Codex can inspect it first. The approved-integration slice then lets an operator propose the candidate, grant an exact-digest approval, and run an integration that cherry-picks the candidate onto the integration branch in a disposable worktree. Integration is never automatic: a human must grant the approval.
 
 ## Requirements
 
@@ -30,6 +30,11 @@ delegate-wave project list
 delegate-wave job create --project <project-id> --goal 'Fix the export bug'
 delegate-wave job run --job <job-id> --model <provider/model>
 delegate-wave job status --job <job-id>
+
+delegate-wave integration propose --job <job-id>
+delegate-wave approval grant --proposal <proposal-id> --principal <id> --origin <channel>
+delegate-wave integration run --proposal <proposal-id>
+
 delegate-wave doctor
 delegate-wave reconcile          # preview only
 delegate-wave reconcile --apply  # fence and orphan dead executors
