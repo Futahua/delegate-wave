@@ -1,11 +1,11 @@
 import {
-  read, baseline, loadModule, expectOnlyChanged, expectMatchesReference, seededNumbers, fail, pass,
+  read, baseline, loadModule, expectTaskChanges, expectMatchesReference, seededNumbers, fail, pass,
 } from "./_harness.js";
 
 // A semantic task with a structural constraint. The append-only requirement is enforced exactly;
 // median's general behaviour is checked against a deterministic reference, because a function that
 // hardcodes three sampled cases would otherwise pass while being wrong everywhere else.
-expectOnlyChanged(["src/lib.js"]);
+expectTaskChanges("t05-add-function");
 
 const source = read("src/lib.js");
 const original = baseline("src/lib.js");
@@ -35,6 +35,12 @@ for (let length = 1; length <= 24; length += 1) {
 }
 for (const length of [2, 3, 6, 9, 15, 32, 64, 101]) {
   domain.push(seededNumbers(20260815 + length, length));
+}
+// The task says "numbers", not integers, so the domain includes fractional values and the halving
+// that even-length input requires.
+domain.push([0.5], [1.5, 2.5], [0.1, 0.2, 0.3], [-1.5, 2.25], [1.25, 1.75, 2.5, 3.5]);
+for (const length of [4, 7, 12]) {
+  domain.push(seededNumbers(20260815 + length, length).map((value) => value / 4));
 }
 
 expectMatchesReference("median", (numbers) => lib.median(numbers), reference, domain);

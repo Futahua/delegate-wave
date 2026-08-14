@@ -1,6 +1,6 @@
-import { csvRows, expectExact, expectOnlyChanged, pass } from "./_harness.js";
+import { csvRows, expectExact, expectTaskChanges, pass } from "./_harness.js";
 
-expectOnlyChanged(["TOTALS.md"]);
+expectTaskChanges("t01-csv-totals");
 
 // The task says the file contains the rows and nothing else except a final total, so the complete
 // output is derived from the frozen source and compared exactly. A line-by-line helper that strips

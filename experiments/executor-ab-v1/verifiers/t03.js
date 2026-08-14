@@ -1,6 +1,6 @@
-import { baseline, requireFile, expectOnlyChanged, fail, pass } from "./_harness.js";
+import { baseline, requireFile, expectTaskChanges, fail, pass } from "./_harness.js";
 
-expectOnlyChanged(["config.summary.json"]);
+expectTaskChanges("t03-json-reshape");
 
 // Derived from the frozen config rather than hardcoded, and compared as an exact object shape:
 // permitting extra keys would accept a summary carrying material the task never asked for.

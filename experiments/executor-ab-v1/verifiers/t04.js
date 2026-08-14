@@ -1,12 +1,12 @@
 import {
-  read, baseline, loadModule, expectOnlyChanged, expectMatchesReference, seededNumbers, fail, pass,
+  read, baseline, loadModule, expectTaskChanges, expectMatchesReference, seededNumbers, fail, pass,
 } from "./_harness.js";
 
 // A semantic task: the goal states correctness for non-empty arrays generally, which two examples
 // cannot establish -- `items.length === 1 ? 0 : 2` would satisfy them and be wrong everywhere else.
 // Behaviour is therefore checked against a deterministic reference over a broad fixed domain, while
 // the unauthorized bytes are protected structurally.
-expectOnlyChanged(["src/lib.js"]);
+expectTaskChanges("t04-bugfix-off-by-one");
 
 // Everything except lastIndex's body must be byte-identical to the frozen source.
 const source = read("src/lib.js");

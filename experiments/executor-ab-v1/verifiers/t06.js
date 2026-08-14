@@ -1,6 +1,6 @@
-import { expectTransformed, expectOnlyChanged, loadModule, fail, pass } from "./_harness.js";
+import { expectTransformed, expectTaskChanges, loadModule, fail, pass } from "./_harness.js";
 
-expectOnlyChanged(["src/lib.js", "src/report.js"]);
+expectTaskChanges("t06-rename-consistent");
 
 // A rename is an exact transformation: every occurrence of the identifier changes and nothing else
 // does. Comparing behaviour alone would accept a worker that also "helpfully" fixed the lastIndex

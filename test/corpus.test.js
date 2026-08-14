@@ -409,3 +409,31 @@ test("a standalone fixture repository preserves bytes and hides the verifiers", 
     { cwd: clone, timeoutMs: 60_000 });
   assert.equal(t10.exitCode, 0, `t10 failed on a cloned worktree: ${t10.stderr}`);
 });
+
+test("every verifier consumes its declared boundary rather than restating it", () => {
+  // A second copy of the same policy is the class of bug that lets a declaration and its enforcement
+  // drift apart silently, so the duplication is prevented structurally rather than kept in sync.
+  for (const task of corpus.tasks) {
+    const source = fs.readFileSync(path.join(verifierRoot, task.verifier), "utf8");
+    assert.ok(source.includes(`expectTaskChanges("${task.id}")`),
+      `${task.verifier} must enforce its declared boundary by task id`);
+    assert.doesNotMatch(source, /expectOnlyChanged\(\[/,
+      `${task.verifier} restates an allowed-change list instead of consuming the declaration`);
+    assert.ok(Array.isArray(task.allowed_changes) && task.allowed_changes.length,
+      `${task.id} declares no allowed_changes`);
+    assert.ok(["deterministic-artifact", "structural-source-edit", "semantic-behaviour"]
+      .includes(task.verification_kind), `${task.id} has no recognised verification_kind`);
+  }
+});
+
+test("the protocol describes the verification model the apparatus actually uses", () => {
+  // PROTOCOL.md is inside DIGEST, so freezing a protocol that misdescribes the instrument would
+  // preregister the wrong experiment.
+  const protocol = fs.readFileSync(path.join(corpusRoot, "PROTOCOL.md"), "utf8");
+  for (const kind of new Set(corpus.tasks.map((task) => task.verification_kind))) {
+    assert.ok(protocol.includes(kind), `PROTOCOL.md does not describe the ${kind} class`);
+  }
+  assert.match(protocol, /allowed_changes/, "PROTOCOL.md does not state the allowed-change rule");
+  assert.match(protocol, /hidden deterministic reference/,
+    "PROTOCOL.md does not describe how semantic behaviour is judged");
+});

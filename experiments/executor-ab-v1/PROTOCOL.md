@@ -22,11 +22,32 @@ edit to a fixture or verifier invisible, which defeats preregistration. The merg
 is recorded alongside results, so Git provides an independent second identity for the frozen
 apparatus.
 
-Where a task has a deterministic output, its verifier derives the complete expected result from the
-frozen fixture and compares it exactly; where a task edits source, the verifier compares against the
-explicitly permitted transformation of the frozen source. Sampling a few properties leaves room for
-an answer that satisfies every check while violating the task statement, and adding counterexamples
-one at a time never closes that gap.
+Each task declares a `verification_kind`, and the instrument matches the claim:
+
+```text
+deterministic-artifact   derive the complete expected result from the frozen inputs and compare
+                         exactly (t01, t02, t03, t07, t08, t09)
+structural-source-edit   compare against the exact permitted transformation of the frozen source
+                         (t06, t10)
+semantic-behaviour       preserve unauthorized bytes structurally, then check behaviour against a
+                         hidden deterministic reference over a broad declared domain (t04, t05)
+```
+
+The third class exists because open-ended behaviour cannot be established by examples: an
+implementation that hardcodes the sampled cases would pass while being wrong everywhere else, and an
+exact source comparison cannot express "correct for all non-empty arrays". A finite oracle does not
+prove an arbitrary implementation either, but a broad fixed domain with a recorded seed is a sound
+instrument and is materially stronger than sample-case validation.
+
+Separately, every task declares `allowed_changes`, and every verifier enforces it by comparing the
+whole candidate tree against the frozen fixture, rejecting any added, deleted, or modified path
+outside that set. Judging only the requested artifact would accept a candidate that produced the
+right answer while damaging something else. Expectations are always derived from the frozen fixture,
+never from candidate inputs: reading a candidate input would let a worker rewrite the problem and
+have the verifier validate its own altered version.
+
+Verifiers consume the declaration in `tasks.json` rather than restating it, so the declared boundary
+and the enforced boundary cannot drift apart.
 
 Every verifier is proven bidirectional in `test/corpus.test.js`: it accepts a correct solution and
 rejects plausible wrong answers. A verifier that passes whatever it is given makes

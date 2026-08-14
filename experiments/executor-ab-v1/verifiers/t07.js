@@ -1,6 +1,6 @@
-import { requireFile, expectOnlyChanged, fail, pass } from "./_harness.js";
+import { requireFile, expectTaskChanges, fail, pass } from "./_harness.js";
 
-expectOnlyChanged(["API.md"]);
+expectTaskChanges("t07-doc-from-code");
 
 // Every field the task requests is graded. An earlier version asked for a free-prose description
 // after the category and never checked it, so `Returns: number` satisfied a format the task said

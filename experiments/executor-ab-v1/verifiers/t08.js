@@ -1,6 +1,6 @@
-import { baseline, expectExact, expectOnlyChanged, pass } from "./_harness.js";
+import { baseline, expectExact, expectTaskChanges, pass } from "./_harness.js";
 
-expectOnlyChanged(["notes.clean.md"]);
+expectTaskChanges("t08-text-transform");
 
 // The transformation is deterministic, so the whole output is derived from the frozen source and
 // compared exactly. Checking only that "there are not too many blank lines" would accept an answer

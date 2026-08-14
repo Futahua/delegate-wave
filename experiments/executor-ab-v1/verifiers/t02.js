@@ -1,6 +1,6 @@
-import { csvRows, expectExact, expectOnlyChanged, pass } from "./_harness.js";
+import { csvRows, expectExact, expectTaskChanges, pass } from "./_harness.js";
 
-expectOnlyChanged(["CHEAP.md"]);
+expectTaskChanges("t02-filter-select");
 
 // Derived from the FROZEN catalog, not the candidate's. Reading the candidate would let a worker
 // rewrite catalog.csv and then produce a matching answer, so the verifier would validate the

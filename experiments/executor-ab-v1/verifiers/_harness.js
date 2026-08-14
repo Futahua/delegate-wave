@@ -129,12 +129,27 @@ function walk(root, base = root, found = []) {
   return found;
 }
 
-// Enforces the task's allowed-change boundary over the whole candidate tree.
+// The frozen task declarations, read from the apparatus rather than restated in each verifier.
+const TASKS = JSON.parse(fs.readFileSync(path.join(FIXTURE_ROOT, "..", "tasks.json"), "utf8"));
+
+// Enforces a task's declared allowed-change boundary, consuming the single authoritative source.
+//
+// Restating the list in each verifier would be a second copy of the same policy, which is the class
+// of bug that lets a declaration and its enforcement drift apart silently.
+export function expectTaskChanges(taskId) {
+  const task = TASKS.tasks.find((entry) => entry.id === taskId);
+  if (!task) fail(`unknown task ${taskId}: the verifier and tasks.json disagree`);
+  if (!Array.isArray(task.allowed_changes) || !task.allowed_changes.length) {
+    fail(`${taskId} declares no allowed_changes`);
+  }
+  expectOnlyChanged(task.allowed_changes);
+}
+
+// Enforces an allowed-change boundary over the whole candidate tree.
 //
 // A verifier that only judges the requested artifact will accept a candidate that produced the right
 // answer while damaging something else. Every added, deleted, or modified path outside the declared
-// set is a violation, and so is leaving the declared deliverable untouched when the task required
-// producing it.
+// set is a violation.
 export function expectOnlyChanged(allowed) {
   const permitted = new Set(allowed);
   const candidateFiles = new Set(walk(process.cwd()));
