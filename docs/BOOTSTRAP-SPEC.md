@@ -66,7 +66,9 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
 
-**VAL-006** A validation MUST record fenced durable intent before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
+**VAL-006** A validation MUST record fenced durable intent on its attempt row before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
+
+**VAL-007** Reconciliation MUST fail closed when validation intent exists without a validator PID receipt because whether the command spawned is uncertain.
 
 ## Recovery
 
@@ -84,6 +86,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as `validation_state = 'FAILED'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to `PENDING` or `NEEDS_ATTENTION` by attempt limit.
 
+**REC-008** Process-liveness probing MUST treat only definite process nonexistence as dead; access denial or an unknown probe failure MUST be treated as alive.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
@@ -98,7 +102,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| VAL-005, VAL-006, REC-001–REC-007 | fenced validation intent/PID receipt, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead, live, genuine blocked-validator, and interrupted validation recovery tests |
+| VAL-005–VAL-007, REC-001–REC-008 | fenced row-level validation intent/PID receipt, fail-closed liveness probe, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead, live, uncertain-start, genuine blocked-validator, and interrupted validation recovery tests |
 
 ## Known bootstrap limitations
 

@@ -43,7 +43,7 @@ The OpenCode worker receives runtime permissions that allow reading and editing 
 
 Attempts are isolated as locked, detached Git worktrees. Failed attempts are marked quarantined in SQLite and retained for inspection. Two failures stop the job at `NEEDS_ATTENTION` by default.
 
-`doctor` checks SQLite integrity, missing repositories, and nonterminal attempts. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch, refuses to orphan an executor whose recorded PID is still alive, and classifies dead attempts without consulting a model.
+`doctor` checks SQLite integrity, missing repositories, and lifecycle-active attempts. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch only after proving that recorded scheduler, executor, and validator processes are dead; an uncertain validator start fails closed for operator attention.
 
 ## Not implemented yet
 

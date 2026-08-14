@@ -213,10 +213,13 @@ export class Dispatcher {
     });
   }
 
-  recordValidationPid(attemptId, epoch, pid) {
-    this.acceptAttemptEvent(attemptId, epoch, () => {
+  recordValidationPid(attemptId, epoch, validationId, pid) {
+    this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
+      if (attempt.validation_intent_id !== validationId) {
+        throw new Error(`Stale validation start rejected for ${attemptId}`);
+      }
       this.db.prepare("UPDATE attempts SET validation_pid = ? WHERE id = ?").run(pid, attemptId);
-      recordEvent(this.db, { kind: "VALIDATION_STARTED", entityType: "attempt", entityId: attemptId, epoch, payload: { pid } });
+      recordEvent(this.db, { kind: "VALIDATION_STARTED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, pid } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
   }
 
@@ -224,22 +227,26 @@ export class Dispatcher {
     const validationId = id("validation");
     const startedAt = now();
     this.acceptAttemptEvent(attemptId, epoch, () => {
+      this.db.prepare("UPDATE attempts SET validation_intent_id = ?, validation_pid = NULL WHERE id = ?").run(validationId, attemptId);
       recordEvent(this.db, { kind: "VALIDATION_INTENDED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, command } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     const result = await runShell(command, {
       cwd: worktreePath,
       timeoutMs: 15 * 60_000,
-      onSpawn: (pid) => this.recordValidationPid(attemptId, epoch, pid),
+      onSpawn: (pid) => this.recordValidationPid(attemptId, epoch, validationId, pid),
     });
     const outputPath = path.join(artifactDir, `${validationId}.log`);
     fs.writeFileSync(outputPath, `${result.stdout}\n${result.stderr}`, { flag: "wx" });
-    this.acceptAttemptEvent(attemptId, epoch, () => {
+    this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
+      if (attempt.validation_intent_id !== validationId) {
+        throw new Error(`Stale validation result rejected for ${attemptId}`);
+      }
       this.db.prepare(`INSERT INTO validation_runs(
         id, attempt_id, command, exit_code, output_path, started_at, finished_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
         validationId, attemptId, command, result.exitCode, outputPath, startedAt, now(),
       );
-      this.db.prepare("UPDATE attempts SET validation_pid = NULL WHERE id = ?").run(attemptId);
+      this.db.prepare("UPDATE attempts SET validation_intent_id = NULL, validation_pid = NULL WHERE id = ?").run(attemptId);
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
@@ -292,6 +299,7 @@ export class Dispatcher {
         scheduler_alive: isProcessAlive(attempt.scheduler_pid),
         executor_alive: isProcessAlive(attempt.executor_pid),
         validation_alive: isProcessAlive(attempt.validation_pid),
+        validation_start_uncertain: Boolean(attempt.validation_intent_id && !attempt.validation_pid),
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
       }));
     const missingRepositories = this.listProjects()
@@ -315,6 +323,7 @@ export class Dispatcher {
       const schedulerAlive = isProcessAlive(attempt.scheduler_pid);
       const executorAlive = isProcessAlive(attempt.executor_pid);
       const validationAlive = isProcessAlive(attempt.validation_pid);
+      const validationStartUncertain = Boolean(attempt.validation_intent_id && !attempt.validation_pid);
       const anyOwnerAlive = schedulerAlive || executorAlive || validationAlive;
       return {
         attempt_id: attempt.id,
@@ -325,14 +334,20 @@ export class Dispatcher {
         executor_alive: executorAlive,
         validation_pid: attempt.validation_pid,
         validation_alive: validationAlive,
+        validation_intent_id: attempt.validation_intent_id,
+        validation_start_uncertain: validationStartUncertain,
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
         proposed: anyOwnerAlive ? "LEAVE_RUNNING"
-          : (phase === "VALIDATION" ? "VALIDATION_INTERRUPTED" : "ORPHAN"),
+          : (validationStartUncertain ? "REFUSE_UNCERTAIN_VALIDATION_START"
+            : (phase === "VALIDATION" ? "VALIDATION_INTERRUPTED" : "ORPHAN")),
       };
     });
     if (!apply || running.length === 0) return { applied: false, observations };
     if (observations.some((item) => item.scheduler_alive || item.executor_alive || item.validation_alive)) {
       return { applied: false, refused: "LIVE_ATTEMPT_PROCESS", observations };
+    }
+    if (observations.some((item) => item.validation_start_uncertain)) {
+      return { applied: false, refused: "UNCERTAIN_VALIDATION_START", observations };
     }
 
     let epoch;
@@ -346,6 +361,11 @@ export class Dispatcher {
         if (candidates.some((attempt) => [attempt.scheduler_pid, attempt.executor_pid, attempt.validation_pid].some(isProcessAlive))) {
           const refusal = new Error("live attempt process appeared during reconciliation");
           refusal.code = "LIVE_ATTEMPT_PROCESS";
+          throw refusal;
+        }
+        if (candidates.some((attempt) => attempt.validation_intent_id && !attempt.validation_pid)) {
+          const refusal = new Error("uncertain validation start appeared during reconciliation");
+          refusal.code = "UNCERTAIN_VALIDATION_START";
           throw refusal;
         }
         const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
@@ -369,6 +389,7 @@ export class Dispatcher {
       }));
     } catch (error) {
       if (error.code === "LIVE_ATTEMPT_PROCESS") return { applied: false, refused: "LIVE_ATTEMPT_PROCESS", observations };
+      if (error.code === "UNCERTAIN_VALIDATION_START") return { applied: false, refused: "UNCERTAIN_VALIDATION_START", observations };
       throw error;
     }
     const applied = [];
@@ -388,12 +409,12 @@ export class Dispatcher {
   }
 }
 
-function isProcessAlive(pid) {
+export function isProcessAlive(pid, probe = (candidate) => process.kill(candidate, 0)) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    process.kill(pid, 0);
+    probe(pid);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return !["ESRCH", "ENOENT"].includes(error?.code);
   }
 }

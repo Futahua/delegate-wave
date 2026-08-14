@@ -97,3 +97,19 @@ The full regression suite now passes 16 tests. Total reported OpenCode Go cost t
 Final remote review identified that production validation processes were not represented by the old `executor_pid`. The schema now records `scheduler_pid`, `executor_pid`, and `validation_pid` separately. Attempt claim durably records the scheduler owner; validation records fenced intent before launch and publishes the real shell PID through a fenced spawn callback; reconciliation refuses epoch movement while any recorded owner is alive.
 
 The blocked-validation regression now waits for a real validation spawn receipt, verifies that PID is live, removes the scheduler receipt to isolate the validator fence, runs applied reconciliation, and proves that reconciliation refuses without moving the epoch. After release, the original attempt reaches `READY_FOR_INTEGRATION`. The suite remains 16 tests because this production-path test replaces the earlier synthetic validation-PID test.
+
+## Validator-fix dogfood audit
+
+The pushed validator-ownership fix at `45279ca` was independently reviewed through `delegate-wave` by a fresh read-only `opencode-go/deepseek-v4-flash` job:
+
+```text
+job     job_e9ffaf2b-e280-47ce-8534-36d2c46de583
+attempt job_e9ffaf2b-e280-47ce-8534-36d2c46de583.1
+session ses_00118c05dffeKO0fnQwqapAIKp
+epoch   7
+cost    $0.0025635652
+```
+
+The audit changed no files and identified two real remaining blockers. Process probing treated every error, including Windows access denial, as proof of death; it now treats only `ESRCH`/`ENOENT` as dead and fails closed for all other probe errors. Validation intent was durable only as an event, leaving a spawn-to-PID receipt ambiguity; it is now persisted on the attempt row before spawn, and reconciliation refuses an intent without a PID receipt instead of advancing the epoch.
+
+Regression coverage now includes fail-closed liveness probes, scheduler ownership before executor publication, the genuine live validator receipt, stale validation with no spawned side effect, and uncertain validation-start recovery. The full suite passes 18 tests. Total reported OpenCode Go cost through this audit is `$0.0180219200`.

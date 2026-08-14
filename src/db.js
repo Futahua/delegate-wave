@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   model TEXT,
   scheduler_pid INTEGER,
   executor_pid INTEGER,
+  validation_intent_id TEXT,
   validation_pid INTEGER,
   worktree_path TEXT,
   worktree_locked INTEGER NOT NULL DEFAULT 0,
@@ -116,7 +117,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '3')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '4')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -136,7 +137,10 @@ function migrate(db) {
   if (!attemptColumns.includes("validation_pid")) {
     db.exec("ALTER TABLE attempts ADD COLUMN validation_pid INTEGER");
   }
-  db.prepare("UPDATE metadata SET value = '3' WHERE key = 'schema_version'").run();
+  if (!attemptColumns.includes("validation_intent_id")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN validation_intent_id TEXT");
+  }
+  db.prepare("UPDATE metadata SET value = '4' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

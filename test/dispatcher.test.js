@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { initializeDataRoot } from "../src/db.js";
 import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
-import { Dispatcher } from "../src/service.js";
+import { Dispatcher, isProcessAlive } from "../src/service.js";
 import { runProcess } from "../src/process.js";
 
 async function command(name, args, cwd) {
@@ -169,6 +169,14 @@ test("reconciliation refuses a live executor without advancing the epoch", async
   const result = await run;
   assert.equal(result.job.status, "READY_FOR_INTEGRATION");
   assert.equal(result.attempts[0].terminal_state, "SUCCEEDED");
+});
+
+test("process liveness fails closed except for definite nonexistence", () => {
+  assert.equal(isProcessAlive(42, () => {}), true);
+  assert.equal(isProcessAlive(42, () => { const error = new Error("denied"); error.code = "EPERM"; throw error; }), true);
+  assert.equal(isProcessAlive(42, () => { const error = new Error("unknown"); error.code = "EIO"; throw error; }), true);
+  assert.equal(isProcessAlive(42, () => { const error = new Error("missing"); error.code = "ESRCH"; throw error; }), false);
+  assert.equal(isProcessAlive(42, () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; }), false);
 });
 
 test("the scheduler PID fences reconciliation before an executor PID is published", async (t) => {
@@ -407,4 +415,27 @@ test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING val
     "SELECT COUNT(*) AS count FROM events WHERE kind = 'VALIDATION_INTERRUPTED' AND entity_id = ?",
   ).get("attempt-interrupted").count;
   assert.equal(interrupted, 1);
+});
+
+test("reconciliation fails closed for durable validation intent without a PID receipt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo });
+  const job = await service.createJob({ projectId: project.id, goal: "uncertain validation start" });
+  service.db.prepare("UPDATE jobs SET status = 'RUNNING' WHERE id = ?").run(job.id);
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, terminal_state, validation_state,
+    backend, validation_intent_id, worktree_path, started_at
+  ) VALUES (?, ?, 1, 1, 'SUCCEEDED', 'PENDING', 'FakeBackend', ?, ?, ?)`).run(
+    "attempt-uncertain-validation", job.id, "validation-intent-only", repo, new Date().toISOString(),
+  );
+  const epochBefore = service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value;
+  const preview = await service.reconcile();
+  assert.equal(preview.observations[0].proposed, "REFUSE_UNCERTAIN_VALIDATION_START");
+  const result = await service.reconcile({ apply: true });
+  assert.equal(result.applied, false);
+  assert.equal(result.refused, "UNCERTAIN_VALIDATION_START");
+  assert.equal(service.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value, epochBefore);
+  assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
 });
