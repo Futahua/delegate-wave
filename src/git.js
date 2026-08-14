@@ -82,9 +82,13 @@ export async function isAncestor(repoPath, ancestor, descendant) {
 }
 
 export async function updateRefCas(repoPath, ref, newSha, expectedOldSha) {
-  const result = await runProcess("git", ["-C", repoPath, "update-ref", ref, newSha, expectedOldSha]);
+  const result = await runProcess("git", ["-C", repoPath, "push", "--porcelain",
+    "--receive-pack=git -c receive.denyCurrentBranch=refuse receive-pack",
+    `--force-with-lease=${ref}:${expectedOldSha}`,
+    repoPath, `${newSha}:${ref}`,
+  ]);
   if (result.exitCode !== 0) {
-    throw new Error(`update-ref ${ref} failed (${result.exitCode}): ${result.stderr.trim()}`);
+    throw new Error(`compare-and-swap ${ref} failed (${result.exitCode}): ${result.stderr.trim()}`);
   }
   return newSha;
 }

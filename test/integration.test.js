@@ -6,6 +6,7 @@ import test from "node:test";
 import { initializeDataRoot } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
+import { updateRefCas } from "../src/git.js";
 import { runProcess } from "../src/process.js";
 
 async function command(name, args, cwd) {
@@ -275,6 +276,35 @@ test("tampered proposal validation data is rejected before authority is consumed
   assert.equal(service.integrationStatus(proposal.id).operations.length, 0);
 });
 
+test("malformed stored validation JSON never degrades to an empty plan", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  service.db.exec("DROP TRIGGER trg_proposals_immutable_update");
+  service.db.prepare("UPDATE integration_proposals SET validation_plan_json = ? WHERE id = ?")
+    .run("{", proposal.id);
+  await assert.rejects(service.runIntegration(proposal.id), /Stored validation plan is not valid JSON/);
+  assert.equal(service.integrationStatus(proposal.id).operations.length, 0);
+});
+
+test("the CAS primitive refuses a branch checked out after any scheduler precheck", async (t) => {
+  const { temp, repo, cleanup } = await fixture(t);
+  t.after(cleanup);
+  const expected = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  const tree = await command("git", ["-C", repo, "write-tree"]);
+  const next = await command("git", ["-C", repo, "commit-tree", tree, "-p", expected, "-m", "next"]);
+  const other = path.join(temp, "late-checkout");
+  await command("git", ["-C", repo, "worktree", "add", other, "integration"]);
+  await assert.rejects(
+    updateRefCas(repo, "refs/heads/integration", next, expected),
+    /refusing to update checked out branch/,
+  );
+  assert.equal(await command("git", ["-C", repo, "rev-parse", "integration"]), expected);
+});
+
 test("candidate ancestry failure is terminal and consumes only its exact approval", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
@@ -336,6 +366,29 @@ test("an operation intent without a terminal record fails closed", async (t) => 
   );
   await assert.rejects(service.runIntegration(proposal.id), /stuck without a terminal outcome/);
   assert.equal(service.integrationStatus(proposal.id).operations[0].state, "INTENDED");
+});
+
+test("a receipt failure after CAS remains uncertain instead of being mislabeled failed", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture", repoPath: repo, branch: "integration", validation: [] });
+  const { proposal } = await readyProposal(service, project.id, service.backend);
+  service.grantApproval({ proposalId: proposal.id, principal: "human-1", origin: "terminal" });
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  const originalRecord = service.recordIntegrationRecord.bind(service);
+  service.recordIntegrationRecord = (operationId, proposalId, kind, detail) => {
+    if (kind === "BRANCH_ADVANCED") throw new Error("injected receipt failure");
+    return originalRecord(operationId, proposalId, kind, detail);
+  };
+  await assert.rejects(service.runIntegration(proposal.id), /reconciliation required/);
+  const after = await command("git", ["-C", repo, "rev-parse", "integration"]);
+  assert.notEqual(after, before);
+  const status = service.integrationStatus(proposal.id);
+  assert.equal(status.operations[0].state, "INTENDED");
+  assert.equal(status.records.some((record) => record.kind === "INTEGRATION_FAILED"), false);
+  assert.equal(status.records.some((record) => record.kind === "BRANCH_ADVANCE_INTENDED"), true);
+  await assert.rejects(service.runIntegration(proposal.id), /stuck without a terminal outcome/);
 });
 
 test("proposal creation refuses a non-ready or non-write job", async (t) => {

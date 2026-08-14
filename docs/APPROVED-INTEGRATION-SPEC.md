@@ -66,8 +66,9 @@ root and MUST NOT touch the user's checkout.
 **INT-RUN-008** A run MUST cherry-pick the candidate and then execute the snapshotted
 deterministic validation plan in that worktree before advancing any branch.
 
-**INT-RUN-009** The integration branch MUST be advanced only by compare-and-swap against
-`expected_integration_head` (`git update-ref <ref> <new> <expected-old>`).
+**INT-RUN-009** The integration branch MUST be advanced only by a local receive-pack transaction
+that both refuses a branch checked out in any worktree and compare-and-swaps against
+`expected_integration_head` (`--force-with-lease=<ref>:<expected-old>`).
 
 **INT-RUN-010** After operation intent is durable, any pre-CAS or CAS failure MUST leave the branch
 tip unchanged and append an `INTEGRATION_FAILED` terminal record. A failed proposal remains `OPEN`
@@ -83,6 +84,10 @@ success and consumes no additional approval.
 **INT-RUN-013** An operation intent without an immutable terminal record MUST fail closed and MUST
 NOT be rerun automatically.
 
+**INT-RUN-014** The scheduler MUST append `BRANCH_ADVANCE_INTENDED` before the ref transaction. If
+the ref advances but a later receipt write fails, it MUST NOT append `INTEGRATION_FAILED`; the
+operation remains uncertain and requires deterministic reconciliation.
+
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
@@ -95,8 +100,8 @@ NOT be rerun automatically.
 | INT-RUN-005 | stored plan snapshot and re-derived digest comparison | snapshot and tamper tests |
 | INT-RUN-006 | `git merge-base --is-ancestor` | happy-path test |
 | INT-RUN-007–INT-RUN-008 | integration-root detached worktree, cherry-pick, validation re-run | happy-path and validation-failure tests |
-| INT-RUN-009–INT-RUN-010 | `git update-ref` CAS, immutable failure record | stale-head, ancestry, validation-failure, and no-branch-movement tests |
-| INT-RUN-011–INT-RUN-013 | immutable terminal records, derived status, idempotent early return | happy-path, immutability, stuck-intent, and idempotency tests |
+| INT-RUN-009–INT-RUN-010 | guarded local receive-pack CAS, immutable failure record | checked-out-branch, stale-head, ancestry, validation-failure, and no-branch-movement tests |
+| INT-RUN-011–INT-RUN-014 | immutable terminal records, derived status, post-CAS fail-closed handling, idempotent early return | happy-path, immutability, stuck-intent, post-CAS failure, and idempotency tests |
 
 ## Out of scope for this slice
 

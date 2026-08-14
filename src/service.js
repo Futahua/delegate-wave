@@ -31,6 +31,19 @@ function parseJson(value, fallback = []) {
   try { return JSON.parse(value); } catch { return fallback; }
 }
 
+function parseValidationPlan(value) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(`Stored validation plan is not valid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((command) => typeof command !== "string" || !command.trim())) {
+    throw new Error("Stored validation plan must be an array of non-empty command strings");
+  }
+  return parsed;
+}
+
 function safeProjectId(name) {
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "project";
   return `${slug}-${crypto.randomBytes(3).toString("hex")}`;
@@ -490,7 +503,7 @@ export class Dispatcher {
       }
     }
 
-    const storedPlan = parseJson(proposal.validation_plan_json);
+    const storedPlan = parseValidationPlan(proposal.validation_plan_json);
     const storedPlanDigest = this.planDigest(storedPlan);
     if (storedPlanDigest !== proposal.validation_plan_digest) {
       throw new Error(`Stored validation plan digest mismatch for proposal ${proposalId}`);
@@ -552,6 +565,7 @@ export class Dispatcher {
 
     const { operationId, worktreePath } = claim;
     const branchRef = `refs/heads/${proposal.integration_branch}`;
+    let branchAdvanced = false;
     try {
       await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
       if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
@@ -564,7 +578,11 @@ export class Dispatcher {
       this.recordIntegrationRecord(operationId, proposalId, "CANDIDATE_CHERRY_PICKED", newHead);
       await this.runIntegrationValidation(storedPlan, worktreePath, operationId, proposalId);
       await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
+      this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCE_INTENDED", JSON.stringify({
+        branchRef, newHead, expectedHead: proposal.expected_integration_head,
+      }));
       await updateRefCas(project.repo_path, branchRef, newHead, proposal.expected_integration_head);
+      branchAdvanced = true;
       this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCED", newHead);
       transaction(this.db, () => {
         const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
@@ -582,6 +600,13 @@ export class Dispatcher {
       return this.integrationStatus(proposalId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (branchAdvanced) {
+        const uncertain = new Error(
+          `Integration branch advanced but completion receipt failed for ${operationId}; reconciliation required: ${message}`,
+        );
+        uncertain.code = "POST_CAS_RECEIPT_UNCERTAIN";
+        throw uncertain;
+      }
       transaction(this.db, () => {
         const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
         if (operation && operation.state === "INTENDED") {
