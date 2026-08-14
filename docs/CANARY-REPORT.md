@@ -54,3 +54,22 @@ Observed results:
 The worker described the protected edit as a boundary breach. That interpretation is incorrect for this layered design: OpenCode confines writes to the disposable worktree; `delegate-wave` independently enforces protected paths before accepting a candidate. The observable end-to-end policy behaved as designed.
 
 Raw model events and the rejected worktree remain under the managed artifact/worktree roots and are intentionally not committed because they contain machine-specific absolute paths and executor transcripts.
+
+## Self-dogfood result
+
+After the disposable boundary canary passed, `delegate-wave` performed one bounded task against its own registered repository:
+
+```text
+job       job_99efeaa2-a64f-4d2e-8d39-f10565060788
+attempt   job_99efeaa2-a64f-4d2e-8d39-f10565060788.1
+session   ses_001332577ffeB78JGjeEC0kaYH
+epoch     4
+cost      $0.0008412824
+candidate 44f2e82417426f3c474b42c5e0ee167d53f23b03
+```
+
+The worker was asked to create only `docs/OPERATOR-CHECKLIST.md`. It changed exactly that file. Dispatcher-controlled `npm test` passed, the attempt reached `SUCCEEDED` with validation `PASSED`, and the job stopped at `READY_FOR_INTEGRATION`.
+
+The running system did not install its own result. The candidate was inspected manually and then cherry-picked as `b785484`, demonstrating the intended external integration boundary.
+
+Total reported OpenCode Go model cost across the successful disposable canary and self-dogfood task was `$0.0016058812`.
