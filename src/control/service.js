@@ -8,7 +8,7 @@ const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
-  "backup.create", "integration.rollback",
+  "backup.create", "integration.rollback", "job.advance", "integration.approve",
 ]);
 
 function canonical(value) {
@@ -155,6 +155,15 @@ export class ControlService {
       "project.create": () => this.dispatcher.addProject(args),
       "job.create": () => this.dispatcher.createJob(args),
       "job.run": () => this.dispatcher.runJob(args.jobId, { model: args.model || null }),
+      // One authorization carries the work as far as it can go without another human decision.
+      "job.advance": () => this.dispatcher.advanceJob(args.jobId, { model: args.model || null }),
+      // The second and final decision: approve this exact candidate and integrate it.
+      "integration.approve": () => this.dispatcher.approveAndIntegrate({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        idempotencyKey: args.idempotencyKey || null,
+      }),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),
       "integration.rollback": () => this.dispatcher.rollbackIntegration({
         proposalId: args.proposalId,
@@ -190,12 +199,27 @@ export class ControlService {
         principal: context.principalId,
         origin: context.originChannel,
       }),
-      "work.proposal.authorize": () => this.dispatcher.authorizeWorkProposal({
-        proposalId: args.proposalId,
-        principal: context.principalId,
-        origin: context.originChannel,
-        maxAttempts: args.maxAttempts ?? 2,
-      }),
+      // Authorizing runs the work: the operator's single decision is "do this", not "do this, then
+      // tell me to start it, then tell me to validate it". Auto-advance is opt-out for callers that
+      // want the decision recorded without immediately spending money.
+      "work.proposal.authorize": async () => {
+        const decided = await this.dispatcher.authorizeWorkProposal({
+          proposalId: args.proposalId,
+          principal: context.principalId,
+          origin: context.originChannel,
+          maxAttempts: args.maxAttempts ?? 2,
+        });
+        if (args.advance === false) return decided;
+        const jobId = decided.decision?.job_id;
+        if (!jobId) return decided;
+        // A worker or validation failure is a normal outcome of advancing, not a failure of the
+        // authorization itself, so it is reported rather than thrown.
+        try {
+          return { ...decided, advanced: await this.dispatcher.advanceJob(jobId, { model: args.model || null }) };
+        } catch (error) {
+          return { ...decided, advanced: null, advance_error: String(error?.message ?? error) };
+        }
+      },
       "work.proposal.reject": () => this.dispatcher.rejectWorkProposal({
         proposalId: args.proposalId,
         principal: context.principalId,

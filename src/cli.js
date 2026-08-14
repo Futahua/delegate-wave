@@ -51,6 +51,8 @@ Commands:
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
   supervisor add-role --role proposer   seal one new credential role into the existing store
   job cancel --job ID [--reason TEXT] stop a running job; records durable intent and outcome
+  job advance --job ID                run, validate, and propose integration in one step
+  integration approve --proposal ID   approve this exact candidate and integrate it
   backup create [--label TEXT]        snapshot the operational database with a checksummed manifest
   backup list
   integration rollback --proposal ID  move an integration branch back, compare-and-swap
@@ -165,6 +167,15 @@ async function main() {
     print(await client.post(
       `/v1/jobs/${encodeURIComponent(required(options, "job"))}/cancel`,
       { reason: options.reason || "" }, requestId(options),
+    ));
+  } else if (resource === "job" && action === "advance") {
+    print(await client.post(
+      `/v1/jobs/${encodeURIComponent(required(options, "job"))}/advance`,
+      { model: options.model || null }, requestId(options),
+    ));
+  } else if (resource === "integration" && action === "approve") {
+    print(await client.post(
+      `/v1/proposals/${encodeURIComponent(required(options, "proposal"))}/approve`, {}, requestId(options),
     ));
   } else if (resource === "backup" && action === "create") {
     print(await client.post("/v1/backups", { label: options.label || "manual" }, requestId(options)));

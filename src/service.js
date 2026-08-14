@@ -789,6 +789,56 @@ export class Dispatcher {
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
   }
 
+  // --- Auto-advance -----------------------------------------------------------------------------
+  //
+  // Human authority is preserved exactly where it matters and removed everywhere it was ceremony.
+  // Two decisions remain: authorize the work, and approve the integration. Everything between them
+  // -- running the worker, validating, and proposing the integration -- is mechanical, and requiring
+  // a human keystroke for each step bought no safety while guaranteeing the loop stalls whenever the
+  // operator is away.
+  //
+  // What is deliberately NOT automated: integration itself still consumes an explicit approval, and
+  // the approval still binds to one exact candidate digest.
+  async advanceJob(jobId, { model = null } = {}) {
+    const job = this.getJob(jobId);
+    if (!job) throw new Error(`Unknown job: ${jobId}`);
+
+    // Run the worker unless the job already produced a candidate.
+    let status = this.status(jobId);
+    if (["PENDING", "NEEDS_ATTENTION"].includes(status.job.status)) {
+      status = await this.runJob(jobId, { model });
+    }
+
+    if (status.job.status !== "READY_FOR_INTEGRATION") {
+      return { job: status.job, attempts: status.attempts, stage: "worker", proposal: null };
+    }
+    if (job.mode !== "write") {
+      return { job: status.job, attempts: status.attempts, stage: "complete", proposal: null };
+    }
+
+    // Proposing an integration is mechanical: it records what would be integrated and still requires
+    // a separate approval before anything moves.
+    const existing = this.db.prepare(
+      "SELECT * FROM integration_proposals WHERE job_id = ? AND state = 'OPEN' ORDER BY created_at DESC LIMIT 1",
+    ).get(jobId);
+    const proposal = existing ?? await this.proposeIntegration({ jobId });
+
+    return {
+      job: this.getJob(jobId),
+      attempts: this.status(jobId).attempts,
+      stage: "awaiting_approval",
+      proposal,
+    };
+  }
+
+  // Approving and integrating in one operator action. The approval is still explicit, still bound to
+  // the exact candidate, and still recorded separately; this only removes the second keystroke that
+  // followed it unconditionally.
+  async approveAndIntegrate({ proposalId, principal, origin, idempotencyKey = null }) {
+    this.grantApproval({ proposalId, principal, origin, idempotencyKey });
+    return this.runIntegration(proposalId);
+  }
+
   // --- Recovery ---------------------------------------------------------------------------------
 
   backup(label = "manual") {
