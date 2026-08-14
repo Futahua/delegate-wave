@@ -265,6 +265,57 @@ test("an operator-only install cannot report success and then fail at supervised
   });
 });
 
+test("reusing an existing store missing a required role fails before the task is created", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-partial-reuse-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const storePath = path.join(root, "config", PROTECTED_SECRET_FILE);
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  const seeded = `${JSON.stringify({ version: 1, records: { operator: "ciphertext-operator" } }, null, 2)}\n`;
+  fs.writeFileSync(storePath, seeded, "utf8");
+
+  const calls = [];
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner: async () => {
+    assert.fail("reuse validation must not decrypt or re-protect anything");
+  } });
+  const supervisor = new WindowsSupervisor({
+    platform: "win32", root, secretStore: store,
+    env: { USERDOMAIN: "MACHINE", USERNAME: "john" },
+    runner: async (args) => { calls.push(args[0]); return { exitCode: 0, stdout: "", stderr: "" }; },
+  });
+
+  // A clean reinstall environment carries no plaintext operator token.
+  await assert.rejects(
+    supervisor.install({ nodePath: "C:\\node.exe", cliPath: "D:\\repo\\src\\cli.js", workingDirectory: "D:\\repo" }),
+    /missing required roles: observer/,
+  );
+  assert.deepEqual(calls, [], "the task must not be created when the store cannot start the API");
+  assert.equal(fs.readFileSync(storePath, "utf8"), seeded, "a refused install must not mutate the store");
+});
+
+test("reusing a complete existing store still succeeds without re-encrypting", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-complete-reuse-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+  const before = fs.readFileSync(store.path, "utf8");
+
+  assert.deepEqual(await store.provision({}), { provisioned: false, path: store.path });
+  assert.equal(fs.readFileSync(store.path, "utf8"), before, "reuse must leave a complete store untouched");
+});
+
+test("a legacy store is left to the entitled migration path rather than refused on reuse", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-legacy-reuse-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const storePath = seedLegacyStore(root, processRunner, legacyValues);
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+
+  assert.deepEqual(await store.provision({}), { provisioned: false, path: storePath });
+  assert.deepEqual(processRunner.decrypted, [], "reuse must not decrypt a legacy bundle to inspect it");
+  assert.equal(store.isLegacyFormat(), true);
+});
+
 test("migration refuses a legacy bundle missing a required role", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-partial-migrate-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

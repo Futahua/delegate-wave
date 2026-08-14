@@ -312,10 +312,31 @@ export class DpapiSecretStore {
     return result.stdout.trim();
   }
 
+  // Structural check on an existing scoped store: which roles have records, without decrypting any
+  // of them. Record presence is all SUP-005d needs to know an install can produce a startable store.
+  missingRequiredRecords() {
+    const records = this.readRecords();
+    return REQUIRED_SECRET_ROLES.filter((role) => !records[role]);
+  }
+
   async provision(env = process.env) {
     requireWindows(this.platform);
     if (!env.DELEGATE_WAVE_CONTROL_TOKEN) {
-      if (this.exists()) return { provisioned: false, path: this.path };
+      if (this.exists()) {
+        // Reusing an existing store still has to satisfy SUP-005d, or an install that cannot start
+        // would report success here and fail at the next supervised start. A legacy bundle is left
+        // to the entitled migration path, since its roles cannot be inspected without decrypting it.
+        if (!this.isLegacyFormat()) {
+          const missing = this.missingRequiredRecords();
+          if (missing.length) {
+            throw new Error(
+              `Protected credential store at ${this.path} is missing required roles: ${missing.join(", ")}. `
+              + "Reinstall with the full credential set to rewrite the store.",
+            );
+          }
+        }
+        return { provisioned: false, path: this.path };
+      }
       throw new Error("DELEGATE_WAVE_CONTROL_TOKEN is required to create the protected supervisor credential store");
     }
 

@@ -194,17 +194,38 @@ planned proposal principal extends this validation by declaring one more role.
 
 The documented setup always supplied both credentials, so no live installation was affected.
 
+A follow-up review found the same invariant still had a hole on the reuse path. `provision()` returned
+early when no plaintext operator token was present and a store already existed, bypassing the new
+validation entirely — so an installation reusing a partial scoped store, exactly the kind the previous
+implementation could create, still reported success and deferred the failure to runtime:
+
+```text
+before: existing store records = [operator], observer absent
+        clean reinstall environment, no plaintext CONTROL_TOKEN
+        install reports installed = true
+        schtasks /Create reached
+        runtime fails later loading observer
+
+after:  install fails: "missing required roles: observer"
+        schtasks calls reached = []
+        existing store unchanged
+```
+
+Reuse now verifies required roles by record presence, which needs no decryption. A legacy combined
+store stays exempt: its roles cannot be inspected without decrypting it, so upgrading it remains the
+entitled migration path's job.
+
 ## Current-head validation
 
 There are no hosted checks, so the deterministic suite is the validation evidence and it is recorded
 against the exact head it was run on:
 
 ```text
-src/ tree       a2ae4f7c4497c17a4712ef874af6f6d999855c31
-test/ tree      76bfcb13ef0d86c64612d644102c774b03dc16c7
+src/ tree       4535bcc47dc58707a2c892e27638846f0172bb97
+test/ tree      a0a06c2ca71f53a96c9cd55dd6c9935f95dce821
 command         npm run check
-result          87/87 pass, 0 fail, 0 skipped, 0 todo
-duration        approximately 41 s
+result          90/90 pass, 0 fail, 0 skipped, 0 todo
+duration        approximately 32 s
 ```
 
 The tree hashes identify the exact validated source; verify with `git rev-parse HEAD:src` and
@@ -212,7 +233,8 @@ The tree hashes identify the exact validated source; verify with `git rev-parse 
 
 That count includes the scoped-decryption, legacy-migration, non-orphaning-uninstall,
 store-replacement, and required-role regressions added after the first review round. Earlier figures
-of 72/72, 76/76, and 83/83 predate those batches and should not be used as this head's evidence.
+of 72/72, 76/76, 83/83, and 87/87 predate those batches and should not be used as this head's
+evidence.
 
 Live re-verification after the store-replacement change, with the API still on PID 42664:
 

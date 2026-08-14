@@ -54,7 +54,10 @@ previous store intact.
 and provisioning and migration MUST validate that whole set before writing a store. An installation
 that cannot produce a startable store MUST fail at install time rather than report success and fail
 at the next supervised start. Adding a role to the declared set MUST extend that validation without
-further changes.
+further changes. This applies equally when installation reuses an existing scoped store: reuse MUST
+verify by record presence that every required role exists, without decrypting any record, and MUST
+fail before the Windows task is created. A legacy combined store is exempt, since its roles cannot be
+inspected without decrypting it; upgrading it remains the entitled migration path's responsibility.
 
 ## Authority and recovery
 
@@ -93,7 +96,7 @@ same Windows user. Untrusted validation requires a separate OS identity, contain
 | SUP-005a | per-role DPAPI records; `load(role)` unseals exactly one | per-role blob isolation test; MCP-startup operator-decrypt-path test; scoped `runtimeEnvironment` test |
 | SUP-005b | explicit `migrate-secrets`; `load()` refuses a legacy bundle without decrypting | legacy migration, idempotence, fail-closed MCP load, and failed-re-protect tests; live migration dogfood |
 | SUP-005c | temporary-file write, fsync, and same-volume rename replacement | no-residue/never-truncated replacement test; failed-write preservation test |
-| SUP-005d | `SECRET_RECORDS` required flags validated before any store write | partial-install and partial-migration refusal tests; deferred-failure test; required-role runtime load test |
+| SUP-005d | `SECRET_RECORDS` required flags validated before any store write and on existing-store reuse | partial-install, partial-migration, and partial-reuse refusal tests; deferred-failure test; complete-reuse and legacy-reuse tests; required-role runtime load test |
 | SUP-006 | CLI-only dynamic supervisor module; absent API/MCP routes | lifecycle command test and existing route allowlist tests |
 | SUP-007–009 | supervisor has no dispatcher/storage imports or cleanup actions | static implementation review; live state comparison |
 | SUP-009a | shared disable/end/PID-wait sequence runs before `/Delete` | non-orphaning uninstall test; stuck-runtime fail-closed uninstall test |
