@@ -28,6 +28,18 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **ATT-006** A job MUST stop at `NEEDS_ATTENTION` after its configured attempt limit is reached.
 
+**ATT-007** Bootstrap job claim, conflict detection, epoch acquisition, attempt creation, and job transition to `RUNNING` MUST occur in one immediate transaction.
+
+**ATT-008** A lifecycle-active attempt is one with `terminal_state IS NULL` or with `terminal_state = 'SUCCEEDED'` and `validation_state = 'PENDING'`.
+
+**ATT-009** A job claim MUST refuse while any lifecycle-active attempt or `RUNNING` job exists and MUST NOT advance the scheduler epoch on refusal.
+
+**ATT-010** Attempt creation MUST persist the owning scheduler process identity in the same transaction as epoch acquisition.
+
+**ATT-011** Executor intent MUST be persisted on the attempt row before backend launch; PID publication and terminal results MUST match that intent.
+
+**ATT-012** Reconciliation MUST fail closed when executor intent exists without an executor PID receipt because whether the backend process spawned is uncertain.
+
 ## Filesystem and Git
 
 **FS-001** Filesystem location MUST NOT determine lifecycle state or authority.
@@ -56,34 +68,51 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **VAL-004** Automatic integration MUST NOT occur in the bootstrap release.
 
+**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
+
+**VAL-006** A validation MUST record fenced durable intent on its attempt row before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
+
+**VAL-007** Reconciliation MUST fail closed when validation intent exists without a validator PID receipt because whether the command spawned is uncertain.
+
 ## Recovery
 
 **REC-001** Reconciliation MUST be read-only unless the operator explicitly requests application.
 
 **REC-002** Applied reconciliation MUST acquire a new scheduler fencing epoch before mutating abandoned attempts.
 
-**REC-003** Reconciliation MUST NOT orphan an attempt whose recorded executor process is still alive.
+**REC-003** Reconciliation MUST NOT recover an attempt while any recorded scheduler, executor, or validator process is still alive.
 
 **REC-004** A dead nonterminal attempt MAY be transitioned to `ORPHANED` without consulting a model.
+
+**REC-005** Applied reconciliation MUST NOT advance the scheduler epoch if any recorded scheduler, executor, or validator process is alive.
+
+**REC-006** `doctor` and `reconcile` MUST detect both the executor-running (`terminal_state IS NULL`) and validation-pending (`SUCCEEDED` with `PENDING`) lifecycle phases.
+
+**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as `validation_state = 'FAILED'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to `PENDING` or `NEEDS_ATTENTION` by attempt limit.
+
+**REC-008** Process-liveness probing MUST treat only definite process nonexistence as dead; access denial or an unknown probe failure MUST be treated as alive.
+
+**REC-009** Authoritative reconciliation MUST invoke process probing with only a PID argument; collection callback metadata MUST NOT be interpreted as a probe implementation.
 
 ## Traceability
 
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
 | AUTH-001, TRUTH-001 | `Dispatcher`, SQLite transactions | all dispatcher tests |
-| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | configuration review; live canary pending |
+| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
-| ATT-004 | `acceptAttemptEvent`, `recordExecutorPid` | stale epoch test |
+| ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
+| ATT-007–ATT-012 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID and executor intent/PID receipts | invalid invocation, live executor, uncertain executor start, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | VAL-004 | absence of integration command | interface conformance review |
-| REC-001–REC-004 | `doctor`, `reconcile`, PID receipt | reconciliation test |
+| VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 
 ## Known bootstrap limitations
 
-- OpenCode permission enforcement has not yet received a paid live-model canary.
+- OpenCode permission enforcement passed the documented disposable live-model canary; this evidence applies to the tested runtime configuration and is not a general OS sandbox guarantee.
 - The scheduler runs one CLI-owned attempt at a time; wave concurrency is not implemented.
 - PID liveness cannot prove that a remote or attached OpenCode session has stopped. Reconciliation therefore refuses live recorded processes and never attaches a replacement mid-attempt.
 - Candidate integration remains a human/Codex operation.

@@ -59,8 +59,15 @@ export class FakeBackend {
 }
 
 export class OpenCodeBackend {
-  constructor({ executable = "opencode", attach, timeoutMs = 30 * 60_000 } = {}) {
-    this.executable = executable;
+  constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000, launchResolver = defaultOpenCodeLaunch } = {}) {
+    if (executable) {
+      this.executable = executable;
+      this.prefixArgs = prefixArgs ?? [];
+    } else {
+      const launch = launchResolver();
+      this.executable = launch.executable;
+      this.prefixArgs = prefixArgs ?? launch.prefixArgs;
+    }
     this.attach = attach;
     this.timeoutMs = timeoutMs;
   }
@@ -74,7 +81,7 @@ export class OpenCodeBackend {
     const prompt = mode === "read"
       ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${goal}`
       : `Implement this bounded task in the current worktree. Do not commit, push, modify Git metadata, or access files outside this worktree. Shell access is intentionally disabled; edit only the necessary files.\n\nTask: ${goal}`;
-    const args = [
+    const args = [...this.prefixArgs,
       "run", prompt,
       "--agent", mode === "read" ? "delegate-wave-reader" : "delegate-wave-worker",
       "--format", "json",
@@ -97,4 +104,18 @@ export class OpenCodeBackend {
     ]);
     return { ...result, stdoutPath, stderrPath };
   }
+}
+
+function defaultOpenCodeLaunch() {
+  if (process.platform !== "win32") return { executable: "opencode", prefixArgs: [] };
+  const configuredEntry = process.env.OPENCODE_NODE_ENTRY;
+  if (!configuredEntry && !process.env.APPDATA) {
+    throw new Error("APPDATA is unavailable; set OPENCODE_NODE_ENTRY or pass an executable explicitly");
+  }
+  const entry = configuredEntry
+    ?? path.join(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode");
+  if (!fs.existsSync(entry)) {
+    throw new Error("OpenCode Node entry was not found; set OPENCODE_NODE_ENTRY or pass an executable explicitly");
+  }
+  return { executable: process.execPath, prefixArgs: [entry] };
 }

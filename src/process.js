@@ -10,13 +10,6 @@ export function runProcess(command, args, options = {}) {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    try {
-      onSpawn?.(child.pid);
-    } catch (error) {
-      child.kill();
-      reject(error);
-      return;
-    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -24,6 +17,18 @@ export function runProcess(command, args, options = {}) {
       timedOut = true;
       child.kill();
     }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("spawn", () => {
+      try {
+        onSpawn?.(child.pid);
+      } catch (error) {
+        child.kill();
+        reject(error);
+      }
+    });
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
       stdout += text;
@@ -33,10 +38,6 @@ export function runProcess(command, args, options = {}) {
       const text = chunk.toString();
       stderr += text;
       onStderr?.(text);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
     });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timer);
