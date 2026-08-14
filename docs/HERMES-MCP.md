@@ -61,6 +61,19 @@ Hermes registers these as `mcp_delegate_wave_<tool>`. If the Control API is down
 falling back to direct state access. Startup also fails if the Hermes token is missing or equals an
 inherited operator token; there is no operator-token fallback.
 
+For a dedicated low-context status invocation, restrict Hermes to this server and start outside a
+source checkout whose repository instructions are irrelevant:
+
+```powershell
+hermes --provider opencode-go --model deepseek-v4-flash `
+  --toolsets delegate_wave --ignore-rules `
+  --oneshot "What needs my attention?"
+```
+
+`--ignore-rules` is suitable for this stateless concierge shape, not for ordinary conversations that
+need Hermes memory or user preferences. Live measurements and their limitations are recorded in
+[HERMES-LIVE-DOGFOOD.md](HERMES-LIVE-DOGFOOD.md).
+
 ## Deferred mutation boundary
 
 Hermes mutation tools require a future proposal/approval capability that can prove a distinct

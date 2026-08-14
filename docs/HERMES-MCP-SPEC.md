@@ -10,8 +10,8 @@ MUST reject every mutating route authenticated with that observer credential.
 
 **MCP-004** Observer and operator credentials MUST NOT be equal.
 
-**MCP-005** The observer credential MUST bind to principal `hermes` and origin `hermes-mcp` at the
-server. Caller content MUST NOT select or override this identity.
+**MCP-005** The observer credential MUST bind to a server-configured principal (default `hermes`) and
+origin `hermes-mcp`. Caller content MUST NOT select or override this identity.
 
 **MCP-006** The stdio adapter MUST emit only newline-delimited JSON-RPC on stdout. Diagnostics MAY
 use stderr.
