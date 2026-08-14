@@ -7,6 +7,7 @@ credential.
 ## Exposed tools
 
 ```text
+get_overview
 list_projects
 get_project_summary
 get_job
@@ -48,11 +49,25 @@ mcp_servers:
       DELEGATE_WAVE_HERMES_CONTROL_TOKEN: "${DELEGATE_WAVE_HERMES_CONTROL_TOKEN}"
     tools:
       include:
+        - get_overview
         - list_projects
         - get_project_summary
         - get_job
         - get_attention_needed
         - get_integration
+      resources: false
+      prompts: false
+  delegate_wave_overview:
+    command: "node"
+    args:
+      - "D:/Letters/MatTroiSeConMoc/delegate-wave/src/cli.js"
+      - "mcp"
+    env:
+      DELEGATE_WAVE_CONTROL_URL: "http://127.0.0.1:47321"
+      DELEGATE_WAVE_HERMES_CONTROL_TOKEN: "${DELEGATE_WAVE_HERMES_CONTROL_TOKEN}"
+    tools:
+      include:
+        - get_overview
       resources: false
       prompts: false
 ```
@@ -66,9 +81,12 @@ source checkout whose repository instructions are irrelevant:
 
 ```powershell
 hermes --provider opencode-go --model deepseek-v4-flash `
-  --toolsets delegate_wave --ignore-rules `
+  --toolsets delegate_wave_overview --ignore-rules `
   --oneshot "What needs my attention?"
 ```
+
+The `delegate_wave_overview` alias starts the same read-only adapter with the same observer credential;
+it only prevents five unused drill-down schemas from entering a dedicated status turn.
 
 `--ignore-rules` is suitable for this stateless concierge shape, not for ordinary conversations that
 need Hermes memory or user preferences. Live measurements and their limitations are recorded in

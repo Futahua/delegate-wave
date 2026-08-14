@@ -2,6 +2,7 @@ import { ControlError } from "./errors.js";
 
 export const ROUTES = Object.freeze([
   { method: "GET", pattern: /^\/v1\/health$/, command: "health" },
+  { method: "GET", pattern: /^\/v1\/overview$/, command: "overview" },
   { method: "GET", pattern: /^\/v1\/projects$/, command: "project.list" },
   { method: "POST", pattern: /^\/v1\/projects$/, command: "project.create", mutation: true },
   { method: "GET", pattern: /^\/v1\/jobs$/, command: "job.list" },

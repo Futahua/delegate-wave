@@ -41,6 +41,38 @@ async function fixture(t) {
   return { root, repo, cleanup };
 }
 
+test("overview is SQL-bounded, compact, and excludes detailed execution state", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-overview-"));
+  const root = path.join(temp, "data");
+  initializeDataRoot(root);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(() => { service.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  const insertProject = service.db.prepare(`INSERT INTO projects(
+    id, name, repo_path, integration_branch, validation_json, protected_json, created_at
+  ) VALUES (?, ?, ?, 'main', '[]', '[]', ?)`);
+  const insertJob = service.db.prepare(`INSERT INTO jobs(
+    id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
+  ) VALUES (?, ?, ?, 'write', ?, ?, 1, ?, ?)`);
+  for (let index = 0; index < 25; index += 1) {
+    const timestamp = new Date(Date.UTC(2026, 7, 14, 0, index)).toISOString();
+    insertProject.run(`project-${index}`, `Project ${index}`, path.join(temp, `repo-${index}`), timestamp);
+    insertJob.run(
+      `job-${index}`, `project-${index}`, `Goal ${index} ${"x".repeat(500)}`,
+      index % 2 ? "NEEDS_ATTENTION" : "READY_FOR_INTEGRATION", "a".repeat(40), timestamp, timestamp,
+    );
+  }
+  const overview = service.overview();
+  const serialized = JSON.stringify(overview);
+  assert.equal(overview.schema_version, 1);
+  assert.deepEqual(overview.totals, { projects: 25, jobs_needing_attention: 12, jobs_ready_for_integration: 13 });
+  assert.ok(overview.projects.length <= 20);
+  assert.ok(overview.attention.length <= 20);
+  assert.equal(overview.truncated, true);
+  assert.ok(overview.attention.every((item) => item.summary.length <= 160));
+  assert.ok(Buffer.byteLength(serialized, "utf8") <= 3 * 1024);
+  assert.doesNotMatch(serialized, /repo_path|worktree|validation|failure_signature|artifact/);
+});
+
 test("successful worker produces a validated candidate commit", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const backend = new FakeBackend(async ({ worktreePath }) => {

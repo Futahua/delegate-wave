@@ -14,7 +14,7 @@ test("Hermes adapter exposes only bounded read tools", async () => {
   const client = { get: async (path) => { paths.push(path); return path === "/v1/projects" ? [{ id: "p1" }] : jobs; } };
   const adapter = new HermesMcpAdapter({ client });
   assert.deepEqual(adapter.listTools().map((tool) => tool.name), [
-    "list_projects", "get_project_summary", "get_job", "get_attention_needed", "get_integration",
+    "get_overview", "list_projects", "get_project_summary", "get_job", "get_attention_needed", "get_integration",
   ]);
   assert.equal(adapter.listTools().some((tool) => /create|run|approve|grant|reconcile/.test(tool.name)), false);
   assert.deepEqual(await adapter.callTool("get_project_summary", { project_id: "p1" }), {
@@ -74,19 +74,28 @@ test("stdio MCP lifecycle and tool calls use newline-delimited JSON-RPC", async 
   const output = new PassThrough();
   let text = "";
   output.on("data", (chunk) => { text += chunk.toString(); });
-  const client = { get: async () => [{ id: "project-one" }] };
+  const overview = {
+    schema_version: 1,
+    totals: { projects: 3, jobs_needing_attention: 2, jobs_ready_for_integration: 1 },
+    attention: [{ summary: "structured-only-marker" }],
+  };
+  const client = { get: async (path) => path === "/v1/overview" ? overview : [{ id: "project-one" }] };
   const lines = runMcpStdio({ input, output, client });
   input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })}\n`);
   input.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
   input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
   input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_projects", arguments: {} } })}\n`);
-  for (let index = 0; index < 100 && text.trim().split("\n").length < 3; index += 1) await delay(10);
+  input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_overview", arguments: {} } })}\n`);
+  for (let index = 0; index < 100 && text.trim().split("\n").length < 4; index += 1) await delay(10);
   input.end();
   lines.close();
   const responses = text.trim().split("\n").map(JSON.parse);
-  assert.equal(responses.length, 3);
+  assert.equal(responses.length, 4);
   assert.equal(responses[0].result.protocolVersion, "2025-06-18");
   assert.equal(responses[0].result.capabilities.tools.listChanged, false);
-  assert.equal(responses[1].result.tools.length, 5);
+  assert.equal(responses[1].result.tools.length, 6);
   assert.deepEqual(responses[2].result.structuredContent, { result: [{ id: "project-one" }] });
+  assert.equal(responses[3].result.content[0].text, "3 projects; jobs needing attention: 2; jobs awaiting integration: 1.");
+  assert.doesNotMatch(responses[3].result.content[0].text, /structured-only-marker/);
+  assert.deepEqual(responses[3].result.structuredContent, { result: overview });
 });

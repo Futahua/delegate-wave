@@ -30,6 +30,7 @@ function fakeDispatcher(root, overrides = {}) {
   return {
     db,
     doctor: () => ({ healthy: true }),
+    overview: () => ({ schema_version: 1, totals: { projects: 0, jobs_needing_attention: 0, jobs_ready_for_integration: 0 } }),
     listProjects: () => [],
     listJobs: () => [],
     listApprovals: () => [],
@@ -299,9 +300,14 @@ test("malformed, unknown, and identity-spoofing requests do not dispatch", async
 
 test("Hermes observer credential can query but cannot mutate", async (t) => {
   let calls = 0;
-  const f = await fixture(t, { createJob: () => { calls += 1; return { id: "forbidden" }; } });
+  const overview = { schema_version: 1, totals: { projects: 2, jobs_needing_attention: 1, jobs_ready_for_integration: 0 } };
+  const f = await fixture(t, {
+    overview: () => overview,
+    createJob: () => { calls += 1; return { id: "forbidden" }; },
+  });
   const observer = new ControlClient({ baseUrl: f.url, token: f.observerToken });
   assert.deepEqual(await observer.get("/v1/projects"), []);
+  assert.deepEqual(await observer.get("/v1/overview"), overview);
   await assert.rejects(
     observer.post("/v1/jobs", { projectId: "p", goal: "no", mode: "write", maxAttempts: 1 }, requestId()),
     (error) => error.code === "READ_ONLY_CREDENTIAL",

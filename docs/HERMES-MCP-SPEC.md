@@ -27,6 +27,16 @@ operator credential. The MCP process MUST discard an accidentally inherited oper
 **MCP-010** Project summaries MUST include at most the 20 most recent jobs and MUST report the total
 job count and whether the result was truncated.
 
+**MCP-011** The everyday overview MUST be a deterministic Control API query bounded to 20 projects,
+20 attention items, 160 characters per summary, and 3 KiB for the complete serialized result.
+
+**MCP-012** Overview bounds MUST be applied in SQLite queries before data reaches the MCP adapter.
+The overview MUST NOT include source paths, attempt history, validation logs, artifact paths, raw
+receipts, failure details, or full job goals.
+
+**MCP-013** The overview's MCP text content MUST contain only compact totals. The complete overview
+MUST appear once in `structuredContent`, not be duplicated as JSON text.
+
 ## Traceability
 
 | Rules | Enforced by | Tested by |
@@ -37,3 +47,5 @@ job count and whether the result was truncated.
 | MCP-008 | absent mutation tools and documentation | adapter surface test |
 | MCP-009 | `hermesControlClient` fail-closed credential construction | factory and production-process fallback tests |
 | MCP-010 | bounded project-summary projection | 23-job summary test |
+| MCP-011–012 | `Dispatcher.overview` SQL projection and byte fitter | 25-project/25-attention query test |
+| MCP-013 | overview-specific MCP renderer | stdio structured-result non-duplication test |

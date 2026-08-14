@@ -42,6 +42,7 @@ export class ControlService {
   async query(command, args = {}) {
     const handlers = {
       health: () => ({ ok: true, doctor: this.dispatcher.doctor() }),
+      overview: () => this.dispatcher.overview(),
       "project.list": () => this.dispatcher.listProjects(),
       "job.list": () => this.dispatcher.listJobs(args.projectId || null),
       "job.get": () => this.dispatcher.status(args.jobId),

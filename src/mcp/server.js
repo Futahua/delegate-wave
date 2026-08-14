@@ -4,6 +4,11 @@ import { ControlClient } from "../control/client.js";
 
 const TOOLS = Object.freeze([
   {
+    name: "get_overview",
+    description: "Get one bounded operational overview: project health, latest jobs, and items needing human attention.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
     name: "list_projects",
     description: "List software projects known to delegate-wave.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -50,6 +55,7 @@ export class HermesMcpAdapter {
   listTools() { return TOOLS; }
 
   async callTool(name, args = {}) {
+    if (name === "get_overview") return this.client.get("/v1/overview");
     if (name === "list_projects") return this.client.get("/v1/projects");
     if (name === "get_project_summary") {
       const projectId = requiredString(args, "project_id");
@@ -112,8 +118,11 @@ export function runMcpStdio({
       else if (request.method === "tools/list") result = { tools: adapter.listTools() };
       else if (request.method === "tools/call") {
         const value = await adapter.callTool(request.params?.name, request.params?.arguments || {});
+        const text = request.params?.name === "get_overview"
+          ? `${value.totals.projects} projects; jobs needing attention: ${value.totals.jobs_needing_attention}; jobs awaiting integration: ${value.totals.jobs_ready_for_integration}.`
+          : JSON.stringify(value);
         result = {
-          content: [{ type: "text", text: JSON.stringify(value) }],
+          content: [{ type: "text", text }],
           structuredContent: { result: value },
           isError: false,
         };

@@ -35,6 +35,7 @@ The v1 routes are:
 
 ```text
 GET  /v1/health
+GET  /v1/overview
 GET  /v1/projects
 POST /v1/projects
 GET  /v1/jobs
