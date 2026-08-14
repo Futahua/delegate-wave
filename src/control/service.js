@@ -32,8 +32,17 @@ function rejectIdentity(args) {
 export class ControlService {
   constructor({ dispatcher, pendingWaitMs = 5000 }) {
     this.dispatcher = dispatcher;
-    this.db = dispatcher.db;
     this.pendingWaitMs = pendingWaitMs;
+  }
+
+  // Read through to the dispatcher's current handle rather than caching one.
+  //
+  // Restore closes the live database and reopens a new handle over the restored file. A cached
+  // reference would still point at the closed handle, so writing the terminal receipt would fail and
+  // a fully successful restore would be reported to the caller as REQUEST_UNCERTAIN -- the single
+  // most alarming answer the API can give, on the one operation an operator runs under stress.
+  get db() {
+    return this.dispatcher.db;
   }
 
   async execute(command, args = {}, context = {}) {
@@ -89,6 +98,9 @@ export class ControlService {
     if (claim.kind === "result") return this.decodeResult(claim.result);
     if (claim.kind === "pending") return this.waitForResult(requestId);
 
+    // Kept so the receipt can be written even if the command replaced the database underneath us.
+    const intent = { command, argsDigest, principalId, originChannel, createdAt: now() };
+
     let response;
     try {
       response = await this.executeMutation(command, args, { principalId, originChannel });
@@ -96,7 +108,7 @@ export class ControlService {
       const normalized = asControlError(error);
       if (String(normalized.code).includes("UNCERTAIN")) throw this.uncertain(requestId, normalized);
       try {
-        this.recordFailedResult(requestId, normalized);
+        this.recordFailedResult(requestId, normalized, intent);
       } catch (receiptError) {
         throw this.uncertain(requestId, receiptError);
       }
@@ -104,23 +116,39 @@ export class ControlService {
     }
 
     try {
-      this.recordSucceededResult(requestId, response);
+      this.recordSucceededResult(requestId, response, intent);
     } catch (receiptError) {
       throw this.uncertain(requestId, receiptError);
     }
     return response;
   }
 
-  recordSucceededResult(requestId, response) {
+  // Restore replaces the whole database, including the intent row this request wrote a moment ago.
+  // The receipt has a foreign key to that intent, so without re-establishing it the receipt cannot
+  // land and a fully successful restore reports as uncertain. Re-inserting the intent this request
+  // genuinely made is not fabrication: it carries this request's own durable record across the swap.
+  reinstateIntent(requestId, intent) {
+    const present = this.db.prepare("SELECT 1 FROM control_request_intents WHERE request_id = ?").get(requestId);
+    if (present) return;
+    this.db.prepare(`INSERT INTO control_request_intents(
+      request_id, command, args_digest, principal_id, origin_channel, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      requestId, intent.command, intent.argsDigest, intent.principalId, intent.originChannel, intent.createdAt,
+    );
+  }
+
+  recordSucceededResult(requestId, response, intent = null) {
     transaction(this.db, () => {
+      if (intent) this.reinstateIntent(requestId, intent);
       this.db.prepare(`INSERT INTO control_request_results(
         request_id, outcome, response_json, created_at
       ) VALUES (?, 'SUCCEEDED', ?, ?)`).run(requestId, JSON.stringify(response), now());
     });
   }
 
-  recordFailedResult(requestId, error) {
+  recordFailedResult(requestId, error, intent = null) {
     transaction(this.db, () => {
+      if (intent) this.reinstateIntent(requestId, intent);
       this.db.prepare(`INSERT INTO control_request_results(
         request_id, outcome, error_code, error_message, created_at
       ) VALUES (?, 'FAILED', ?, ?, ?)`).run(requestId, error.code, error.message, now());

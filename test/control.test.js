@@ -457,3 +457,39 @@ test("distinct tokens are required across all three principals", async () => {
   }), /Proposer and observer control tokens must be distinct/);
   dispatcher.db.close();
 });
+
+// A restore that genuinely succeeded must not be reported as REQUEST_UNCERTAIN.
+//
+// Restore closes the live database and reopens a new handle over the restored file. Two things used
+// to break: the service held a cached handle that was now closed, and the intent row backing the
+// receipt's foreign key lived only in the replaced database. Both made the most reassuring possible
+// outcome -- a clean restore -- come back as the most alarming error the API has.
+test("a successful restore that swaps the database still returns a terminal receipt", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-restore-receipt-"));
+  const dataRoot = path.join(temp, "data");
+  const dispatcher = fakeDispatcher(dataRoot, {
+    restore: async function restore() {
+      // Exactly what the real restore does to the handle: close it and open a fresh one over a file
+      // that has no memory of the in-flight request.
+      this.db.close();
+      fs.rmSync(managedPaths(dataRoot).database, { force: true });
+      this.db = openDatabase(managedPaths(dataRoot).database);
+      return { restored: "backup-dir", coherent: true, files: 1, repositories: [] };
+    },
+  });
+  const service = new ControlService({ dispatcher, pendingWaitMs: 2000 });
+  t.after(() => { try { dispatcher.db.close(); } catch { /* already closed */ } });
+
+  const requestId = `req_${crypto.randomUUID()}`;
+  const response = await service.execute("backup.restore", { backup: "backup-dir" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  });
+  assert.equal(response.coherent, true, "the restore itself reports coherent");
+
+  // The receipt landed in the restored database, so replaying the same request_id is idempotent
+  // rather than uncertain -- which is what makes a retry after a restore safe.
+  const replay = await service.execute("backup.restore", { backup: "backup-dir" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  });
+  assert.deepEqual(replay, response, "replaying the request returns the recorded receipt");
+});
