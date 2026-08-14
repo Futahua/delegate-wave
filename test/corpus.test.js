@@ -97,157 +97,219 @@ test("the recorded digest covers the whole apparatus, not just the task list", a
   assert.match(recorded, /^[a-f0-9]{64}$/);
 });
 
-test("the precommitted execution order is balanced", () => {
+test("the execution policy is precommitted, balanced, and retry-free", () => {
+  const { execution } = corpus;
+  assert.ok(execution, "the corpus must precommit its execution policy");
+
+  // The experiment measures a backend's first failure, so the scheduler must not repair it.
+  assert.equal(execution.max_attempts, 1);
+  assert.ok(execution.max_attempts_rationale?.length > 20, "the retry decision must record its reason");
+  assert.ok(execution.pair_adjacency?.length > 20, "pair adjacency must be stated");
+
+  const order = execution.order;
+  assert.equal(order.length, 10, "every task must appear in the order");
+  assert.deepEqual(
+    [...order.map((entry) => entry.task)].sort(),
+    corpus.tasks.map((task) => task.id).sort(),
+    "the order must cover exactly the corpus tasks",
+  );
+  const leading = order.reduce((counts, entry) => {
+    counts[entry.first] = (counts[entry.first] ?? 0) + 1;
+    return counts;
+  }, {});
+  assert.deepEqual(leading, { opencode: 5, harness: 5 }, "each executor must lead five pairs");
+
+  // The pilot must contain one pair of each leading order, or it cannot detect an order effect.
+  assert.equal(execution.pilot.length, 2);
+  const pilotLeaders = execution.pilot.map((id) => order.find((entry) => entry.task === id).first);
+  assert.deepEqual([...pilotLeaders].sort(), ["harness", "opencode"]);
+
+  // The prose protocol must agree with the machine-readable policy.
   const protocol = fs.readFileSync(path.join(corpusRoot, "PROTOCOL.md"), "utf8");
-  const openCodeFirst = /OpenCode first\s+(.+)/.exec(protocol)[1].trim().split(/\s+/);
-  const harnessFirst = /Harness first\s+(.+)/.exec(protocol)[1].trim().split(/\s+/);
-  assert.equal(openCodeFirst.length, 5, "five pairs must run OpenCode first");
-  assert.equal(harnessFirst.length, 5, "five pairs must run Harness first");
-  assert.equal(new Set([...openCodeFirst, ...harnessFirst]).size, 10, "each task appears once");
+  assert.match(protocol, /`maxAttempts` is \*\*1\*\*/);
+  assert.match(protocol, /back to\s*\n?back/);
 });
 
-test("t01 accepts correct totals and rejects wrong arithmetic", async () => {
+test("t01 requires exactly the inventory rows and a single final total", async () => {
   const correct = "widget: 12\ngadget: 7\nsprocket: 20\nflange: 5\nTotal: 44\n";
   assert.equal((await verify("t01-csv-totals", (d) => write(d, "TOTALS.md", correct))).exitCode, 0);
-  // A plausible wrong answer: right shape, wrong sum.
-  const wrongSum = correct.replace("Total: 44", "Total: 40");
-  assert.notEqual((await verify("t01-csv-totals", (d) => write(d, "TOTALS.md", wrongSum))).exitCode, 0);
-  // Missing a row.
-  const missingRow = "widget: 12\ngadget: 7\nsprocket: 20\nTotal: 44\n";
-  assert.notEqual((await verify("t01-csv-totals", (d) => write(d, "TOTALS.md", missingRow))).exitCode, 0);
+  for (const [label, body] of [
+    ["wrong sum", correct.replace("Total: 44", "Total: 40")],
+    ["missing row", "widget: 12\ngadget: 7\nsprocket: 20\nTotal: 44\n"],
+    ["duplicated row", "widget: 12\nwidget: 12\ngadget: 7\nsprocket: 20\nflange: 5\nTotal: 44\n"],
+    // A correct total placed first, then a wrong one last: the goal says the total is the final line.
+    ["total not last", "Total: 44\nwidget: 12\ngadget: 7\nsprocket: 20\nflange: 5\nTotal: 999\n"],
+    ["invented row", "widget: 12\ngadget: 7\nsprocket: 20\nflange: 5\nbracket: 3\nTotal: 47\n"],
+  ]) {
+    assert.notEqual((await verify("t01-csv-totals", (d) => write(d, "TOTALS.md", body))).exitCode, 0, label);
+  }
 });
 
-test("t02 accepts the filtered sort and rejects a boundary or ordering error", async () => {
+test("t02 requires catalog prices, not merely ascending numbers", async () => {
   const correct = "bracket 2.00\nwidget 3.50\nsprocket 4.99\n";
   assert.equal((await verify("t02-filter-select", (d) => write(d, "CHEAP.md", correct))).exitCode, 0);
-  // Includes an item above the threshold.
-  const included = `${correct}gadget 7.25\n`;
-  assert.notEqual((await verify("t02-filter-select", (d) => write(d, "CHEAP.md", included))).exitCode, 0);
-  // Correct set, wrong order.
-  const unsorted = "sprocket 4.99\nbracket 2.00\nwidget 3.50\n";
-  assert.notEqual((await verify("t02-filter-select", (d) => write(d, "CHEAP.md", unsorted))).exitCode, 0);
+  for (const [label, body] of [
+    ["includes an item past the boundary", correct + "gadget 7.25\n"],
+    ["correct set, wrong order", "sprocket 4.99\nbracket 2.00\nwidget 3.50\n"],
+    // Right names, ascending, but the prices were never read from catalog.csv.
+    ["invented prices", "bracket 1.00\nwidget 2.00\nsprocket 3.00\n"],
+  ]) {
+    assert.notEqual((await verify("t02-filter-select", (d) => write(d, "CHEAP.md", body))).exitCode, 0, label);
+  }
 });
 
 test("t03 accepts the reshaped summary and rejects undeduplicated ports", async () => {
   const correct = JSON.stringify({ services: 3, ports: [8080, 9090] });
   assert.equal((await verify("t03-json-reshape", (d) => write(d, "config.summary.json", correct))).exitCode, 0);
-  const duplicated = JSON.stringify({ services: 3, ports: [8080, 9090, 8080] });
-  assert.notEqual((await verify("t03-json-reshape", (d) => write(d, "config.summary.json", duplicated))).exitCode, 0);
-  const miscounted = JSON.stringify({ services: 2, ports: [8080, 9090] });
-  assert.notEqual((await verify("t03-json-reshape", (d) => write(d, "config.summary.json", miscounted))).exitCode, 0);
+  for (const [label, body] of [
+    ["undeduplicated", JSON.stringify({ services: 3, ports: [8080, 9090, 8080] })],
+    ["miscounted", JSON.stringify({ services: 2, ports: [8080, 9090] })],
+    ["unsorted", JSON.stringify({ services: 3, ports: [9090, 8080] })],
+  ]) {
+    assert.notEqual((await verify("t03-json-reshape", (d) => write(d, "config.summary.json", body))).exitCode, 0, label);
+  }
 });
 
-test("t04 accepts the fix and rejects collateral damage", async () => {
+test("t04 permits only the lastIndex fix and rejects any other source change", async () => {
   const fix = (body) => body.replace("return items.length;", "return items.length - 1;");
   assert.equal((await verify("t04-bugfix-off-by-one", (d) => edit(d, "src/lib.js", fix))).exitCode, 0);
-  // Unfixed.
-  assert.notEqual((await verify("t04-bugfix-off-by-one", () => {})).exitCode, 0);
-  // Fixed, but a neighbouring function was broken on the way past.
-  const collateral = (body) => fix(body).replace("(counts[item] ?? 0) + 1", "1");
-  assert.notEqual((await verify("t04-bugfix-off-by-one", (d) => edit(d, "src/lib.js", collateral))).exitCode, 0);
+  for (const [label, mutate] of [
+    ["unfixed", (b) => b],
+    // Passes a behavioural sample of sum while destroying it for every other input.
+    ["sum stubbed to the sampled value", (b) => fix(b).replace(
+      "return numbers.reduce((total, value) => total + value, 0);", "return 6;")],
+    ["tally special-cased", (b) => fix(b).replace(
+      "for (const item of items) counts[item] = (counts[item] ?? 0) + 1;",
+      "if (items.length === 3) return { a: 2, b: 1 };\n  for (const item of items) counts[item] = (counts[item] ?? 0) + 1;")],
+    ["unrelated function added", (b) => fix(b) + "\nexport const extra = () => 1;\n"],
+  ]) {
+    assert.notEqual((await verify("t04-bugfix-off-by-one", (d) => edit(d, "src/lib.js", mutate))).exitCode, 0, label);
+  }
 });
 
-test("t05 accepts median and rejects the even-length and empty edge cases", async () => {
-  const good = `
-export function median(numbers) {
-  if (!numbers.length) return null;
-  const sorted = [...numbers].sort((a, b) => a - b);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-}
-`;
-  assert.equal((await verify("t05-add-function", (d) => edit(d, "src/lib.js", (b) => b + good))).exitCode, 0);
-  // A naive implementation that ignores even-length averaging and empty input.
-  const naive = `
-export function median(numbers) {
-  const sorted = [...numbers].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
-`;
-  assert.notEqual((await verify("t05-add-function", (d) => edit(d, "src/lib.js", (b) => b + naive))).exitCode, 0);
+test("t05 requires an append that leaves existing content byte-identical", async () => {
+  const good = [
+    "",
+    "export function median(numbers) {",
+    "  if (!numbers.length) return null;",
+    "  const sorted = [...numbers].sort((a, b) => a - b);",
+    "  const middle = Math.floor(sorted.length / 2);",
+    "  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;",
+    "}",
+    "",
+  ].join("\n");
+  const naive = [
+    "",
+    "export function median(numbers) {",
+    "  const sorted = [...numbers].sort((a, b) => a - b);",
+    "  return sorted[Math.floor(sorted.length / 2)];",
+    "}",
+    "",
+  ].join("\n");
+
+  assert.equal((await verify("t05-add-function",
+    (d) => edit(d, "src/lib.js", (b) => b + good))).exitCode, 0);
+  for (const [label, mutate] of [
+    ["naive median ignoring even-length and empty input", (b) => b + naive],
+    // Every originally checked line still appears, but an existing function was broken.
+    ["existing function modified", (b) => b.replace(
+      "export function sum(numbers) {", "export function sum(numbers) {\n  numbers = [];") + good],
+    ["nothing appended", (b) => b],
+  ]) {
+    assert.notEqual((await verify("t05-add-function", (d) => edit(d, "src/lib.js", mutate))).exitCode, 0, label);
+  }
 });
 
-test("t06 accepts a multi-site rename and rejects an alias or a stale reference", async () => {
-  const renameDefinition = (body) => body.replace("export function tally(", "export function countItems(");
-  const renameUsage = (body) => body.replace(/\btally\b/g, "countItems");
-
-  // The genuine rename must update both the definition and its downstream references.
+test("t06 permits only the rename and rejects any other behavioural change", async () => {
+  const rename = (body) => body.replace(/\btally\b/g, "countItems");
   assert.equal((await verify("t06-rename-consistent", (d) => {
-    edit(d, "src/lib.js", renameDefinition);
-    edit(d, "src/report.js", renameUsage);
+    edit(d, "src/lib.js", rename);
+    edit(d, "src/report.js", rename);
   })).exitCode, 0);
 
-  // Added under the new name but the old export was kept: not a rename.
   assert.notEqual((await verify("t06-rename-consistent", (d) => {
-    edit(d, "src/lib.js", (b) => `${b}\nexport const countItems = tally;\n`);
-  })).exitCode, 0);
+    edit(d, "src/lib.js", (b) => b + "\nexport const countItems = tally;\n");
+  })).exitCode, 0, "alias left behind");
 
-  // Definition renamed but the downstream module still imports the old name: the module breaks.
   assert.notEqual((await verify("t06-rename-consistent",
-    (d) => edit(d, "src/lib.js", renameDefinition))).exitCode, 0);
+    (d) => edit(d, "src/lib.js", rename))).exitCode, 0, "downstream reference left stale");
+
+  // Renamed correctly, but the lastIndex bug was "helpfully" fixed along the way.
+  assert.notEqual((await verify("t06-rename-consistent", (d) => {
+    edit(d, "src/lib.js", (b) => rename(b).replace("return items.length;", "return items.length - 1;"));
+    edit(d, "src/report.js", rename);
+  })).exitCode, 0, "unrelated behaviour changed");
 });
 
-test("t07 accepts the documented fields and rejects invented or incomplete API surface", async () => {
-  const section = (name, parameters, returns) => `## ${name}\nParameters: ${parameters}\nReturns: ${returns}\n`;
-  const correct = [
-    "# API", "",
-    section("lastIndex", "items", "the index of the final element of the array"),
-    section("tally", "items", "an object of counts per distinct value"),
-    section("sum", "numbers", "the arithmetic total of the numbers"),
+test("t07 requires exactly the exports with correct parameters and return categories", async () => {
+  const section = (name, parameters, returns) => "## " + name + "\nParameters: " + parameters + "\nReturns: " + returns + "\n";
+  const correct = ["# API", "",
+    section("lastIndex", "items", "number - the index of the final element"),
+    section("tally", "items", "object - counts per distinct value"),
+    section("sum", "numbers", "number - the arithmetic total"),
   ].join("\n");
   assert.equal((await verify("t07-doc-from-code", (d) => write(d, "API.md", correct))).exitCode, 0);
 
-  // Documents a function that does not exist.
-  const confabulated = `${correct}\n${section("median", "numbers", "the middle value of the numbers")}`;
-  assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", confabulated))).exitCode, 0);
-
-  // Omits an export.
-  const partial = ["# API", "", section("lastIndex", "items", "the last index of the array"),
-    section("sum", "numbers", "the total of the numbers")].join("\n");
-  assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", partial))).exitCode, 0);
-
-  // Sections present but the required fields are missing: prose instead of the requested format.
-  const prose = "# API\n\n## lastIndex\nReturns the last index.\n\n## tally\nCounts.\n\n## sum\nAdds.\n";
-  assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", prose))).exitCode, 0);
-
-  // Wrong parameter name: the worker did not actually read the source.
-  const wrongParameter = correct.replace("Parameters: numbers", "Parameters: values");
-  assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", wrongParameter))).exitCode, 0);
+  for (const [label, body] of [
+    ["invented section", correct + "\n" + section("median", "numbers", "number - the middle value")],
+    // Any invented name must fail, not merely the one the verifier happens to name.
+    ["differently invented section", correct + "\n" + section("imaginaryFunction", "x", "number - a value")],
+    ["omitted export", ["# API", "", section("lastIndex", "items", "number - the last index"),
+      section("sum", "numbers", "number - the total")].join("\n")],
+    ["prose instead of the requested fields",
+      "# API\n\n## lastIndex\nReturns the last index.\n\n## tally\nCounts.\n\n## sum\nAdds.\n"],
+    // 'notitems' contains 'items' as a substring but is not the parameter name.
+    ["wrong parameter name", correct.replace("Parameters: items", "Parameters: notitems")],
+    ["vacuous return description", correct.replace("number - the arithmetic total", "does not return anything")],
+    ["wrong return category", correct.replace("object - counts per distinct value", "number - counts per distinct value")],
+  ]) {
+    assert.notEqual((await verify("t07-doc-from-code", (d) => write(d, "API.md", body))).exitCode, 0, label);
+  }
 });
 
-test("t08 accepts the cleaned copy and rejects reordering or in-place mutation", async () => {
+test("t08 requires each blank run collapsed to exactly one blank line", async () => {
   const correct = "first line\n\nsecond line\n\nthird line\n";
   assert.equal((await verify("t08-text-transform", (d) => write(d, "notes.clean.md", correct))).exitCode, 0);
-  // Content reordered.
-  const reordered = "third line\n\nsecond line\n\nfirst line\n";
-  assert.notEqual((await verify("t08-text-transform", (d) => write(d, "notes.clean.md", reordered))).exitCode, 0);
-  // Cleaned the source in place instead of producing a new file.
-  assert.notEqual((await verify("t08-text-transform", (d) => {
-    write(d, "notes.clean.md", correct);
-    write(d, "notes.md", correct);
-  })).exitCode, 0);
+  for (const [label, body, alsoEditSource] of [
+    // All blank lines removed rather than collapsed: fewer blanks, not the requested transformation.
+    ["blank lines deleted", "first line\nsecond line\nthird line\n", false],
+    ["reordered", "third line\n\nsecond line\n\nfirst line\n", false],
+    ["trailing whitespace left", "first line   \n\nsecond line\n\nthird line\n", false],
+    ["source cleaned in place", correct, true],
+  ]) {
+    assert.notEqual((await verify("t08-text-transform", (d) => {
+      write(d, "notes.clean.md", body);
+      if (alsoEditSource) write(d, "notes.md", correct);
+    })).exitCode, 0, label);
+  }
 });
 
-test("t09 accepts the join and rejects including unmatched items", async () => {
+test("t09 requires the exact requested format, not merely the right numbers", async () => {
   const correct = "widget 12 x 3.50 = 42.00\ngadget 7 x 7.25 = 50.75\nsprocket 20 x 4.99 = 99.80\n";
   assert.equal((await verify("t09-two-file-join", (d) => write(d, "REPORT.md", correct))).exitCode, 0);
-  // An outer join: flange has no price.
-  const outer = `${correct}flange 5 x 0.00 = 0.00\n`;
-  assert.notEqual((await verify("t09-two-file-join", (d) => write(d, "REPORT.md", outer))).exitCode, 0);
-  // Right shape, wrong arithmetic.
-  const wrongMath = correct.replace("= 42.00", "= 40.00");
-  assert.notEqual((await verify("t09-two-file-join", (d) => write(d, "REPORT.md", wrongMath))).exitCode, 0);
+  for (const [label, body] of [
+    ["outer join", correct + "flange 5 x 0.00 = 0.00\n"],
+    ["wrong arithmetic", correct.replace("= 42.00", "= 40.00")],
+    // Right numbers, wrong format: no separators and a one-decimal price.
+    ["separators dropped", "widget 12 3.5 42\ngadget 7 7.25 50.75\nsprocket 20 4.99 99.80\n"],
+    ["total not two decimals", correct.replace("= 42.00", "= 42")],
+  ]) {
+    assert.notEqual((await verify("t09-two-file-join", (d) => write(d, "REPORT.md", body))).exitCode, 0, label);
+  }
 });
 
-test("t10 accepts the minimal edit and rejects tidying the file on the way past", async () => {
+test("t10 requires the original bytes plus exactly one appended line", async () => {
   assert.equal((await verify("t10-constrained-edit",
-    (d) => edit(d, "notes.md", (b) => `${b}# end\n`))).exitCode, 0);
-  // Appended correctly, but trailing whitespace was helpfully removed.
-  assert.notEqual((await verify("t10-constrained-edit",
-    (d) => edit(d, "notes.md", (b) => `${b.replace(/[ \t]+$/gm, "")}# end\n`))).exitCode, 0);
-  // Appended correctly, but blank runs were collapsed.
-  assert.notEqual((await verify("t10-constrained-edit",
-    (d) => edit(d, "notes.md", (b) => `${b.replace(/\n{3,}/g, "\n\n")}# end\n`))).exitCode, 0);
+    (d) => edit(d, "notes.md", (b) => b + "# end\n"))).exitCode, 0);
+  for (const [label, mutate] of [
+    ["trailing whitespace tidied", (b) => b.replace(/[ \t]+$/gm, "") + "# end\n"],
+    ["blank runs collapsed", (b) => b.replace(/\n{3,}/g, "\n\n") + "# end\n"],
+    // An extra line smuggled in before the authorized one.
+    ["extra line inserted", (b) => b + "# note\n# end\n"],
+    ["appended without the newline", (b) => b + "# end"],
+  ]) {
+    assert.notEqual((await verify("t10-constrained-edit", (d) => edit(d, "notes.md", mutate))).exitCode, 0, label);
+  }
 });
 
 test("a standalone fixture repository preserves bytes and hides the verifiers", async (t) => {

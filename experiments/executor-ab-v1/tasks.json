@@ -6,6 +6,7 @@
     "Each task is run once per executor from the same base commit, goal, and validation plan.",
     "Verifiers live outside the attempt worktree. A worker must never be able to read the acceptance criteria instead of solving the task.",
     "Validation must exercise the task's own deliverable. A plan that passes without testing what was asked for makes first-pass rate optimistic for both executors.",
+    "Where a task has a deterministic output, its verifier derives the complete expected result from the frozen fixture and compares exactly. Sampling properties leaves room for an answer that satisfies the checks while violating the task statement.",
     "Validation must reject a plausible wrong answer, not merely a missing file.",
     "No task may be edited after either executor has run it. If a task proves defective, discard the pair and restart it.",
     "None of these tasks may be used for provider or measurement calibration; that uses a separate throwaway task."
@@ -13,7 +14,7 @@
   "tasks": [
     {
       "id": "t01-csv-totals",
-      "goal": "Create TOTALS.md containing one line per row of inventory.csv in the form '<item>: <qty>', then a final line 'Total: <sum>' with the arithmetic sum of the qty column.",
+      "goal": "Create TOTALS.md with one line per row of inventory.csv in the form '<item>: <qty>', in the order they appear, and nothing else except a final line 'Total: <sum>' holding the arithmetic sum of the qty column.",
       "deliverable": "TOTALS.md",
       "shape": "arithmetic over a small table",
       "verifier": "t01.js"
@@ -41,7 +42,7 @@
     },
     {
       "id": "t05-add-function",
-      "goal": "Add an exported function named median to src/lib.js that returns the median of an array of numbers, averaging the two middle values for even-length input and returning null for an empty array. Do not modify existing functions.",
+      "goal": "Append an exported function named median to src/lib.js that returns the median of an array of numbers, averaging the two middle values for even-length input and returning null for an empty array. Append only: do not change any existing content of the file.",
       "deliverable": "src/lib.js",
       "shape": "additive API change with edge cases",
       "verifier": "t05.js"
@@ -55,7 +56,7 @@
     },
     {
       "id": "t07-doc-from-code",
-      "goal": "Create API.md with one '## <name>' section per exported function in src/lib.js. Each section must contain a line 'Parameters: <names>' listing its parameter names and a line 'Returns: <description>' describing what it returns.",
+      "goal": "Create API.md with exactly one '## <name>' section per exported function in src/lib.js and no others. Each section must contain a line 'Parameters: <names>' listing its parameter names in order, and a line 'Returns: <category> - <description>' where category is one of number, string, boolean, object, array, null.",
       "deliverable": "API.md",
       "shape": "read code, produce accurate prose",
       "verifier": "t07.js"
@@ -69,14 +70,14 @@
     },
     {
       "id": "t09-two-file-join",
-      "goal": "Create REPORT.md joining inventory.csv and catalog.csv on the item name, one line per item present in both as '<item> <qty> x <price> = <total>' with total rounded to two decimals.",
+      "goal": "Create REPORT.md joining inventory.csv and catalog.csv on the item name, including only items present in both, in inventory order, one line each as '<item> <qty> x <price> = <total>' with price and total written to exactly two decimals.",
       "deliverable": "REPORT.md",
       "shape": "join across two sources with computation",
       "verifier": "t09.js"
     },
     {
       "id": "t10-constrained-edit",
-      "goal": "Add a trailing newline and a final line '# end' to notes.md without altering any existing line of that file.",
+      "goal": "Append a final line '# end' to notes.md. Change nothing else in the file: every existing byte must be preserved exactly.",
       "deliverable": "notes.md",
       "shape": "minimal edit under a strict no-collateral constraint",
       "verifier": "t10.js"
@@ -88,5 +89,56 @@
   "notes": [
     "The runner resolves <VERIFIER_ROOT> to an absolute path outside the attempt worktree and runs the command with the worktree as the working directory.",
     "A relative validate command is deliberately not stored here: it would encode an assumption about where the worktree sits relative to the verifiers, which does not hold for a real attempt worktree."
-  ]
+  ],
+  "execution": {
+    "max_attempts": 1,
+    "max_attempts_rationale": "A backend's first failure is what the experiment measures. Allowing the scheduler to retry would let it repair a weak executor and hide the difference; retry economics is a separate later experiment.",
+    "pair_adjacency": "Each pair runs back to back in the listed order before the next pair begins, so provider and cache state drift affects both arms of a pair equally.",
+    "order": [
+      {
+        "task": "t01-csv-totals",
+        "first": "opencode"
+      },
+      {
+        "task": "t02-filter-select",
+        "first": "harness"
+      },
+      {
+        "task": "t03-json-reshape",
+        "first": "opencode"
+      },
+      {
+        "task": "t04-bugfix-off-by-one",
+        "first": "harness"
+      },
+      {
+        "task": "t05-add-function",
+        "first": "opencode"
+      },
+      {
+        "task": "t06-rename-consistent",
+        "first": "harness"
+      },
+      {
+        "task": "t07-doc-from-code",
+        "first": "opencode"
+      },
+      {
+        "task": "t08-text-transform",
+        "first": "harness"
+      },
+      {
+        "task": "t09-two-file-join",
+        "first": "opencode"
+      },
+      {
+        "task": "t10-constrained-edit",
+        "first": "harness"
+      }
+    ],
+    "pilot": [
+      "t01-csv-totals",
+      "t02-filter-select"
+    ]
+  }
 }

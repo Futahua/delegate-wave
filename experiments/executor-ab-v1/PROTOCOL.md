@@ -22,8 +22,14 @@ edit to a fixture or verifier invisible, which defeats preregistration. The merg
 is recorded alongside results, so Git provides an independent second identity for the frozen
 apparatus.
 
+Where a task has a deterministic output, its verifier derives the complete expected result from the
+frozen fixture and compares it exactly; where a task edits source, the verifier compares against the
+explicitly permitted transformation of the frozen source. Sampling a few properties leaves room for
+an answer that satisfies every check while violating the task statement, and adding counterexamples
+one at a time never closes that gap.
+
 Every verifier is proven bidirectional in `test/corpus.test.js`: it accepts a correct solution and
-rejects at least two plausible wrong answers. A verifier that passes whatever it is given makes
+rejects plausible wrong answers. A verifier that passes whatever it is given makes
 first-pass validation rate optimistic for both executors equally, so the comparison would look clean
 and mean nothing. That failure mode was found in the earlier baseline, where a task's deliverable was
 never tested by its own validation plan.
@@ -68,15 +74,29 @@ filter.
 Each task runs once per executor from the same base commit, with the same goal and the same
 validation plan, in a fresh worktree. Twenty runs total.
 
+`maxAttempts` is **1**. A backend's first failure is what the experiment measures; letting the
+scheduler retry would repair a weak executor and hide the difference. Retry economics is a separate
+later experiment.
+
 Execution order is precommitted and balanced, because provider latency and cache state drift during a
-run and always running one backend first would confound the comparison:
+run and always running one backend first would confound the comparison. Each pair runs **back to
+back** in this order, both arms before the next pair begins, so drift affects both arms equally:
 
 ```text
-OpenCode first   t01  t03  t05  t07  t09
-Harness first    t02  t04  t06  t08  t10
+pair  task                    order
+ 1    t01-csv-totals          OpenCode -> Harness
+ 2    t02-filter-select       Harness  -> OpenCode
+ 3    t03-json-reshape        OpenCode -> Harness
+ 4    t04-bugfix-off-by-one   Harness  -> OpenCode
+ 5    t05-add-function        OpenCode -> Harness
+ 6    t06-rename-consistent   Harness  -> OpenCode
+ 7    t07-doc-from-code       OpenCode -> Harness
+ 8    t08-text-transform      Harness  -> OpenCode
+ 9    t09-two-file-join       OpenCode -> Harness
+10    t10-constrained-edit    Harness  -> OpenCode
 ```
 
-The two-pair pilot uses t01 and t02, one of each order.
+The pilot is pairs 1 and 2, one leading with each executor.
 
 A pilot of two pairs runs first. Its purpose is instrumentation, not performance: it must show that
 both executors produce complete usage receipts, that cache-read units mean the same thing on both

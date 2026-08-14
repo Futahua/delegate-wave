@@ -13,7 +13,9 @@ import { fileURLToPath } from "node:url";
 
 export const APPARATUS_ROOT = path.dirname(fileURLToPath(import.meta.url));
 
-const EXCLUDED = new Set(["DIGEST", "digest.mjs"]);
+// Only DIGEST is excluded, because a file cannot contain its own hash. This script is included: it
+// defines how the apparatus is hashed, so a change to it changes what "frozen" means.
+const EXCLUDED = new Set(["DIGEST"]);
 
 function walk(directory, base = directory) {
   const found = [];

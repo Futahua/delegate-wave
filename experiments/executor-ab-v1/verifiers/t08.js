@@ -1,13 +1,16 @@
-import { requireFile, read, fail, pass } from "./_harness.js";
+import { baseline, expectExact, expectUntouched, pass } from "./_harness.js";
 
-const body = requireFile("notes.clean.md");
-const got = body.split(/\r?\n/);
-if (got.some((l) => /\s$/.test(l))) fail("a line still has trailing whitespace");
-if (/\n[ \t]*\n[ \t]*\n/.test(body)) fail("a run of blank lines was not collapsed");
-const content = got.filter((l) => l.trim());
-if (JSON.stringify(content) !== JSON.stringify(["first line", "second line", "third line"])) {
-  fail(`content or order changed: ${JSON.stringify(content)}`);
-}
-// The task asks for a new file, so the source must survive untouched.
-if (!/\n\n\n/.test(read("notes.md"))) fail("notes.md itself was modified");
-pass("notes.clean.md trimmed and collapsed with order preserved");
+// The transformation is deterministic, so the whole output is derived from the frozen source and
+// compared exactly. Checking only that "there are not too many blank lines" would accept an answer
+// that deleted every blank line instead of collapsing each run to one.
+const source = baseline("notes.md");
+const expected = source
+  .split("\n")
+  .map((line) => line.replace(/[ \t]+$/, ""))
+  .join("\n")
+  .replace(/\n{3,}/g, "\n\n");
+
+expectExact("notes.clean.md", expected);
+// The task asks for a new file, so the source must survive byte-identically.
+expectUntouched("notes.md");
+pass("notes.clean.md is exactly the trimmed, collapsed source with notes.md untouched");
