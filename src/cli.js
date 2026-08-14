@@ -41,6 +41,7 @@ Commands:
   supervisor stop
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
+  supervisor add-role --role proposer   seal one new credential role into the existing store
   proposal list [--project ID]   list Hermes work proposals awaiting a decision
   proposal show --id ID
   proposal authorize --id ID     authorize one proposal into a job (operator only)
@@ -102,9 +103,13 @@ async function main() {
       print(await supervisor.migrateSecrets());
       return;
     }
+    if (action === "add-role") {
+      print(await supervisor.addSecretRole(required(options, "role")));
+      return;
+    }
     if (!["install", "status", "start", "stop", "uninstall"].includes(action)) {
       throw new Error(
-        "Unknown supervisor command; use install, status, start, stop, uninstall, or migrate-secrets",
+        "Unknown supervisor command; use install, status, start, stop, uninstall, migrate-secrets, or add-role",
       );
     }
     print(await supervisor[action]());

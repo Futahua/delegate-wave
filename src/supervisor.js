@@ -375,6 +375,34 @@ export class DpapiSecretStore {
     return { provisioned: true, path: this.path };
   }
 
+  // Seals one new role into an existing scoped store. Other roles are copied as ciphertext, so this
+  // never decrypts a credential it is not adding -- adding the proposal role does not expose the
+  // operator or observer secrets.
+  async addRole(role, env = process.env) {
+    requireWindows(this.platform);
+    const record = SECRET_RECORDS[role];
+    if (!record) throw new Error(`Unknown protected credential role: ${role}`);
+    if (!this.exists()) throw new Error(`Protected supervisor credential store is missing: ${this.path}`);
+    if (this.isLegacyFormat()) {
+      throw new Error(
+        `Protected credential store at ${this.path} is in the legacy combined format. `
+        + "Run 'delegate-wave supervisor migrate-secrets' before adding a role.",
+      );
+    }
+
+    const values = Object.fromEntries(record.names
+      .filter((name) => env[name])
+      .map((name) => [name, env[name]]));
+    if (!values[record.token]) throw new Error(`${record.token} is required to add the ${role} credential`);
+
+    const records = { ...this.readRecords() };
+    if (records[role]) return { added: false, role, path: this.path };
+    records[role] = await this.protect(values);
+    this.writeStore(records);
+    for (const name of record.names) delete env[name];
+    return { added: true, role, path: this.path };
+  }
+
   // Decrypts exactly one role's record. A process that loads the observer credential never holds
   // ciphertext-to-plaintext authority over the operator credential.
   async load(role) {
@@ -499,6 +527,14 @@ export class WindowsSupervisor {
   async migrateSecrets() {
     requireWindows(this.platform);
     return this.secretStore.migrateLegacyStore();
+  }
+
+  // Adds one role to an existing scoped store without requiring the other roles' plaintext, which
+  // only exists inside DPAPI after provisioning. Existing records are carried across as sealed
+  // ciphertext and are never decrypted.
+  async addSecretRole(role, env = process.env) {
+    requireWindows(this.platform);
+    return this.secretStore.addRole(role, env);
   }
 
   // The supervised API serves both principals, so it is the one process entitled to decrypt both

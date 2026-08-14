@@ -557,3 +557,48 @@ test("provisioning still succeeds without the optional proposer credential", asy
   assert.equal(result.provisioned, true);
   assert.deepEqual(store.missingRequiredRecords(), []);
 });
+
+test("adding a role seals it without decrypting the existing credentials", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-add-role-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+  const before = JSON.parse(fs.readFileSync(store.path, "utf8")).records;
+
+  const environment = { DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "proposer-secret-must-not-leak" };
+  assert.deepEqual(await store.addRole("proposer", environment), {
+    added: true, role: "proposer", path: store.path,
+  });
+
+  // Nothing was decrypted: the operator and observer ciphertexts were carried across untouched.
+  assert.deepEqual(processRunner.decrypted, []);
+  const after = JSON.parse(fs.readFileSync(store.path, "utf8")).records;
+  assert.equal(after.operator, before.operator);
+  assert.equal(after.observer, before.observer);
+  assert.ok(after.proposer);
+  assert.equal("DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN" in environment, false, "plaintext must be cleared");
+
+  assert.deepEqual(await store.load("proposer"), {
+    DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "proposer-secret-must-not-leak",
+  });
+  assert.equal(store.hasRecord("proposer"), true);
+});
+
+test("adding a role is idempotent and validates its inputs", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-add-role-guard-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const processRunner = recordingDpapiRunner();
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+
+  await assert.rejects(store.addRole("proposer", {}), /DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN is required/);
+  await assert.rejects(store.addRole("nonsense", {}), /Unknown protected credential role/);
+
+  await store.addRole("proposer", { DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "first" });
+  const sealed = fs.readFileSync(store.path, "utf8");
+  assert.deepEqual(await store.addRole("proposer", { DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "second" }), {
+    added: false, role: "proposer", path: store.path,
+  });
+  assert.equal(fs.readFileSync(store.path, "utf8"), sealed, "an existing role must not be silently replaced");
+});
