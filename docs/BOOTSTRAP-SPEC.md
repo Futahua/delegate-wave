@@ -105,6 +105,14 @@ non-integral or negative dimensions, a positive step count under `UNKNOWN`, and 
 provenance disagrees with it. An invalid observation MUST become a visible capture failure rather
 than a plausible but corrupt receipt.
 
+**WRK-011** The five usage dimensions -- input, output, reasoning, cache-read, cache-write -- MUST be
+disjoint, and `output_tokens` MUST mean non-reasoning generated output. Providers disagree on this:
+some report reasoning tokens separately from generated output, while the DeepSeek wire protocol
+reports reasoning as a subset of its completion total. A backend adapter MUST convert to the
+canonical disjoint form, and MUST record a malformed observation rather than a plausible one when the
+provider's report is incoherent. Pricing MUST remain backend-independent: the same real usage MUST
+cost the same regardless of which executor reported it.
+
 **WRK-004** Every executor attempt MUST have a dispatcher-resolved, provider-qualified model
 persisted before the attempt launches. An execution backend MUST fail closed rather than fall back to
 an ambient model or provider, so a caller that bypasses dispatcher routing cannot reopen
@@ -167,6 +175,7 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | WRK-008 | `pricing.js` pinned append-only bases; separate reported and reference columns with cost provenance | separate-facts receipt test; unknown-model, unknown-basis, and unpriced-cache-write null tests; published-rate check; superseded-basis test |
 | WRK-009 | `recordAttemptUsage` emits `USAGE_RECEIPT_FAILED`; `usageCoverage` separates accounted from healthy and scopes to `EXECUTOR_INTENDED` | capture-failure invalidates health test; unexplained-gap test; pre-executor-attempt exclusion test |
 | WRK-010 | `assertValidObservation` runs in the finalizer before any receipt is written | finalizer rejection test; invalid-backend-observation dispatcher test; conflicting-duplicate-id test |
+| WRK-011 | `canonicalizeNestedReasoning` converts subset-style reports; pricing sums disjoint dimensions | nested-reasoning canonicalization test; cross-arm equal-pricing test proving the naive mapping inflates one arm |
 | VAL-004 | absence of integration command | interface conformance review |
 | VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 

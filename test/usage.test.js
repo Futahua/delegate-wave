@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
-  COST_SOURCE_EXECUTOR, finalizeUsageReceipt, observeOpenCodeArtifact, parseOpenCodeUsage,
+  canonicalizeNestedReasoning, COST_SOURCE_EXECUTOR, finalizeUsageReceipt, observeOpenCodeArtifact,
+  parseOpenCodeUsage,
   USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN,
 } from "../src/usage.js";
 import { DEFAULT_PRICING_BASIS, PRICING_BASES, pricedModelName, referenceCostUsd } from "../src/pricing.js";
@@ -346,4 +347,53 @@ test("cost provenance must name a source, not merely be non-null", () => {
   assert.throws(() => finalize({ ...base, reported_cost_source: "   " }), /non-empty string/);
   assert.throws(() => finalize({ ...base, reported_cost_source: 42 }), /non-empty string/);
   assert.ok(finalize({ ...base, reported_cost_source: COST_SOURCE_EXECUTOR }).reported_cost_source);
+});
+
+test("nested reasoning tokens are canonicalized so pricing cannot double-count them", () => {
+  // The DeepSeek wire protocol reports reasoning INSIDE completion_tokens, while OpenCode reports
+  // the two as disjoint figures. Verified empirically on the OpenCode Go route: a response with
+  // completion_tokens 40 and reasoning_tokens 21 carried roughly 19 tokens of visible content.
+  assert.deepEqual(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: 21 }),
+    { output_tokens: 19, reasoning_tokens: 21 });
+  assert.deepEqual(canonicalizeNestedReasoning({ completionTokens: 10, reasoningTokens: 0 }),
+    { output_tokens: 10, reasoning_tokens: 0 });
+
+  // Incoherent reports become malformed observations rather than plausible wrong numbers.
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 5, reasoningTokens: 9 }), null);
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: -1, reasoningTokens: 0 }), null);
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 1.5, reasoningTokens: 0 }), null);
+
+  // The wire field is optional. Absent reasoning evidence must not become an observation of zero
+  // reasoning: the caller decides whether absence means "thinking was disabled" or "incomplete".
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40 }), null,
+    "a missing reasoning count is incomplete evidence, not zero");
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: undefined }), null);
+  assert.equal(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: null }), null);
+  // An adapter that knows thinking was disabled may still state zero explicitly.
+  assert.deepEqual(canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: 0 }),
+    { output_tokens: 40, reasoning_tokens: 0 });
+});
+
+test("two arms reporting the same real usage price identically", () => {
+  // The whole point of the canonical form: an executor's reporting convention must not change the
+  // measured cost. Both describe one response with 19 non-reasoning and 21 reasoning tokens.
+  const openCodeStyle = {
+    input_tokens: 1000, output_tokens: 19, reasoning_tokens: 21,
+    cache_read_tokens: 500, cache_write_tokens: 0,
+  };
+  const fromWire = canonicalizeNestedReasoning({ completionTokens: 40, reasoningTokens: 21 });
+  const harnessStyle = {
+    input_tokens: 1000, ...fromWire, cache_read_tokens: 500, cache_write_tokens: 0,
+  };
+
+  const a = referenceCostUsd(openCodeStyle, { model: "opencode-go/deepseek-v4-flash" });
+  const b = referenceCostUsd(harnessStyle, { model: "deepseek-official/deepseek-v4-flash" });
+  assert.equal(a.reference_cost_usd, b.reference_cost_usd,
+    "the same real usage must cost the same regardless of which executor reported it");
+
+  // The bug this guards: copying completion_tokens into output_tokens while also reporting
+  // reasoning would price 21 tokens twice.
+  const doubleCounted = { ...openCodeStyle, output_tokens: 40 };
+  assert.ok(referenceCostUsd(doubleCounted, { model: "deepseek-v4-flash" }).reference_cost_usd
+    > a.reference_cost_usd, "the naive mapping would inflate the Harness arm");
 });

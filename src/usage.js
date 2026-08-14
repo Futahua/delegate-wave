@@ -23,7 +23,35 @@ const EMPTY_TOKENS = Object.freeze({
 // executor metadata rather than a commercial difference.
 export const COST_SOURCE_EXECUTOR = "executor-computed";
 
+// The five receipt dimensions are DISJOINT: each token is counted in exactly one of them, and
+// `output_tokens` means non-reasoning generated output.
+//
+// This has to be stated because providers disagree. OpenCode reports output and reasoning as
+// separate figures that sum with input and cache to the total. The DeepSeek wire protocol, and
+// therefore Harness, reports reasoning as a SUBSET of completion tokens. A backend adapter that
+// copied a wire `completion_tokens` into `output_tokens` while also reporting `reasoning_tokens`
+// would have every reasoning token priced twice, silently inflating that arm's cost.
+//
+// An adapter converts to the canonical form; pricing stays backend-independent.
 const TOKEN_DIMENSIONS = Object.freeze(["input", "output", "reasoning", "cache_read", "cache_write"]);
+
+// Converts a provider report whose reasoning tokens are counted inside its completion total into the
+// canonical disjoint form. Returns null when the report is incoherent OR incomplete, so the caller
+// records a malformed observation rather than a plausible but wrong one.
+//
+// reasoningTokens is deliberately NOT defaulted. The wire field is optional, so defaulting it to
+// zero would turn absent evidence into an observation of no reasoning -- the same substitution this
+// contract forbids everywhere else. Absence is the caller's decision to interpret:
+//
+//   count present                          canonicalize normally
+//   absent, thinking explicitly disabled   the adapter may supply an explicit 0
+//   absent, thinking enabled               incomplete evidence: PARTIAL, not zero
+export function canonicalizeNestedReasoning({ completionTokens, reasoningTokens }) {
+  if (!Number.isInteger(completionTokens) || completionTokens < 0) return null;
+  if (!Number.isInteger(reasoningTokens) || reasoningTokens < 0) return null;
+  if (reasoningTokens > completionTokens) return null;
+  return { output_tokens: completionTokens - reasoningTokens, reasoning_tokens: reasoningTokens };
+}
 
 // Integral, not merely finite: truncating a fractional count would launder malformed evidence past
 // the finalizer's validation, making WRK-010 true only for backend-supplied observations.
