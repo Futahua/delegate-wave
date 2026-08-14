@@ -23,8 +23,13 @@ list_projects error    false
 structured result      object
 ```
 
-The deterministic suite passes 58/58 tests, including observer read success, observer mutation
+After the credential hardening, a further installed-SDK probe launched the MCP process with both
+`OPERATOR` and `OBSERVER` present. The HTTP harness observed exactly `Bearer OBSERVER`; the call
+passed, and the operator credential was not selected.
+
+The deterministic suite passes 60/60 tests, including observer read success, observer mutation
 rejection before dispatcher invocation, unequal credential enforcement, bounded tool discovery,
-and newline-delimited JSON-RPC lifecycle/call behavior.
+missing-token operator-fallback rejection, 20-job summary bounds, and newline-delimited JSON-RPC
+lifecycle/call behavior.
 
 No model call or model cost was used for this slice.

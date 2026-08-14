@@ -15,7 +15,8 @@ get_integration
 ```
 
 No tool creates or runs work, grants approval, integrates code, reconciles state, or changes policy.
-The Control API independently enforces this boundary with a distinct observer bearer credential;
+Project summaries include only the 20 most recent jobs plus total/truncation metadata. The Control
+API independently enforces the authority boundary with a distinct observer bearer credential;
 even a forged MCP `tools/call` for a mutation cannot cross the HTTP command boundary.
 
 ## Start the Control API
@@ -57,7 +58,8 @@ mcp_servers:
 ```
 
 Hermes registers these as `mcp_delegate_wave_<tool>`. If the Control API is down, calls fail without
-falling back to direct state access.
+falling back to direct state access. Startup also fails if the Hermes token is missing or equals an
+inherited operator token; there is no operator-token fallback.
 
 ## Deferred mutation boundary
 

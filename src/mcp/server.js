@@ -10,7 +10,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: "get_project_summary",
-    description: "Get one project and its jobs. Read-only; does not start work.",
+    description: "Get one project and its 20 most recent jobs with total/truncation metadata. Read-only; does not start work.",
     inputSchema: {
       type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"], additionalProperties: false,
     },
@@ -37,6 +37,7 @@ const TOOLS = Object.freeze([
 ]);
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const PROJECT_SUMMARY_JOB_LIMIT = 20;
 
 function requiredString(args, name) {
   if (typeof args?.[name] !== "string" || !args[name].trim()) throw new Error(`${name} must be a non-empty string`);
@@ -56,7 +57,12 @@ export class HermesMcpAdapter {
       const project = projects.find((item) => item.id === projectId);
       if (!project) throw new Error(`Unknown project: ${projectId}`);
       const jobs = await this.client.get(`/v1/jobs?projectId=${encodeURIComponent(projectId)}`);
-      return { project, jobs };
+      return {
+        project,
+        recent_jobs: jobs.slice(0, PROJECT_SUMMARY_JOB_LIMIT),
+        total_jobs: jobs.length,
+        truncated: jobs.length > PROJECT_SUMMARY_JOB_LIMIT,
+      };
     }
     if (name === "get_job") return this.client.get(`/v1/jobs/${encodeURIComponent(requiredString(args, "job_id"))}`);
     if (name === "get_attention_needed") return this.client.get("/v1/attention");
@@ -67,10 +73,23 @@ export class HermesMcpAdapter {
 
 function send(output, message) { output.write(`${JSON.stringify(message)}\n`); }
 
+export function hermesControlClient(environment = process.env) {
+  const token = environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
+  if (!token) throw new Error("DELEGATE_WAVE_HERMES_CONTROL_TOKEN is required");
+  if (environment.DELEGATE_WAVE_CONTROL_TOKEN && token === environment.DELEGATE_WAVE_CONTROL_TOKEN) {
+    throw new Error("Hermes credential must not equal operator credential");
+  }
+  delete environment.DELEGATE_WAVE_CONTROL_TOKEN;
+  return new ControlClient({
+    baseUrl: environment.DELEGATE_WAVE_CONTROL_URL,
+    token,
+  });
+}
+
 export function runMcpStdio({
   input = process.stdin,
   output = process.stdout,
-  client = new ControlClient({ token: process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN }),
+  client = hermesControlClient(),
 } = {}) {
   const adapter = new HermesMcpAdapter({ client });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });

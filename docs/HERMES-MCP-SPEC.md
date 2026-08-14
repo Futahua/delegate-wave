@@ -21,6 +21,12 @@ use stderr.
 **MCP-008** Adding mutating Hermes tools requires a separate authority specification and MUST NOT be
 implemented by giving Hermes the operator credential.
 
+**MCP-009** The Hermes credential MUST be explicitly present and MUST NOT fall back to or equal the
+operator credential. The MCP process MUST discard an accidentally inherited operator credential.
+
+**MCP-010** Project summaries MUST include at most the 20 most recent jobs and MUST report the total
+job count and whether the result was truncated.
+
 ## Traceability
 
 | Rules | Enforced by | Tested by |
@@ -29,3 +35,5 @@ implemented by giving Hermes the operator credential.
 | MCP-003–005 | observer authentication branch in Control server | observer query/mutation and equal-token tests |
 | MCP-006–007 | `runMcpStdio` JSON-RPC loop | stdio lifecycle/tool-call tests |
 | MCP-008 | absent mutation tools and documentation | adapter surface test |
+| MCP-009 | `hermesControlClient` fail-closed credential construction | factory and production-process fallback tests |
+| MCP-010 | bounded project-summary projection | 23-job summary test |
