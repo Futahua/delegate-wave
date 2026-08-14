@@ -598,7 +598,7 @@ test("reconciliation fails closed for durable validation intent without a PID re
   assert.equal(service.status(job.id).attempts[0].validation_state, "PENDING");
 });
 
-test("a schema 9 database migrates to 10 with the work proposal objects", async (t) => {
+test("a legacy database migrates forward to the current schema with the work proposal objects", async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-schema-9-"));
   const root = path.join(temp, "data");
   initializeDataRoot(root);
@@ -622,7 +622,8 @@ test("a schema 9 database migrates to 10 with the work proposal objects", async 
 
   const upgraded = openDatabase(file);
   t.after(() => { upgraded.close(); fs.rmSync(temp, { recursive: true, force: true }); });
-  assert.equal(upgraded.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, "10");
+  // Asserted against the constant so a later schema bump does not require editing this test.
+  assert.equal(upgraded.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
 
   const names = (type) => upgraded.prepare("SELECT name FROM sqlite_master WHERE type = ?").all(type)
     .map((row) => row.name);
@@ -644,7 +645,7 @@ test("a fresh database is created at the current schema version", async (t) => {
   const db = openDatabase(managedPaths(root).database);
   t.after(() => { db.close(); fs.rmSync(temp, { recursive: true, force: true }); });
   assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, "10");
+  assert.equal(Number(SCHEMA_VERSION) >= 11, true, "work proposals and usage receipts require schema 11+");
 });
 
 test("a job without --model resolves to DeepSeek Flash and persists the resolved model", async (t) => {
@@ -705,4 +706,379 @@ test("explicit review and escalation lanes stay distinct from the default", () =
   assert.equal(REVIEW_MODEL, "opencode-go/gpt-5.6-luna");
   assert.equal(ESCALATION_MODEL, "opencode-go/deepseek-v4-pro");
   assert.equal(new Set([DEFAULT_WORKER_MODEL, REVIEW_MODEL, ESCALATION_MODEL]).size, 3);
+});
+
+test("usage is persisted for a failed attempt and never affects acceptance", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // A worker that burns tokens and then exits nonzero: the attempt fails, but the cost is real.
+  const backend = new FakeBackend(async ({ artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 900, output: 40, reasoning: 3, cache: { read: 2000, write: 0 } }, cost: 0.00009 } }),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 800, output: 30, reasoning: 2, cache: { read: 1500, write: 0 } }, cost: 0.00008 } }),
+    ].join("\n"));
+    return { exitCode: 3, stdout: "", stderr: "worker gave up" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "FailUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "will fail", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.terminal_state, "FAILED");
+
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "a failed attempt must still carry its usage receipt");
+  assert.equal(usage.status, "COMPLETE");
+  assert.equal(usage.provider_steps, 2);
+  assert.equal(usage.input_tokens, 1700);
+  assert.ok(Math.abs(usage.reported_cost_usd - 0.00017) < 1e-12);
+  // Evidence must not launder a failure into success.
+  assert.notEqual(attempt.terminal_state, "SUCCEEDED");
+  assert.equal(result.job.status, "NEEDS_ATTENTION");
+});
+
+test("usage is retained when validation fails after a successful executor", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 500, output: 25, reasoning: 0, cache: { read: 1000, write: 0 } }, cost: 0.00005 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "produced\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({
+    name: "ValFailUsage", repoPath: repo, validation: ["node -e \"process.exit(1)\""],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "fails validation", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.validation_state, "FAILED");
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "validation failure must not discard the usage receipt");
+  assert.equal(usage.input_tokens, 500);
+  assert.equal(usage.status, "COMPLETE");
+});
+
+test("an attempt with no usage artifact records UNKNOWN rather than zero", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Mirrors the live ProviderAuthError failure: the executor died before any model call.
+  const backend = new FakeBackend(async () => ({ exitCode: 1, stdout: "", stderr: "auth failed" }));
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "NoUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "dies early", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const usage = service.getAttemptUsage(result.attempts.at(-1).id);
+  assert.equal(usage.status, "UNKNOWN");
+  assert.equal(usage.input_tokens, null, "absent usage must never be recorded as zero");
+  assert.equal(usage.reported_cost_usd, null);
+  assert.equal(usage.reference_cost_usd, null);
+  assert.equal(usage.provider_steps, 0);
+});
+
+test("recording usage twice for one attempt does not double-count", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 700, output: 20, reasoning: 0, cache: { read: 900, write: 0 } }, cost: 0.00007 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Idem", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+  const attemptId = result.attempts.at(-1).id;
+  const before = service.getAttemptUsage(attemptId);
+
+  const artifactDir = path.join(root, "artifacts", project.id, attemptId);
+  assert.equal(service.recordAttemptUsage({ attemptId, artifactDir, model: "opencode-go/deepseek-v4-flash" }), null);
+  assert.deepEqual(service.getAttemptUsage(attemptId), before, "a second record must be a no-op");
+  assert.equal(before.input_tokens, 700);
+});
+
+test("usage receipts are immutable once written", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Immutable", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const attemptId = (await service.runJob(job.id)).attempts.at(-1).id;
+
+  assert.throws(
+    () => service.db.prepare("UPDATE attempt_usage_receipts SET input_tokens = 999 WHERE attempt_id = ?").run(attemptId),
+    /immutable/,
+  );
+  assert.throws(
+    () => service.db.prepare("DELETE FROM attempt_usage_receipts WHERE attempt_id = ?").run(attemptId),
+    /immutable/,
+  );
+});
+
+test("a backend that throws after emitting usage still records its receipt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Provider work happened, then the runtime failed: the tokens were still spent.
+  const backend = new FakeBackend(async ({ artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 600, output: 30, reasoning: 2, cache: { read: 1200, write: 0 } }, cost: 0.00006 } }),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 400, output: 20, reasoning: 1, cache: { read: 800, write: 0 } }, cost: 0.00004 } }),
+    ].join("\n"));
+    throw new Error("transport died after the model calls");
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "ThrowUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "throws late", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const attempt = result.attempts.at(-1);
+  assert.equal(attempt.terminal_state, "FAILED");
+  const usage = service.getAttemptUsage(attempt.id);
+  assert.ok(usage, "a throwing backend must not lose its usage evidence");
+  assert.equal(usage.status, "COMPLETE");
+  assert.equal(usage.input_tokens, 1000);
+  assert.equal(usage.provider_steps, 2);
+  assert.equal(usage.reported_cost_source, "executor-computed");
+});
+
+test("a backend that throws before any model call records UNKNOWN", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async () => { throw new Error("spawn failed"); });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "ThrowEarly", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "dies at spawn", maxAttempts: 1 });
+  const result = await service.runJob(job.id);
+
+  const usage = service.getAttemptUsage(result.attempts.at(-1).id);
+  assert.equal(usage.status, "UNKNOWN");
+  assert.equal(usage.input_tokens, null);
+  assert.equal(usage.provider_steps, 0);
+});
+
+test("a backend may supply its own observation without computing the reference cost", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Models a non-OpenCode backend: it reports what its provider said and nothing more.
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return {
+      exitCode: 0, stdout: "ok", stderr: "",
+      usage: {
+        status: "COMPLETE",
+        input_tokens: 2000, output_tokens: 100, reasoning_tokens: 10,
+        cache_read_tokens: 5000, cache_write_tokens: 0,
+        provider_steps: 3, reported_cost_usd: null, reported_cost_source: null,
+        malformed_events: 0, source_artifact: "harness-session.jsonl", source_format: "harness-events",
+      },
+    };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "OwnUsage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const usage = service.getAttemptUsage((await service.runJob(job.id)).attempts.at(-1).id);
+
+  assert.equal(usage.source_format, "harness-events", "backend provenance must survive");
+  assert.equal(usage.input_tokens, 2000);
+  assert.equal(usage.reported_cost_usd, null);
+  // Pricing is applied centrally, so a backend that reports no cost still gets a reference cost.
+  assert.ok(usage.reference_cost_usd > 0, "delegate-wave prices the observation, not the backend");
+  assert.equal(usage.pricing_basis_id, "deepseek-direct-2026-08-14-v2");
+});
+
+test("a usage capture failure is visible and breaks measurement health, not the attempt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  // Simulate a normalization/schema defect.
+  const realFinalize = service.recordAttemptUsage.bind(service);
+  service.recordAttemptUsage = (args) => realFinalize({
+    ...args,
+    backend: { constructor: { name: "Broken" }, observeUsage: () => { throw new Error("injected parser fault"); } },
+  });
+
+  const project = await service.addProject({ name: "Unhealthy", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+  const attemptId = result.attempts.at(-1).id;
+
+  // The product task still succeeds.
+  assert.equal(result.attempts.at(-1).terminal_state, "SUCCEEDED");
+  assert.equal(service.getAttemptUsage(attemptId), null);
+
+  // But the failure is durable and the dataset is not healthy-by-silence.
+  const failure = service.db.prepare(
+    "SELECT * FROM events WHERE kind = 'USAGE_RECEIPT_FAILED' AND entity_id = ?",
+  ).get(attemptId);
+  assert.ok(failure, "a capture failure must leave a durable record");
+
+  // Accounted for, but NOT healthy: the attempt has no defensible cost, so a
+  // cost-per-validated-candidate result computed over this dataset would be indefensible.
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.accounted, true, "the failure is explained rather than silently missing");
+  assert.equal(coverage.healthy, false, "a known capture failure must invalidate the dataset");
+  assert.deepEqual(coverage.capture_failures, [attemptId]);
+  assert.deepEqual(coverage.missing_evidence, []);
+});
+
+test("usage coverage reports an attempt with neither a receipt nor a failure record", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+      type: "step_finish",
+      part: { tokens: { input: 300, output: 15, reasoning: 0, cache: { read: 600, write: 0 } }, cost: 0.00003 },
+    }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Coverage", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const attemptId = (await service.runJob(job.id)).attempts.at(-1).id;
+  assert.equal(service.usageCoverage({ jobIds: [job.id] }).healthy, true);
+
+  // An attempt with no evidence at all must be reported, or a cost result would silently omit it.
+  service.db.exec("DROP TRIGGER trg_usage_receipts_immutable_delete");
+  service.db.prepare("DELETE FROM attempt_usage_receipts WHERE attempt_id = ?").run(attemptId);
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.healthy, false);
+  assert.equal(coverage.accounted, false, "an unexplained gap is worse than a recorded failure");
+  assert.deepEqual(coverage.missing_evidence, [attemptId]);
+  assert.deepEqual(coverage.capture_failures, []);
+});
+
+test("coverage excludes attempts that never reached executor intent", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+      type: "step_finish",
+      part: { tokens: { input: 400, output: 20, reasoning: 0, cache: { read: 800, write: 0 } }, cost: 0.00004 },
+    }));
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "Eligibility", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const attemptId = (await service.runJob(job.id)).attempts.at(-1).id;
+  assert.equal(service.usageCoverage({ jobIds: [job.id] }).attempts, 1);
+
+  // An attempt that failed during worktree setup never invoked a backend and consumed no provider
+  // usage, so it must not be reported as missing evidence.
+  service.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, backend, model, worktree_path, started_at, terminal_state
+  ) VALUES (?, ?, 99, 1, 'FakeBackend', 'opencode-go/deepseek-v4-flash', NULL, ?, 'FAILED')`)
+    .run("attempt-never-started", job.id, new Date().toISOString());
+
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.attempts, 1, "only attempts reaching EXECUTOR_INTENDED are eligible");
+  assert.deepEqual(coverage.missing_evidence, []);
+  assert.equal(coverage.healthy, true);
+  assert.deepEqual(coverage.receipts, 1);
+  assert.equal(service.getAttemptUsage(attemptId).status, "COMPLETE");
+});
+
+test("an invalid backend observation becomes visible missing evidence, not a corrupt receipt", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // A backend reporting a cost with no provenance: SQLite would accept it, the finalizer must not.
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "ok\n");
+    return {
+      exitCode: 0, stdout: "ok", stderr: "",
+      usage: {
+        status: "COMPLETE",
+        input_tokens: 100, output_tokens: 10, reasoning_tokens: 0,
+        cache_read_tokens: 0, cache_write_tokens: 0,
+        provider_steps: 1,
+        reported_cost_usd: 0.001, reported_cost_source: null,
+        malformed_events: 0, source_artifact: "x", source_format: "harness-events",
+      },
+    };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => { service.close(); await cleanup(); });
+
+  const project = await service.addProject({ name: "BadObs", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  const result = await service.runJob(job.id);
+  const attemptId = result.attempts.at(-1).id;
+
+  assert.equal(result.attempts.at(-1).terminal_state, "SUCCEEDED", "measurement must not fail the task");
+  assert.equal(service.getAttemptUsage(attemptId), null, "a corrupt receipt must not be stored");
+  const coverage = service.usageCoverage({ jobIds: [job.id] });
+  assert.equal(coverage.healthy, false);
+  assert.deepEqual(coverage.capture_failures, [attemptId]);
+});
+
+test("an UNKNOWN, PARTIAL, or unpriced receipt is accounted for but not healthy", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  // Each case is a durable receipt that cannot support a defensible cost total.
+  const cases = [
+    ["unknown", null, "opencode-go/deepseek-v4-flash", "unknown_receipts"],
+    ["partial", [
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }),
+      '{"type":"step_finish","part":{"tokens":{"input":99',
+    ].join("\n"), "opencode-go/deepseek-v4-flash", "partial_receipts"],
+    // A model the pinned basis cannot price: COMPLETE usage, no reference cost.
+    ["unpriced", JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 } }),
+      "opencode-go/some-unpriced-model", "unpriced_receipts"],
+  ];
+
+  for (const [name, artifact, model, bucket] of cases) {
+    const backend = new FakeBackend(async ({ worktreePath, artifactDir }) => {
+      if (artifact !== null) {
+        fs.mkdirSync(artifactDir, { recursive: true });
+        fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), artifact);
+      }
+      fs.writeFileSync(path.join(worktreePath, `${name}.txt`), "ok\n");
+      return { exitCode: 0, stdout: "ok", stderr: "" };
+    });
+    const service = new Dispatcher({ root: path.join(root, name), backend });
+    const project = await service.addProject({ name, repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: `produce ${name}.txt` });
+    const attemptId = (await service.runJob(job.id, { model })).attempts.at(-1).id;
+
+    const coverage = service.usageCoverage({ jobIds: [job.id] });
+    assert.equal(coverage.accounted, true, `${name}: the attempt is explained`);
+    assert.equal(coverage.healthy, false, `${name}: must not support a cost total`);
+    assert.deepEqual(coverage[bucket], [attemptId], `${name}: reported in the right bucket`);
+    assert.deepEqual(coverage.missing_evidence, []);
+    service.close();
+  }
+  await cleanup();
 });
