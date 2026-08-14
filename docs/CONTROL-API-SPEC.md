@@ -89,8 +89,9 @@ or receipt state is uncertain, the CLI MUST show how to retry the exact command 
 
 **CTL-HTTP-002** Request bodies MUST be bounded and parsed as JSON objects.
 
-**CTL-HTTP-003** `delegate-wave serve` MAY run in the foreground. Service installation, remote
-exposure, TLS termination, token provisioning, and multi-user authentication are outside this slice.
+**CTL-HTTP-003** `delegate-wave serve` MAY run in the foreground. The Windows supervisor MAY run
+that same entry point as a least-privilege logon task. Remote exposure, TLS termination, token
+provisioning, and multi-user authentication remain outside this slice.
 
 ## Traceability
 
@@ -106,5 +107,5 @@ exposure, TLS termination, token provisioning, and multi-user authentication are
 
 ## Deferred
 
-This slice does not implement remote access, MCP/Hermes/T3 adapters, subscriptions, cancellation,
-multi-principal authentication, daemon installation, automatic escalation, or concurrent waves.
+This slice does not implement remote access, Hermes mutation/T3 adapters, subscriptions,
+cancellation, multi-principal authentication, automatic escalation, or concurrent waves.

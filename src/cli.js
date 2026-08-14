@@ -35,6 +35,11 @@ function help() {
 
 Commands:
   serve
+  supervisor install          install least-privilege Windows logon task
+  supervisor status
+  supervisor start
+  supervisor stop
+  supervisor uninstall
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
@@ -75,6 +80,16 @@ async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   if (!positional[0] || options.help) { help(); return; }
   if (positional[0] === "serve") { await serve(); return; }
+  if (positional[0] === "supervisor") {
+    const { WindowsSupervisor } = await import("./supervisor.js");
+    const supervisor = new WindowsSupervisor();
+    const action = positional[1];
+    if (!["install", "status", "start", "stop", "uninstall"].includes(action)) {
+      throw new Error("Unknown supervisor command; use install, status, start, stop, or uninstall");
+    }
+    print(await supervisor[action]());
+    return;
+  }
   if (positional[0] === "mcp") {
     const { runMcpStdio } = await import("./mcp/server.js");
     runMcpStdio();
