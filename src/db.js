@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS integration_proposals (
   candidate_commit TEXT NOT NULL,
   integration_branch TEXT NOT NULL,
   expected_integration_head TEXT NOT NULL,
+  validation_plan_json TEXT NOT NULL,
   validation_plan_digest TEXT NOT NULL,
   action_digest TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'OPEN' CHECK (state IN ('OPEN', 'INTEGRATED', 'CANCELLED')),
@@ -108,21 +109,22 @@ CREATE TABLE IF NOT EXISTS approval_receipts (
   expires_at TEXT,
   idempotency_key TEXT UNIQUE,
   granted_digest TEXT NOT NULL,
-  granted_at TEXT NOT NULL,
-  consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
-  consumed_at TEXT
+  granted_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS integration_operations (
   id TEXT PRIMARY KEY,
   proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
   approval_receipt_id TEXT NOT NULL REFERENCES approval_receipts(id),
-  state TEXT NOT NULL CHECK (state IN ('INTENDED', 'SUCCEEDED', 'FAILED')),
-  worktree_path TEXT,
+  action_digest TEXT NOT NULL,
+  base_sha TEXT NOT NULL,
+  candidate_commit TEXT NOT NULL,
+  integration_branch TEXT NOT NULL,
   expected_integration_head TEXT NOT NULL,
-  new_head TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  validation_plan_digest TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'INTENDED' CHECK (state = 'INTENDED'),
+  worktree_path TEXT,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS integration_records (
@@ -134,12 +136,37 @@ CREATE TABLE IF NOT EXISTS integration_records (
   created_at TEXT NOT NULL
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_proposals_immutable_update
+BEFORE UPDATE ON integration_proposals
+BEGIN SELECT RAISE(ABORT, 'integration_proposals is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_proposals_immutable_delete
+BEFORE DELETE ON integration_proposals
+BEGIN SELECT RAISE(ABORT, 'integration_proposals is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_approvals_immutable_update
+BEFORE UPDATE ON approval_receipts
+BEGIN SELECT RAISE(ABORT, 'approval_receipts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_approvals_immutable_delete
+BEFORE DELETE ON approval_receipts
+BEGIN SELECT RAISE(ABORT, 'approval_receipts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_operations_immutable_update
+BEFORE UPDATE ON integration_operations
+BEGIN SELECT RAISE(ABORT, 'integration_operations is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_operations_immutable_delete
+BEFORE DELETE ON integration_operations
+BEGIN SELECT RAISE(ABORT, 'integration_operations is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_records_immutable_update
+BEFORE UPDATE ON integration_records
+BEGIN SELECT RAISE(ABORT, 'integration_records is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_records_immutable_delete
+BEFORE DELETE ON integration_records
+BEGIN SELECT RAISE(ABORT, 'integration_records is immutable'); END;
+
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_job ON attempts(job_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_type, entity_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_proposals_job ON integration_proposals(job_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_state ON integration_proposals(state);
-CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id, consumed);
+CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_ops_proposal ON integration_operations(proposal_id, state);
 CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operation_id, sequence);
 `;
@@ -174,7 +201,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '6')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '7')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -200,7 +227,24 @@ function migrate(db) {
   if (!attemptColumns.includes("executor_intent_id")) {
     db.exec("ALTER TABLE attempts ADD COLUMN executor_intent_id TEXT");
   }
-  db.prepare("UPDATE metadata SET value = '6' WHERE key = 'schema_version'").run();
+  const proposalColumns = db.prepare("PRAGMA table_info(integration_proposals)").all().map((column) => column.name);
+  if (!proposalColumns.includes("validation_plan_json")) {
+    db.exec("ALTER TABLE integration_proposals ADD COLUMN validation_plan_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  const approvalColumns = db.prepare("PRAGMA table_info(approval_receipts)").all().map((column) => column.name);
+  if (approvalColumns.includes("consumed") || approvalColumns.includes("consumed_at")) {
+    db.exec("DROP INDEX IF EXISTS idx_approvals_proposal");
+    if (approvalColumns.includes("consumed")) db.exec("ALTER TABLE approval_receipts DROP COLUMN consumed");
+    if (approvalColumns.includes("consumed_at")) db.exec("ALTER TABLE approval_receipts DROP COLUMN consumed_at");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON approval_receipts(proposal_id)");
+  }
+  const operationColumns = db.prepare("PRAGMA table_info(integration_operations)").all().map((column) => column.name);
+  for (const column of ["action_digest", "base_sha", "candidate_commit", "integration_branch", "validation_plan_digest"]) {
+    if (!operationColumns.includes(column)) {
+      db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+    }
+  }
+  db.prepare("UPDATE metadata SET value = '7' WHERE key = 'schema_version'").run();
 }
 
 export function transaction(db, action) {

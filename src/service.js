@@ -304,9 +304,8 @@ export class Dispatcher {
     return { job, attempts, validations };
   }
 
-  validationPlanDigest(project) {
-    const commands = parseJson(project.validation_json);
-    const canonical = [...commands].sort().join("\n");
+  planDigest(commands) {
+    const canonical = commands.map((command) => String(command)).join("\n");
     return crypto.createHash("sha256").update(canonical).digest("hex");
   }
 
@@ -349,7 +348,9 @@ export class Dispatcher {
     if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
     const project = this.getProject(job.project_id);
     const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);
-    const planDigest = this.validationPlanDigest(project);
+    const planCommands = parseJson(project.validation_json);
+    const planJson = JSON.stringify(planCommands);
+    const planDigest = this.planDigest(planCommands);
     const digest = this.actionDigest({
       projectId: project.id, jobId, attemptId: candidate.id,
       baseSha: job.base_sha, candidateCommit: candidate.result_commit,
@@ -360,16 +361,20 @@ export class Dispatcher {
       if (existing.action_digest !== digest) {
         throw new Error(`Existing proposal ${existing.id} has a different action digest for attempt ${candidate.id}`);
       }
+      if (existing.validation_plan_digest !== planDigest) {
+        throw new Error(`Existing proposal ${existing.id} has a different validation plan digest for attempt ${candidate.id}`);
+      }
       return this.getProposal(existing.id);
     }
     const proposalId = id("proposal");
     const timestamp = now();
     this.db.prepare(`INSERT INTO integration_proposals(
       id, project_id, job_id, attempt_id, base_sha, candidate_commit, integration_branch,
-      expected_integration_head, validation_plan_digest, action_digest, state, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
+      expected_integration_head, validation_plan_json, validation_plan_digest, action_digest,
+      state, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
       proposalId, project.id, jobId, candidate.id, job.base_sha, candidate.result_commit,
-      project.integration_branch, expectedHead, planDigest, digest, timestamp, timestamp,
+      project.integration_branch, expectedHead, planJson, planDigest, digest, timestamp, timestamp,
     );
     recordEvent(this.db, {
       kind: "INTEGRATION_PROPOSED", entityType: "proposal", entityId: proposalId,
@@ -404,7 +409,8 @@ export class Dispatcher {
       if (existing.granted_digest !== proposal.action_digest) {
         throw new Error(`Existing approval ${existing.id} grants a different digest`);
       }
-      if (existing.consumed === 0) return existing;
+      const consumed = this.db.prepare("SELECT 1 FROM integration_operations WHERE approval_receipt_id = ? LIMIT 1").get(existing.id);
+      if (!consumed) return existing;
     }
     const receiptId = id("approval");
     this.db.prepare(`INSERT INTO approval_receipts(
@@ -426,8 +432,7 @@ export class Dispatcher {
     );
   }
 
-  async runIntegrationValidation(project, worktreePath, operationId, proposalId) {
-    const commands = parseJson(project.validation_json);
+  async runIntegrationValidation(commands, worktreePath, operationId, proposalId) {
     for (const command of commands) {
       const result = await runShell(command, { cwd: worktreePath, timeoutMs: 15 * 60_000 });
       this.recordIntegrationRecord(operationId, proposalId, "VALIDATION_RUN", `${command} => ${result.exitCode}`);
@@ -436,32 +441,7 @@ export class Dispatcher {
     this.recordIntegrationRecord(operationId, proposalId, "VALIDATION_PASSED", String(commands.length));
   }
 
-  async runIntegration(proposalId) {
-    const proposal = this.getProposal(proposalId);
-    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
-    const project = this.getProject(proposal.project_id);
-    if (!project) throw new Error(`Unknown project: ${proposal.project_id}`);
-
-    const succeeded = this.db.prepare(
-      "SELECT * FROM integration_operations WHERE proposal_id = ? AND state = 'SUCCEEDED' ORDER BY created_at DESC LIMIT 1",
-    ).get(proposalId);
-    if (succeeded) {
-      if (proposal.state !== "INTEGRATED") {
-        throw new Error(`Proposal ${proposalId} is ${proposal.state} despite a successful operation`);
-      }
-      return this.integrationStatus(proposalId);
-    }
-    if (proposal.state !== "OPEN") throw new Error(`Proposal ${proposalId} is ${proposal.state}`);
-    const intended = this.db.prepare(
-      "SELECT * FROM integration_operations WHERE proposal_id = ? AND state = 'INTENDED' LIMIT 1",
-    ).get(proposalId);
-    if (intended) throw new Error(`Integration already in progress for proposal ${proposalId} (operation ${intended.id})`);
-
-    const planDigest = this.validationPlanDigest(project);
-    if (planDigest !== proposal.validation_plan_digest) {
-      throw new Error(`Validation plan changed since proposal ${proposalId}`);
-    }
-    const branchRef = `refs/heads/${proposal.integration_branch}`;
+  async assertIntegrationHeadUnchanged(project, proposal, branchRef) {
     const checkedOut = (await listWorktrees(project.repo_path)).some((entry) => entry.branch === branchRef);
     if (checkedOut) {
       throw new Error(`Integration branch ${proposal.integration_branch} is checked out in another worktree`);
@@ -470,34 +450,90 @@ export class Dispatcher {
     if (currentHead !== proposal.expected_integration_head) {
       throw new Error(`Integration head changed: expected ${proposal.expected_integration_head}, found ${currentHead}`);
     }
+  }
+
+  async runIntegration(proposalId) {
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    const project = this.getProject(proposal.project_id);
+    if (!project) throw new Error(`Unknown project: ${proposal.project_id}`);
+
+    const proposalIntegrated = this.db.prepare(
+      "SELECT * FROM integration_records WHERE proposal_id = ? AND kind = 'PROPOSAL_INTEGRATED' ORDER BY sequence DESC LIMIT 1",
+    ).get(proposalId);
+    if (proposalIntegrated) return this.integrationStatus(proposalId);
+
+    const operations = this.db.prepare(
+      "SELECT * FROM integration_operations WHERE proposal_id = ? ORDER BY created_at",
+    ).all(proposalId);
+    if (operations.length > 0) {
+      const last = operations[operations.length - 1];
+      const terminal = this.db.prepare(
+        "SELECT * FROM integration_records WHERE operation_id = ? AND kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED') ORDER BY sequence DESC LIMIT 1",
+      ).get(last.id);
+      if (!terminal) {
+        throw new Error(`Integration operation ${last.id} is stuck without a terminal outcome`);
+      }
+      if (terminal.kind === "INTEGRATION_SUCCEEDED") {
+        throw new Error(`Proposal ${proposalId} has a succeeded operation but no terminal proposal record`);
+      }
+    }
+
+    const storedPlan = parseJson(proposal.validation_plan_json);
+    const storedPlanDigest = this.planDigest(storedPlan);
+    if (storedPlanDigest !== proposal.validation_plan_digest) {
+      throw new Error(`Stored validation plan digest mismatch for proposal ${proposalId}`);
+    }
+    const recomputedAction = this.actionDigest({
+      projectId: proposal.project_id, jobId: proposal.job_id, attemptId: proposal.attempt_id,
+      baseSha: proposal.base_sha, candidateCommit: proposal.candidate_commit,
+      integrationBranch: proposal.integration_branch, expectedHead: proposal.expected_integration_head,
+      planDigest: storedPlanDigest,
+    });
+    if (recomputedAction !== proposal.action_digest) {
+      throw new Error(`Action digest mismatch for proposal ${proposalId}`);
+    }
+
+    const branchRef = `refs/heads/${proposal.integration_branch}`;
+    await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
     if (!(await isAncestor(project.repo_path, proposal.base_sha, proposal.candidate_commit))) {
       throw new Error(`Candidate ${proposal.candidate_commit} does not descend from base ${proposal.base_sha}`);
     }
 
     const claim = transaction(this.db, () => {
       const current = this.getProposal(proposalId);
-      if (!current || current.state !== "OPEN") throw new Error(`Proposal ${proposalId} is no longer open`);
+      if (!current) throw new Error(`Proposal ${proposalId} no longer exists`);
       if (current.action_digest !== proposal.action_digest) {
         throw new Error(`Proposal ${proposalId} action digest mismatch`);
       }
-      const receipt = this.db.prepare(
-        "SELECT * FROM approval_receipts WHERE proposal_id = ? AND consumed = 0 ORDER BY granted_at LIMIT 1",
-      ).get(proposalId);
-      if (!receipt) throw new Error(`No unexpired approval for proposal ${proposalId}`);
-      if (receipt.granted_digest !== current.action_digest) {
-        throw new Error(`Approval ${receipt.id} grants a digest different from proposal ${proposalId}`);
-      }
-      if (receipt.expires_at && new Date(receipt.expires_at).getTime() <= Date.now()) {
-        throw new Error(`Approval ${receipt.id} expired at ${receipt.expires_at}`);
-      }
-      this.db.prepare("UPDATE approval_receipts SET consumed = 1, consumed_at = ? WHERE id = ?").run(now(), receipt.id);
+      const receipt = this.db.prepare(`SELECT r.* FROM approval_receipts r
+        WHERE r.proposal_id = ?
+          AND r.granted_digest = ?
+          AND (r.expires_at IS NULL OR r.expires_at > ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM integration_operations o WHERE o.approval_receipt_id = r.id
+          )
+        ORDER BY r.granted_at LIMIT 1`).get(proposalId, proposal.action_digest, now());
+      if (!receipt) throw new Error(`No unexpired unconsumed approval for proposal ${proposalId}`);
       const operationId = id("integration_op");
       const worktreePath = path.join(this.paths.integration, project.id, proposal.id);
       this.db.prepare(`INSERT INTO integration_operations(
-        id, proposal_id, approval_receipt_id, state, worktree_path, expected_integration_head, created_at, updated_at
-      ) VALUES (?, ?, ?, 'INTENDED', ?, ?, ?, ?)`).run(
-        operationId, proposalId, receipt.id, worktreePath, current.expected_integration_head, now(), now(),
+        id, proposal_id, approval_receipt_id, action_digest, base_sha, candidate_commit,
+        integration_branch, expected_integration_head, validation_plan_digest, state,
+        worktree_path, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENDED', ?, ?)`).run(
+        operationId, proposalId, receipt.id, proposal.action_digest, proposal.base_sha,
+        proposal.candidate_commit, proposal.integration_branch, proposal.expected_integration_head,
+        proposal.validation_plan_digest, worktreePath, now(),
       );
+      this.recordIntegrationRecord(operationId, proposalId, "INTEGRATION_STARTED", JSON.stringify({
+        approvalId: receipt.id,
+        baseSha: proposal.base_sha,
+        candidateCommit: proposal.candidate_commit,
+        integrationBranch: proposal.integration_branch,
+        expectedHead: proposal.expected_integration_head,
+        validationPlanDigest: proposal.validation_plan_digest,
+      }));
       recordEvent(this.db, {
         kind: "INTEGRATION_INTENDED", entityType: "operation", entityId: operationId,
         payload: { proposalId, approvalId: receipt.id },
@@ -512,7 +548,8 @@ export class Dispatcher {
       this.recordIntegrationRecord(operationId, proposalId, "WORKTREE_CREATED", worktreePath);
       const newHead = await cherryPick(worktreePath, proposal.candidate_commit);
       this.recordIntegrationRecord(operationId, proposalId, "CANDIDATE_CHERRY_PICKED", newHead);
-      await this.runIntegrationValidation(project, worktreePath, operationId, proposalId);
+      await this.runIntegrationValidation(storedPlan, worktreePath, operationId, proposalId);
+      await this.assertIntegrationHeadUnchanged(project, proposal, branchRef);
       await updateRefCas(project.repo_path, branchRef, newHead, proposal.expected_integration_head);
       this.recordIntegrationRecord(operationId, proposalId, "BRANCH_ADVANCED", newHead);
       transaction(this.db, () => {
@@ -520,12 +557,8 @@ export class Dispatcher {
         if (!operation || operation.state !== "INTENDED") {
           throw new Error(`Operation ${operationId} state mismatch`);
         }
-        this.db.prepare(
-          "UPDATE integration_operations SET state = 'SUCCEEDED', new_head = ?, updated_at = ? WHERE id = ?",
-        ).run(newHead, now(), operationId);
-        this.db.prepare(
-          "UPDATE integration_proposals SET state = 'INTEGRATED', updated_at = ? WHERE id = ? AND state = 'OPEN'",
-        ).run(now(), proposalId);
+        this.recordIntegrationRecord(operationId, proposalId, "INTEGRATION_SUCCEEDED", newHead);
+        this.recordIntegrationRecord(operationId, proposalId, "PROPOSAL_INTEGRATED", proposalId);
         this.db.prepare(
           "UPDATE jobs SET status = 'SUCCEEDED', updated_at = ? WHERE id = ? AND status = 'READY_FOR_INTEGRATION'",
         ).run(now(), proposal.job_id);
@@ -538,7 +571,6 @@ export class Dispatcher {
       transaction(this.db, () => {
         const operation = this.db.prepare("SELECT * FROM integration_operations WHERE id = ?").get(operationId);
         if (operation && operation.state === "INTENDED") {
-          this.db.prepare("UPDATE integration_operations SET state = 'FAILED', updated_at = ? WHERE id = ?").run(now(), operationId);
           this.recordIntegrationRecord(operationId, proposalId, "INTEGRATION_FAILED", message);
           recordEvent(this.db, { kind: "INTEGRATION_FAILED", entityType: "operation", entityId: operationId, payload: { message } });
         }
