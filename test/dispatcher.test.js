@@ -9,7 +9,7 @@ import { FakeBackend, OpenCodeBackend } from "../src/backend.js";
 import {
   DEFAULT_WORKER_MODEL, Dispatcher, ESCALATION_MODEL, isProcessAlive, REVIEW_MODEL,
 } from "../src/service.js";
-import { runProcess } from "../src/process.js";
+import { CONTROL_AUTHORITY_NAMES, runProcess, runShell } from "../src/process.js";
 
 async function command(name, args, cwd) {
   const result = await runProcess(name, args, { cwd });
@@ -113,32 +113,72 @@ test("successful worker produces a validated candidate commit", async (t) => {
   assert.match(result.attempts[0].result_commit, /^[a-f0-9]{40,64}$/);
 });
 
-test("child processes exclude the Control API authority token unless explicitly supplied", async (t) => {
-  const original = process.env.DELEGATE_WAVE_CONTROL_TOKEN;
-  const originalObserver = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
-  const originalHermes = process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
-  process.env.DELEGATE_WAVE_CONTROL_TOKEN = "must-not-inherit";
-  process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = "must-not-inherit-observer";
-  process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = "must-not-inherit-hermes";
+test("child processes exclude every Control API authority credential unless explicitly supplied", async (t) => {
+  // Drives the full declared set rather than a hand-listed subset, so a newly declared credential
+  // role cannot quietly remain inheritable (CTL-AUTH-005).
+  const saved = new Map(CONTROL_AUTHORITY_NAMES.map((name) => [name, process.env[name]]));
+  for (const name of CONTROL_AUTHORITY_NAMES) process.env[name] = `must-not-inherit-${name}`;
   t.after(() => {
-    if (original === undefined) delete process.env.DELEGATE_WAVE_CONTROL_TOKEN;
-    else process.env.DELEGATE_WAVE_CONTROL_TOKEN = original;
-    if (originalObserver === undefined) delete process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
-    else process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = originalObserver;
-    if (originalHermes === undefined) delete process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
-    else process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN = originalHermes;
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
-  const script = `process.stdout.write([
-    process.env.DELEGATE_WAVE_CONTROL_TOKEN,
-    process.env.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN,
-    process.env.DELEGATE_WAVE_HERMES_CONTROL_TOKEN,
-  ].filter(Boolean).join(',') || 'absent')`;
+
+  assert.ok(CONTROL_AUTHORITY_NAMES.includes("DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN"));
+  assert.ok(CONTROL_AUTHORITY_NAMES.includes("DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL"));
+
+  const script = `process.stdout.write(${JSON.stringify(CONTROL_AUTHORITY_NAMES)}
+    .map((name) => process.env[name]).filter(Boolean).join(',') || 'absent')`;
+
+  // A generic child, as used for Git commands and Git hooks.
   const scrubbed = await runProcess(process.execPath, ["-e", script]);
   assert.equal(scrubbed.stdout, "absent");
+
+  // A validation command, which runs repository-controlled content through the shell. Probe by
+  // environment name rather than by embedding a script, so quoting cannot mask a leak.
+  const validated = await runShell(
+    "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
+    + " { 'leaked' } else { 'absent' }",
+  );
+  assert.equal(validated.stdout.trim(), "absent");
+
+  // An explicitly launched Control API client may still receive exactly the credential it requires.
   const explicit = await runProcess(process.execPath, ["-e", script], {
     env: { DELEGATE_WAVE_CONTROL_TOKEN: "explicit-test-token" },
   });
   assert.equal(explicit.stdout, "explicit-test-token");
+});
+
+test("the executor backend receives no Control authority credential", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const saved = new Map(CONTROL_AUTHORITY_NAMES.map((name) => [name, process.env[name]]));
+  for (const name of CONTROL_AUTHORITY_NAMES) process.env[name] = `must-not-inherit-${name}`;
+
+  let observed = null;
+  const backend = new FakeBackend(async ({ worktreePath }) => {
+    // Spawn through the same helper the real executor uses, and report what it inherited.
+    const probe = await runProcess(process.execPath, ["-e",
+      `process.stdout.write(${JSON.stringify(CONTROL_AUTHORITY_NAMES)}
+        .map((name) => process.env[name]).filter(Boolean).join(',') || 'absent')`]);
+    observed = probe.stdout;
+    fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "" };
+  });
+  const service = new Dispatcher({ root, backend });
+  t.after(async () => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    service.close();
+    await cleanup();
+  });
+
+  const project = await service.addProject({ name: "Scrub", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "produce out.txt" });
+  await service.runJob(job.id);
+  assert.equal(observed, "absent", "an executor child must inherit no Control authority credential");
 });
 
 test("project and job rows roll back when their event receipt fails", async (t) => {

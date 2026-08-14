@@ -5,9 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  buildTaskXml, DpapiSecretStore, PROTECTED_SECRET_FILE, REQUIRED_SECRET_ROLES, SUPERVISOR_TASK_NAME,
+  buildTaskXml, DpapiSecretStore, PROTECTED_SECRET_FILE, REQUIRED_SECRET_ROLES, SECRET_RECORDS, SUPERVISOR_TASK_NAME,
   WindowsSupervisor,
 } from "../src/supervisor.js";
+import { CONTROL_AUTHORITY_NAMES } from "../src/process.js";
 
 const configuredEnvironment = {
   USERDOMAIN: "MACHINE",
@@ -601,4 +602,46 @@ test("adding a role is idempotent and validates its inputs", async (t) => {
     added: false, role: "proposer", path: store.path,
   });
   assert.equal(fs.readFileSync(store.path, "utf8"), sealed, "an existing role must not be silently replaced");
+});
+
+test("add-role clears supplied credential material on the no-op path too", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-add-role-hygiene-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cleared = [];
+  const base = recordingDpapiRunner();
+  const processRunner = async (command, args, options) => {
+    if (!options.env?.DELEGATE_WAVE_SECRET_PAYLOAD && !options.env?.DELEGATE_WAVE_SECRET_BLOB) {
+      cleared.push(String(args.at(-1)));
+    }
+    return base(command, args, options);
+  };
+  const store = new DpapiSecretStore({ platform: "win32", root, processRunner });
+  await store.provision({ ...configuredEnvironment });
+  cleared.length = 0;
+
+  const first = { DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "seal-me" };
+  assert.equal((await store.addRole("proposer", first)).added, true);
+  assert.equal("DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN" in first, false);
+  assert.equal(cleared.length, 1, "a successful add must clear persistent values");
+  assert.match(cleared[0], /DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN/);
+  assert.match(cleared[0], /DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL/);
+
+  // The no-op path must not leave the supplied plaintext behind either.
+  const second = { DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN: "already-present" };
+  assert.equal((await store.addRole("proposer", second)).added, false);
+  assert.equal("DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN" in second, false, "a no-op add must still clear plaintext");
+  assert.equal(cleared.length, 2, "a no-op add must still clear persistent values");
+});
+
+test("every declared credential role is scrubbed from child processes", () => {
+  // Guards CTL-AUTH-005 structurally: a role declared without child scrubbing must be impossible.
+  for (const record of Object.values(SECRET_RECORDS)) {
+    for (const name of record.names) {
+      assert.ok(
+        CONTROL_AUTHORITY_NAMES.includes(name),
+        `${name} is a credential variable but is not scrubbed from child processes`,
+      );
+    }
+  }
+  assert.ok(CONTROL_AUTHORITY_NAMES.includes("DELEGATE_WAVE_HERMES_CONTROL_TOKEN"));
 });

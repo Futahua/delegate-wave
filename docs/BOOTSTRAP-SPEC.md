@@ -58,6 +58,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **WRK-003** Validation commands MUST run under dispatcher control after executor completion.
 
+**WRK-004** Every executor attempt MUST have a dispatcher-resolved, provider-qualified model
+persisted before the attempt launches. An execution backend MUST fail closed rather than fall back to
+an ambient model or provider, so a caller that bypasses dispatcher routing cannot reopen
+non-deterministic provider selection. Routing remains explicit: DeepSeek Flash is the default bulk
+worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalation lane.
+
 ## Validation
 
 **VAL-001** Executor exit success MUST NOT imply validation success.
@@ -107,6 +113,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
+| WRK-004 | `Dispatcher.resolveModel` persists the resolved model; `OpenCodeBackend` refuses an absent model | default-model resolution test; unrouted-backend refusal test; distinct-lane test; live no-model run recorded in the proposal dogfood |
 | VAL-004 | absence of integration command | interface conformance review |
 | VAL-005–VAL-007, REC-001–REC-009 | fenced row-level intent/PID receipts, fail-closed liveness probe, explicit PID callback, `doctor`, `reconcile`, `VALIDATION_INTERRUPTED` | dead recorded PID, live owners, uncertain executor/validator starts, genuine blocked-validator, and interrupted validation recovery tests |
 

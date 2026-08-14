@@ -138,3 +138,38 @@ integration         INTEGRATED (7a923a9)
 
 The equivalent run before this change failed in 2.3 s with
 `ProviderAuthError: Google Generative AI API key is missing`.
+
+## Credential inheritance after the live cutover
+
+Review found that the live proposal credential was inheritable by child processes. With a proposer
+record present the supervised runtime deliberately decrypts it into the server environment, but the
+child scrubber removed only three hardcoded names and did not include the proposer token or
+principal. Repository-controlled code reached through validation could therefore read a `read +
+propose` bearer token and call the loopback Control API.
+
+The root cause was structural: the scrub list, the persistent-environment cleanup script, and the
+provisioning name list were three separately maintained copies, so declaring a credential role did
+not automatically cover it. The scrub set is now a single exported list, the cleanup script is
+generated from the declared roles, and `supervisor.js` fails at import if any declared role variable
+is missing from the scrub set.
+
+Live verification on the supervised installation, with all three credentials present in the server
+process, using a validation command committed to the repository under test:
+
+```text
+validation command  node leakcheck.js
+probes              7 Control authority variables
+result              absent
+exit code           0
+validation_state    PASSED
+```
+
+The same probe run against the pre-fix scrubber would have reported the proposer token.
+
+`add-role` now also clears supplied credential material from both the process environment and
+`HKCU\Environment` on the already-present path, not only on a successful seal.
+
+## Operator friction resolved
+
+`proposal show|authorize|reject` now take `--proposal`, matching `integration` and `approval`.
+`--id` is still accepted so existing invocations keep working.

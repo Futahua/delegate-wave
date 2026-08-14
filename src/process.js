@@ -1,10 +1,25 @@
 import { spawn } from "node:child_process";
 
+// CTL-AUTH-005: executors, validation commands, Git hooks, and any other child process must never
+// inherit Control-plane authority.
+//
+// Declared here rather than in supervisor.js because this is the lowest-level module and must not
+// depend on it. supervisor.js asserts that every name it declares for a credential role appears in
+// this list, so adding a role cannot silently leave its credential inheritable -- which is exactly
+// how the proposal credential first escaped this scrub.
+export const CONTROL_AUTHORITY_NAMES = Object.freeze([
+  "DELEGATE_WAVE_CONTROL_TOKEN",
+  "DELEGATE_WAVE_CONTROL_PRINCIPAL",
+  "DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN",
+  "DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL",
+  "DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN",
+  "DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL",
+  "DELEGATE_WAVE_HERMES_CONTROL_TOKEN",
+]);
+
 export function childEnvironment(extra = {}) {
   const environment = { ...process.env };
-  delete environment.DELEGATE_WAVE_CONTROL_TOKEN;
-  delete environment.DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN;
-  delete environment.DELEGATE_WAVE_HERMES_CONTROL_TOKEN;
+  for (const name of CONTROL_AUTHORITY_NAMES) delete environment[name];
   return { ...environment, ...extra };
 }
 

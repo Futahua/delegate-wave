@@ -50,6 +50,15 @@ truncated or partially written live path. The store MUST be written to a tempora
 filesystem, flushed, and moved into place by a same-volume rename. A failed write MUST leave the
 previous store intact.
 
+**SUP-012** `supervisor add-role` MUST be an explicit local operation. It MUST require an
+already-scoped store, add at most one declared role, preserve every other record as ciphertext
+without decrypting it, and leave the previous store intact if sealing or writing fails. It MUST clear
+the supplied credential material from both the process environment and persistent user environment on
+success and when the role is already present.
+
+**SUP-013** Every variable naming a declared credential role MUST be scrubbed from child processes.
+Declaring a role without covering it MUST fail rather than silently leave the credential inheritable.
+
 **SUP-005d** The set of credential roles the supervised runtime requires MUST be declared explicitly,
 and provisioning and migration MUST validate that whole set before writing a store. An installation
 that cannot produce a startable store MUST fail at install time rather than report success and fail
@@ -96,6 +105,8 @@ same Windows user. Untrusted validation requires a separate OS identity, contain
 | SUP-005a | per-role DPAPI records; `load(role)` unseals exactly one | per-role blob isolation test; MCP-startup operator-decrypt-path test; scoped `runtimeEnvironment` test |
 | SUP-005b | explicit `migrate-secrets`; `load()` refuses a legacy bundle without decrypting | legacy migration, idempotence, fail-closed MCP load, and failed-re-protect tests; live migration dogfood |
 | SUP-005c | temporary-file write, fsync, and same-volume rename replacement | no-residue/never-truncated replacement test; failed-write preservation test |
+| SUP-012 | `addRole` seals one role, copies others as ciphertext, clears supplied material | add-role sealing test asserting zero decrypts; no-op-path hygiene test; idempotence and input-validation tests |
+| SUP-013 | `CONTROL_AUTHORITY_NAMES` drives the child scrub; import-time coverage check | full-set child scrub test; executor-child scrub test; declared-role coverage test |
 | SUP-005d | `SECRET_RECORDS` required flags validated before any store write and on existing-store reuse | partial-install, partial-migration, and partial-reuse refusal tests; deferred-failure test; complete-reuse and legacy-reuse tests; required-role runtime load test |
 | SUP-006 | CLI-only dynamic supervisor module; absent API/MCP routes | lifecycle command test and existing route allowlist tests |
 | SUP-007–009 | supervisor has no dispatcher/storage imports or cleanup actions | static implementation review; live state comparison |
