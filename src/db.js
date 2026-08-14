@@ -3,6 +3,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { managedPaths } from "./paths.js";
 
+// Bump whenever the normative durable schema changes, so a database cannot advertise a version that
+// does not describe its actual objects. Single constant: creation and migration must never drift.
+// 10: work_proposals and work_proposal_decisions, with their immutability triggers and indexes.
+export const SCHEMA_VERSION = "10";
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
@@ -279,7 +284,7 @@ export function openDatabase(filename) {
   db.exec(SCHEMA);
   migrate(db);
   const now = new Date().toISOString();
-  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '9')").run();
+  db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)").run(SCHEMA_VERSION);
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('scheduler_epoch', '0')").run();
   db.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)").run(now);
   return db;
@@ -331,7 +336,7 @@ function migrate(db) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
-  db.prepare("UPDATE metadata SET value = '9' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE metadata SET value = ? WHERE key = 'schema_version'").run(SCHEMA_VERSION);
 }
 
 export function transaction(db, action) {

@@ -1,5 +1,11 @@
-// Exercises the real `delegate-wave mcp` launcher against a live Control API, so the credential the
-// production process actually loads is the one under test -- not a client constructed by the test.
+// Exercises the real `delegate-wave mcp` launcher against a live Control API: the spawned process
+// builds its own ControlClient and adapter, so the tool surface and the HTTP authority boundary are
+// the production ones rather than test-constructed objects.
+//
+// Scope limit: this test supplies DELEGATE_WAVE_HERMES_CONTROL_TOKEN directly, so the process takes
+// the explicit-token path and never reaches DPAPI record selection. Proposer-preferred and
+// observer-fallback decryption are covered separately in supervisor.test.js; the composition of the
+// two is proven by live provisioning, not here.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";

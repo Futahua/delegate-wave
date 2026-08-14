@@ -52,6 +52,10 @@ expiry read from the clock.
 **PROP-008** Work proposals and their decisions MUST be immutable once written, enforced in the
 database rather than by convention.
 
+**PROP-015** Adding authoritative tables, triggers, or indexes MUST advance the recorded
+`schema_version`, so a database cannot advertise a version that does not describe its actual objects.
+Work proposals introduce schema 10. Creation and migration MUST read that version from one constant.
+
 ## Authorization
 
 **PROP-009** Only an `operate`-scoped credential may authorize or reject a work proposal.
@@ -93,12 +97,13 @@ provisioned, and older installations remain read-only.
 | PROP-006 | proposal insert performs no lifecycle transition | acceptance test asserts no job exists after proposing |
 | PROP-007 | digest excludes expiry; unique idempotency key | idempotent-proposal test; conflicting-reuse refusal |
 | PROP-008 | immutability triggers on both tables | schema triggers; existing immutability pattern |
+| PROP-015 | single `SCHEMA_VERSION` constant used by creation and migration | schema 9 to 10 upgrade test; fresh-database version test |
 | PROP-009 | `operate` scope on authorize/reject routes | acceptance test proves Hermes cannot authorize |
 | PROP-010 | expiry, state-version, and digest re-derivation checks | expired and superseded proposal tests |
 | PROP-011 | decision row keyed by proposal id | idempotent-authorization and rejected-proposal tests |
 | PROP-012 | single transaction around job insert and decision insert | failed-decision-write rollback test; concurrent-authorization test |
 | PROP-013 | idempotency lookup inside `BEGIN IMMEDIATE` | concurrent identical proposal test |
-| PROP-014 | `hasRecord`-driven credential selection in the MCP path | proposer-preferred and observer-fallback startup tests; live `delegate-wave mcp` propose test |
+| PROP-014 | `hasRecord`-driven credential selection in the MCP path | proposer-preferred and observer-fallback record-selection tests. The live `delegate-wave mcp` test supplies an explicit token and therefore covers the tool surface and HTTP boundary, not record selection; the composition of the two is proven by live provisioning. |
 
 ## Deferred
 
