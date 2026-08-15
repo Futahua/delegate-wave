@@ -9,6 +9,7 @@ const MUTATION_COMMANDS = new Set([
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
   "backup.create", "backup.restore", "restore.resolve", "integration.rollback", "job.advance", "integration.approve",
+  "integration.decline", "project.retire", "project.restore",
 ]);
 
 function canonical(value) {
@@ -223,6 +224,20 @@ export class ControlService {
       }),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),
       // Clears the unresolved-restore condition; only a person can say the truths agree again.
+      // The counterpart to approve: deciding not to integrate a candidate is a decision too.
+      "integration.decline": () => this.dispatcher.declineIntegration({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        reason: args.reason || "",
+      }),
+      // Stop tracking a project without destroying what it did.
+      "project.retire": () => this.dispatcher.retireProject({
+        projectId: args.projectId, principal: context.principalId, origin: context.originChannel,
+      }),
+      "project.restore": () => this.dispatcher.restoreProject({
+        projectId: args.projectId, principal: context.principalId, origin: context.originChannel,
+      }),
       "restore.resolve": () => this.dispatcher.resolveRestore(),
       "backup.restore": () => this.dispatcher.restore(args.backup, {
         restoreRepositories: args.restoreRepositories !== false,

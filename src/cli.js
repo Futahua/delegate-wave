@@ -53,6 +53,9 @@ Commands:
   job cancel --job ID [--reason TEXT] stop a running job; records durable intent and outcome
   job advance --job ID                run, validate, and propose integration in one step
   integration approve --proposal ID   approve this exact candidate and integrate it
+  integration decline --proposal ID   decide not to integrate it; keeps every record
+  project retire --project ID         stop tracking a project, keeping its history
+  project restore --project ID        track it again
   backup create [--label TEXT]        snapshot the operational database with a checksummed manifest
   backup list
   backup restore --backup DIR         restore the database and every repository head together
@@ -191,6 +194,15 @@ async function main() {
       backup: required(options, "backup"),
       restoreRepositories: options["database-only"] !== true,
     }, requestId(options)));
+  } else if (resource === "integration" && action === "decline") {
+    print(await client.post(`/v1/proposals/${encodeURIComponent(proposalOption(options))}/decline`,
+      { reason: options.reason || "" }, requestId(options)));
+  } else if (resource === "project" && action === "retire") {
+    print(await client.post(`/v1/projects/${encodeURIComponent(required(options, "project"))}/retire`,
+      {}, requestId(options)));
+  } else if (resource === "project" && action === "restore") {
+    print(await client.post(`/v1/projects/${encodeURIComponent(required(options, "project"))}/restore`,
+      {}, requestId(options)));
   } else if (resource === "restore" && action === "resolve") {
     print(await client.post("/v1/restore/resolve", {}, requestId(options)));
   } else if (resource === "backup" && action === "list") {

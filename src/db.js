@@ -11,7 +11,7 @@ import { managedPaths } from "./paths.js";
 // 13: durable cancellation intents and results.
 // 14: jobs carry an enforced cost ceiling.
 // 15: integration rollbacks are a first-class recorded outcome.
-export const SCHEMA_VERSION = "17";
+export const SCHEMA_VERSION = "18";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -26,6 +26,11 @@ CREATE TABLE IF NOT EXISTS projects (
   integration_branch TEXT NOT NULL,
   validation_json TEXT NOT NULL DEFAULT '[]',
   protected_json TEXT NOT NULL DEFAULT '[]',
+  -- When the operator stopped tracking this project. Retirement is not deletion: every job, attempt,
+  -- cost receipt and integration record it owns stays exactly where it is, because that history is
+  -- the point of the database. Retiring only removes it from the everyday surface and from health
+  -- checks, so a repository you no longer keep cannot make the system look permanently broken.
+  retired_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -230,7 +235,10 @@ CREATE TABLE IF NOT EXISTS cancellation_intents (
 -- intent is immutable evidence of the request, while the outcome is discovered afterwards.
 CREATE TABLE IF NOT EXISTS cancellation_results (
   intent_id TEXT PRIMARY KEY REFERENCES cancellation_intents(id),
-  outcome TEXT NOT NULL CHECK (outcome IN ('CANCELLED', 'ALREADY_TERMINAL', 'NOTHING_RUNNING')),
+  -- CLOSED means the job was open but nothing was running: it was ended by decision rather than
+  -- by killing a process. Distinct from CANCELLED so a receipt never implies a kill that did not
+  -- happen, and from NOTHING_RUNNING, which changed no state at all.
+  outcome TEXT NOT NULL CHECK (outcome IN ('CANCELLED', 'CLOSED', 'ALREADY_TERMINAL', 'NOTHING_RUNNING')),
   killed_pid INTEGER,
   detail TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
@@ -430,6 +438,32 @@ export function openDatabase(filename) {
 }
 
 function migrate(db) {
+  // The cancellation_results CHECK predates the CLOSED outcome. SQLite cannot alter a CHECK in
+  // place, so the table is rebuilt and every recorded receipt copied across -- these rows are
+  // immutable evidence, and losing them to a schema change would be exactly the wrong trade.
+  const cancelCheck = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cancellation_results'",
+  ).get()?.sql ?? "";
+  if (cancelCheck && !cancelCheck.includes("'CLOSED'")) {
+    db.exec(`
+      DROP TRIGGER IF EXISTS trg_cancel_results_immutable_update;
+      DROP TRIGGER IF EXISTS trg_cancel_results_immutable_delete;
+      CREATE TABLE cancellation_results_rebuilt (
+        intent_id TEXT PRIMARY KEY REFERENCES cancellation_intents(id),
+        outcome TEXT NOT NULL CHECK (outcome IN ('CANCELLED', 'CLOSED', 'ALREADY_TERMINAL', 'NOTHING_RUNNING')),
+        killed_pid INTEGER,
+        detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO cancellation_results_rebuilt SELECT * FROM cancellation_results;
+      DROP TABLE cancellation_results;
+      ALTER TABLE cancellation_results_rebuilt RENAME TO cancellation_results;
+    `);
+  }
+  const projectColumns = db.prepare("PRAGMA table_info(projects)").all().map((column) => column.name);
+  if (!projectColumns.includes("retired_at")) {
+    db.exec("ALTER TABLE projects ADD COLUMN retired_at TEXT");
+  }
   const jobColumns = db.prepare("PRAGMA table_info(jobs)").all().map((column) => column.name);
   if (!jobColumns.includes("maximum_cost")) {
     db.exec("ALTER TABLE jobs ADD COLUMN maximum_cost REAL");

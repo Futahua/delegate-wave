@@ -38,7 +38,10 @@ export const ROUTES = Object.freeze([
   { method: "GET", pattern: /^\/v1\/backups$/, command: "backup.list", scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/backups\/restore$/, command: "backup.restore", mutation: true, scope: SCOPES.OPERATE },
   { method: "POST", pattern: /^\/v1\/restore\/resolve$/, command: "restore.resolve", mutation: true, scope: SCOPES.OPERATE },
+  { method: "POST", pattern: /^\/v1\/proposals\/([^/]+)\/decline$/, command: "integration.decline", params: ["proposalId"], mutation: true, scope: SCOPES.OPERATE },
   { method: "POST", pattern: /^\/v1\/proposals\/([^/]+)\/rollback$/, command: "integration.rollback", params: ["proposalId"], mutation: true, scope: SCOPES.OPERATE },
+  { method: "POST", pattern: /^\/v1\/projects\/([^/]+)\/retire$/, command: "project.retire", params: ["projectId"], mutation: true, scope: SCOPES.OPERATE },
+  { method: "POST", pattern: /^\/v1\/projects\/([^/]+)\/restore$/, command: "project.restore", params: ["projectId"], mutation: true, scope: SCOPES.OPERATE },
 
   // Proposal-only authority: creating and reading bounded work requests.
   { method: "POST", pattern: /^\/v1\/work\/proposals$/, command: "work.propose", mutation: true, scope: SCOPES.PROPOSE },

@@ -116,7 +116,11 @@ test("cancelling a finished job does not retroactively unfinish it", async (t) =
   assert.equal(dispatcher.cancellationIntents(job.id).length, 1);
 });
 
-test("cancelling a job with nothing running is recorded rather than silently ignored", async (t) => {
+// Cancelling a queued job closes it. Leaving it PENDING would mean it still runs later, which is
+// the opposite of what was asked -- the old no-op meant a job could not be called off before it
+// started. The outcome is CLOSED rather than CANCELLED because nothing was killed, and a receipt
+// must not imply a kill that never happened.
+test("cancelling a queued job closes it, and says nothing was killed", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const dispatcher = new Dispatcher({ root, backend: new FakeBackend() });
   t.after(async () => { dispatcher.close(); await cleanup(); });
@@ -125,10 +129,28 @@ test("cancelling a job with nothing running is recorded rather than silently ign
   const job = await dispatcher.createJob({ projectId: project.id, goal: "never started" });
 
   const outcome = await dispatcher.cancelJob({ jobId: job.id, principal: "john", origin: "local-cli" });
-  assert.equal(outcome.outcome, "NOTHING_RUNNING");
+  assert.equal(outcome.outcome, "CLOSED");
+  assert.equal(outcome.killed_pid, null, "nothing was running, so nothing was killed");
+  assert.equal(dispatcher.getJob(job.id).status, "CANCELLED", "and it will not run later");
+
   const intents = dispatcher.cancellationIntents(job.id);
-  assert.equal(intents.length, 1);
-  assert.equal(intents[0].outcome, "NOTHING_RUNNING");
+  assert.equal(intents.length, 1, "asking is recorded even when no process was signalled");
+  assert.equal(intents[0].outcome, "CLOSED");
+});
+
+// A job that is genuinely finished is left exactly as it was.
+test("cancelling an already-cancelled job changes nothing", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const dispatcher = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(async () => { dispatcher.close(); await cleanup(); });
+
+  const project = await dispatcher.addProject({ name: "Twice", repoPath: repo, validation: [] });
+  const job = await dispatcher.createJob({ projectId: project.id, goal: "closed twice" });
+  await dispatcher.cancelJob({ jobId: job.id, principal: "john", origin: "local-cli" });
+
+  const again = await dispatcher.cancelJob({ jobId: job.id, principal: "john", origin: "local-cli" });
+  assert.equal(again.outcome, "ALREADY_TERMINAL");
+  assert.equal(dispatcher.getJob(job.id).status, "CANCELLED");
 });
 
 test("a stale callback from a cancelled worker cannot mutate the attempt", async (t) => {

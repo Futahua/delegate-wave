@@ -867,6 +867,61 @@ export class Dispatcher {
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
   }
 
+  // Stop tracking a project without destroying what it did.
+  //
+  // There was no way to do this at all, so a project registered by mistake -- or one whose
+  // repository was deleted -- stayed in the health check and the everyday surface permanently, and
+  // the only remedy was editing SQLite by hand. That is precisely what this system exists to make
+  // unnecessary.
+  //
+  // Retirement is reversible and keeps every record. Live work blocks it, because retiring a
+  // project mid-attempt would hide something that is still running.
+  retireProject({ projectId, principal, origin }) {
+    if (!principal || !origin) throw new Error("Retiring a project requires an authorizing identity");
+    const project = this.getProject(projectId);
+    if (!project) throw new Error(`Unknown project: ${projectId}`);
+    if (project.retired_at) return { retired: false, reason: "already retired", project };
+
+    // Only genuinely running work blocks retirement. A candidate awaiting a decision is safe to
+    // retire: nothing is executing, nothing is destroyed, and restoring the project brings it back.
+    // Requiring every pending candidate be declined first would be friction that pushes people back
+    // to editing SQLite, which is the thing this exists to prevent.
+    const running = this.db.prepare(
+      "SELECT id FROM jobs WHERE project_id = ? AND status = 'RUNNING' LIMIT 1",
+    ).get(projectId);
+    if (running) {
+      throw new Error(
+        `Refusing to retire ${project.name}: job ${running.id} is still running. `
+        + "Cancel it first, or wait for it to finish.",
+      );
+    }
+
+    return transaction(this.db, () => {
+      const timestamp = now();
+      this.db.prepare("UPDATE projects SET retired_at = ? WHERE id = ?").run(timestamp, projectId);
+      recordEvent(this.db, {
+        kind: "PROJECT_RETIRED", entityType: "project", entityId: projectId,
+        payload: { principal, origin, name: project.name },
+      });
+      return { retired: true, project: this.getProject(projectId) };
+    });
+  }
+
+  // The counterpart, so retiring is not a one-way door.
+  restoreProject({ projectId, principal, origin }) {
+    if (!principal || !origin) throw new Error("Restoring a project requires an authorizing identity");
+    const project = this.getProject(projectId);
+    if (!project) throw new Error(`Unknown project: ${projectId}`);
+    if (!project.retired_at) return { restored: false, reason: "not retired", project };
+    return transaction(this.db, () => {
+      this.db.prepare("UPDATE projects SET retired_at = NULL WHERE id = ?").run(projectId);
+      recordEvent(this.db, {
+        kind: "PROJECT_RESTORED", entityType: "project", entityId: projectId,
+        payload: { principal, origin, name: project.name },
+      });
+      return { restored: true, project: this.getProject(projectId) };
+    });
+  }
   // --- Everyday status --------------------------------------------------------------------------
   //
   // One bounded answer to "what is happening", written for a person rather than for a machine.
@@ -900,7 +955,7 @@ export class Dispatcher {
 
     const working = this.db.prepare(`SELECT j.id, j.goal, p.name AS project, j.updated_at
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'RUNNING' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      WHERE j.status = 'RUNNING' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
       .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
 
     const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
@@ -920,10 +975,16 @@ export class Dispatcher {
     const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, ip.attempt_id, j.goal, p.name AS project
       FROM integration_proposals ip
       JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
-      WHERE ip.state = 'OPEN'
+      WHERE ip.state = 'OPEN' AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_records r
           WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
+        )
+        -- A declined candidate is no longer awaiting anything. Derived like the rest, because the
+        -- proposal row is immutable and its state column cannot record the decision.
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.kind = 'INTEGRATION_DECLINED' AND e.entity_type = 'proposal' AND e.entity_id = ip.id
         )
       ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
       .map((row) => {
@@ -953,7 +1014,7 @@ export class Dispatcher {
         (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id
          ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'NEEDS_ATTENTION' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      WHERE j.status = 'NEEDS_ATTENTION' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
       .map((row) => {
         // What happened to the change, then what it means, then the mechanism -- never the internal
         // state name. `why` is retained because callers and the detailed tools already use it.
@@ -974,7 +1035,7 @@ export class Dispatcher {
     // A job whose integration was rolled back is not Done: the change it describes is gone.
     const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'SUCCEEDED'
+      WHERE j.status = 'SUCCEEDED' AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_rollbacks rb
           JOIN integration_proposals ip ON ip.id = rb.proposal_id
@@ -999,6 +1060,7 @@ export class Dispatcher {
       JOIN integration_proposals ip ON ip.id = rb.proposal_id
       JOIN jobs j ON j.id = ip.job_id
       JOIN projects p ON p.id = j.project_id
+      WHERE p.retired_at IS NULL
       ORDER BY rb.created_at DESC LIMIT ?`).all(limit)
       .map((row) => ({
         job: row.id,
@@ -1364,6 +1426,56 @@ export class Dispatcher {
     return verifyBackup(backupDirectory);
   }
 
+  // Decline a candidate rather than integrating it.
+  //
+  // The missing half of the pair. A candidate could be approved, or rolled back AFTER it landed,
+  // but never simply declined -- so deciding "no" left the job sitting in the decision queue
+  // forever, and the only way to clear it was editing SQLite. Work proposals have had authorize
+  // and reject from the start; integration proposals had approve and nothing.
+  //
+  // Declining destroys nothing. The attempt, its candidate commit, its cost receipt and its
+  // validation record all stay; what changes is that nobody is going to integrate it.
+  declineIntegration({ proposalId, principal, origin, reason = "" }) {
+    if (!principal || !origin) throw new Error("Declining a candidate requires an authorizing identity");
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+
+    // Derived from the records rather than the state column, for the same reason the briefing is:
+    // the column lags, and declining something already integrated would be a false claim.
+    const integrated = this.db.prepare(
+      "SELECT 1 FROM integration_records WHERE proposal_id = ? AND kind = 'INTEGRATION_SUCCEEDED' LIMIT 1",
+    ).get(proposalId);
+    if (integrated) {
+      throw new Error(
+        `Proposal ${proposalId} is already integrated; roll it back instead of declining it.`,
+      );
+    }
+
+    return transaction(this.db, () => {
+      // The proposal row is immutable by design, so declining is RECORDED rather than written into
+      // it -- the same way integration success is. Everything that asks "is this still awaiting a
+      // decision" derives the answer from records, so one more record is all this needs.
+      if (this.latestDecline(proposalId)) {
+        return { declined: false, reason: "already declined", proposal: this.getProposal(proposalId) };
+      }
+      const current = this.getProposal(proposalId);
+      recordEvent(this.db, {
+        kind: "INTEGRATION_DECLINED", entityType: "proposal", entityId: proposalId,
+        payload: { principal, origin, reason: reason || null, jobId: current.job_id },
+      });
+      // The job is finished without an integration, which is exactly what CANCELLED means for a job.
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
+        .run(now(), current.job_id);
+      return { declined: true, proposal: current };
+    });
+  }
+
+  // Whether a candidate has been declined, read from the records rather than the row.
+  latestDecline(proposalId) {
+    return this.db.prepare(`SELECT payload_json, occurred_at FROM events
+      WHERE kind = 'INTEGRATION_DECLINED' AND entity_type = 'proposal' AND entity_id = ?
+      ORDER BY sequence DESC LIMIT 1`).get(proposalId) ?? null;
+  }
   // Rolls an integration branch back to the state before a recorded integration.
   //
   // The target comes from the recorded operation, not from the caller: asking an operator to supply
@@ -1573,10 +1685,34 @@ export class Dispatcher {
     });
 
     if (!active) {
-      // READY_FOR_INTEGRATION counts as finished work: the attempt succeeded and produced a
-      // candidate, so cancelling must not read as "nothing happened here".
-      const finished = ["SUCCEEDED", "FAILED", "CANCELLED", "READY_FOR_INTEGRATION"].includes(job.status);
-      return settle(finished ? "ALREADY_TERMINAL" : "NOTHING_RUNNING", `job status ${job.status}`);
+      // Cancelling means "I do not want this job to continue". With nothing running there is nothing
+      // to kill, but the job may still be open -- waiting for a decision, or holding a candidate
+      // nobody will approve. Those used to stay open forever: cancel reported NOTHING_RUNNING and
+      // changed nothing, and there was no other way to close them, so the everyday surface filled
+      // with work the person had already mentally abandoned.
+      //
+      // Genuinely terminal states are left alone. An integrated job cannot be un-integrated by
+      // cancelling it, and saying otherwise would be a lie about what happened.
+      // READY_FOR_INTEGRATION is deliberately NOT closed here. It holds a validated candidate, and
+      // discarding one is a decision in its own right -- `integration decline` exists for that, so a
+      // mistyped cancel cannot throw away work that passed its checks.
+      const terminal = ["SUCCEEDED", "CANCELLED", "READY_FOR_INTEGRATION"].includes(job.status);
+      if (terminal) return settle("ALREADY_TERMINAL", `job status ${job.status}`);
+
+      const open = ["PENDING", "NEEDS_ATTENTION", "FAILED"].includes(job.status);
+      if (open) {
+        const previous = job.status;
+        this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
+          .run(now(), jobId);
+        recordEvent(this.db, {
+          kind: "JOB_CLOSED", entityType: "job", entityId: jobId,
+          payload: { principal, origin, reason: reason || null, from: previous },
+        });
+        // A distinct outcome from CANCELLED: nothing was killed, and the receipt should not imply
+        // that something was.
+        return settle("CLOSED", `closed from ${previous} without running work`);
+      }
+      return settle("NOTHING_RUNNING", `job status ${job.status}`);
     }
 
     // Kill the executor if one is running. A missing PID is not an error: the attempt may not have
@@ -2067,8 +2203,11 @@ export class Dispatcher {
         validation_start_uncertain: Boolean(attempt.validation_intent_id && !attempt.validation_pid),
         worktree_exists: Boolean(attempt.worktree_path && fs.existsSync(attempt.worktree_path)),
       }));
+    // A retired project's repository is allowed to be gone -- that is what retiring it meant.
+    // Reporting it forever would turn the health signal into noise, and a health signal nobody
+    // believes is worse than none at all.
     const missingRepositories = this.listProjects()
-      .filter((project) => !fs.existsSync(project.repo_path))
+      .filter((project) => !project.retired_at && !fs.existsSync(project.repo_path))
       .map((project) => ({ id: project.id, repo_path: project.repo_path }));
     const unresolvedIntegrations = this.db.prepare(`SELECT
         o.id AS operation_id,
