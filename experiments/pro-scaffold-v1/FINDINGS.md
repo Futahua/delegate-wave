@@ -15,8 +15,8 @@ Three configs, all Pro over the OpenCode Go route, all through the real Dispatch
 | **B** | `max` | delegate-wave's `workerPrompt` |
 | **C** | `max` | bare persona + task, no framing |
 
-Config D (a staged tool catalog across requests) was dropped: it needs a persistent PTY that win32
-does not provide, and faking it would have measured the imitation rather than the harness.
+Config D — the staged tool catalog — **was not tested, and should have been.** See
+[the correction](#correction-what-this-study-actually-measured) below.
 
 ## Result
 
@@ -34,8 +34,10 @@ roundtrip-codec        64s $0.0034   146s $0.0067    55s $0.0031    2.7x
 async-cache            77s $0.0040    44s $0.0029    23s $0.0020    3.3x
 ```
 
-The claim is **not reproduced**. Pass-rate and attempt count are identical across all three, so
-neither reasoning effort nor the opening scaffold moved the outcome on anything measured here.
+**No effect was measurable in this saturated corpus, and the article's central staged-tool-catalog
+hypothesis was not tested.** That is a much weaker statement than "the claim is not reproduced," and
+it is the correct one: a corpus where every cell scores 100% cannot distinguish good configurations
+from bad ones, so the absence of a gap here is a ceiling, not evidence of equivalence.
 
 Cost and latency do vary, but not in a way that supports the claim. The rightmost column is the
 ratio between the fastest and slowest config *on an identical task*, and the sign of the difference
@@ -73,15 +75,75 @@ Two of those three tasks were wrong on first construction and were caught by the
 
 Both would have produced a clean-looking null result for the wrong reason.
 
+## Correction: what this study actually measured
+
+The three configs vary **reasoning effort** (A vs B) and **prompt wording** (B vs C). None of them
+varies the first-request *tool surface*, which is the actual mechanism the source result describes:
+
+```
+request #1    minimal persona + tiny API-visible tool catalog
+request #2+   full tool catalog
+```
+
+So the budget went to the two less interesting variables. The interesting one was skipped.
+
+It was skipped for a bad reason, recorded here because the reasoning is the instructive part: this
+study inherited a stale premise that staging required a *persistent Minimal bash*, which win32 cannot
+provide without a PTY. That premise was already known to be wrong. The frozen Windows run that scored
+98 then 99 used `pwsh + read` on request #1 and 25 Standard tools on request #2+ — Windows native, no
+persistent bash anywhere in it. Nothing about it needs a PTY.
+
+Staging is also directly supported by the harness rather than requiring imitation:
+`ctx.tools.restrict(filter)` applies an agent-scoped visibility mask and returns a dispose function,
+which is precisely "narrow catalog, then widen."
+
+**Config D has since been built and works.** It is a ~60-line plugin
+([`src/harness/stage-plugin.js`](../../src/harness/stage-plugin.js)) that restricts the catalog on
+`agent/created` and lifts the restriction on the first `tools/result`. Widening triggers on the first
+tool *result* rather than a request counter, because an opening request that called nothing is
+exactly the case where the model has not committed to an approach and the anchoring effect being
+measured would not yet exist.
+
+The condition is verified off disk, not asserted: every transition is written to a marker file, and
+the runner reads it back onto each result. Three runs, three confirmations —
+
+```json
+{"narrowed_to":["pwsh","read"],"widened_after":"pwsh","widened_to_count":25,"verified":true}
+```
+
+— which reproduces the frozen Windows configuration exactly: `pwsh/read → 25 tools`.
+
+D then scored **3/3 on the hard corpus**, like every other config. As predicted, that says nothing
+about the hypothesis. The corpus is the bottleneck, not the harness.
+
+**The corpus is the wrong place to test it**, which D's 3/3 confirms. D needs tasks where current Pro
+succeeds *50–85%* of the time — repo-scale work with many-file exploration, competing hypotheses,
+migrations or API interactions, debugging after tests fail, and enough context that premature
+commitment actually costs something. Any task where both configs score 100% should be discarded on
+sight.
+
+The comparison should then be on **validated success, attempts to success, Codex escalation avoided,
+cost per successful task, and wall time per successful task** — not on stylistic tics of the
+trajectory.
+
 ## Caveats
 
 - **n=1 per cell.** These runs bound the effect size against a measured noise floor; they do not
   estimate it. Nothing here rules out a small systematic difference.
-- **Tasks are single-file and self-contained.** The article's claim may hold on work large enough for
-  context management to matter. This corpus cannot speak to that.
-- **C varies wording only.** The staged-tool-catalog half of the Minimal hypothesis is untested.
+- **24/24 is a ceiling, not evidence of equivalence.** Repeating A/B/C at n=5 would mostly measure,
+  more precisely, an effect these tasks cannot express.
+- **Tasks are single-file and self-contained.** Single-file problems probably erase exactly the
+  long-horizon planning and context-management failure that the staged-catalog result exposed.
 - All measurements are from delegate-wave's own usage receipts; cost figures are executor-computed
   against the pinned basis, not a provider bill.
+
+## The most useful thing here
+
+The hard tier — deliberately built to be nastier, using a documented failure mode — was solved
+*faster and cheaper* than the tier it was meant to be harder than. Human intuition about what makes
+an agent task difficult turns out to be a poor benchmark generator. Difficulty has to be measured
+against the model rather than designed for it, which is why the 50–85% success band is the selection
+criterion for the next corpus rather than anything about how the tasks look.
 
 ## Consequence for delegate-wave
 

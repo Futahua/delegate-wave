@@ -304,3 +304,55 @@ test("read mode is unchanged by the capability profile", async () => {
     workerPrompt({ goal: "x", mode: "read", profile: "restricted" }),
   );
 });
+
+// The promptBuilder seam exists so an experiment can vary the opening request without maintaining a
+// forked backend that drifts from the code it is supposed to be measuring. That is only true while
+// production keeps the default, so the default is pinned here rather than left to inspection: an
+// experiment quietly becoming the shipped behaviour is exactly the failure this seam invites.
+test("the prompt builder defaults to workerPrompt and is not overridden in production", async () => {
+  const { HarnessBackend, workerPrompt } = await import("../src/harness/backend.js");
+  const backend = new HarnessBackend({ harnessHome: "D:/nonexistent-harness-home" });
+  assert.equal(backend.promptBuilder, workerPrompt, "the default builder is workerPrompt itself");
+
+  const built = backend.promptBuilder({ goal: "x", mode: "write", profile: "trusted" });
+  assert.equal(built, workerPrompt({ goal: "x", mode: "write", profile: "trusted" }));
+});
+
+test("an explicit prompt builder replaces the opening request without touching the profile", async () => {
+  const { HarnessBackend } = await import("../src/harness/backend.js");
+  const backend = new HarnessBackend({
+    harnessHome: "D:/nonexistent-harness-home",
+    promptBuilder: ({ goal }) => `bare: ${goal}`,
+  });
+  assert.equal(backend.promptBuilder({ goal: "x", mode: "write", profile: "trusted" }), "bare: x");
+  assert.equal(backend.profile, "trusted", "capability is unchanged by how the request is worded");
+});
+
+// Staging is an experimental condition, not a product behaviour. Production must compose a patch
+// with no staging plugin in it at all -- not a staging plugin that happens to be configured to do
+// nothing -- so the absence is pinned rather than the configuration.
+test("the staged tool catalog is absent from production patches", async () => {
+  const { HarnessBackend, buildAttemptPatch } = await import("../src/harness/backend.js");
+  const backend = new HarnessBackend({ harnessHome: "D:/nonexistent-harness-home" });
+  assert.equal(backend.stageFirstRequest, null, "production never stages the catalog");
+
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/w", artifactDir: "D:/a", model: "deepseek-v4-pro",
+    baseUrl: "https://example.invalid", apiKeyEnv: "K", reasoningEffort: "high",
+  });
+  assert.doesNotMatch(patch, /stage-plugin/, "no staging plugin is composed by default");
+  assert.doesNotMatch(patch, /first-request-stage/, "and its id never appears");
+});
+
+test("a staged patch narrows the opening catalog and records where the evidence goes", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/w", artifactDir: "D:/a", model: "deepseek-v4-pro",
+    baseUrl: "https://example.invalid", apiKeyEnv: "K", reasoningEffort: "max",
+    stageFirstRequest: ["pwsh", "read"],
+  });
+  assert.match(patch, /first-request-stage/);
+  assert.match(patch, /first: \["pwsh", "read"\]/, "the opening catalog is exactly what was asked for");
+  // Without a marker the condition could only be asserted, never checked.
+  assert.match(patch, /markerPath: "D:\/a\/stage\.jsonl"/);
+});

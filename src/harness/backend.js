@@ -161,6 +161,9 @@ export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE 
 export function buildAttemptPatch({
   worktreePath, artifactDir, model, baseUrl, apiKeyEnv, reasoningEffort,
   profile = DEFAULT_CAPABILITY_PROFILE,
+  // Experiment-only: the tool names visible on the opening request, widened to the full catalog once
+  // the worker has actually used one. Null means the catalog never changes, which is production.
+  stageFirstRequest = null,
 }) {
   const capabilities = capabilityProfile(profile);
   const lines = capabilities.disabled.map((id) => `- id: ${id}\n  disabled: true`);
@@ -231,6 +234,18 @@ export function buildAttemptPatch({
     ].join("\n"));
   }
 
+  // Staged catalog, inserted last so its listeners see a fully composed registry.
+  if (stageFirstRequest) {
+    lines.push([
+      "- insert:",
+      "    - id: delegate-wave-first-request-stage",
+      `      name: ${yamlString(pathToFileURL(path.join(here, "stage-plugin.js")).href)}`,
+      "      config:",
+      `        first: [${stageFirstRequest.map((n) => yamlString(n)).join(", ")}]`,
+      `        markerPath: ${yamlString(path.join(artifactDir, "stage.jsonl").replace(/\\/g, "/"))}`,
+    ].join("\n"));
+  }
+
   return `${lines.join("\n")}\n`;
 }
 
@@ -249,6 +264,8 @@ export class HarnessBackend {
     // passes anything else; it exists so a measurement can vary the scaffold without a fork of the
     // backend drifting away from the code it is supposed to be measuring.
     promptBuilder = workerPrompt,
+    // Experiment-only; production leaves the catalog fixed. See stage-plugin.js.
+    stageFirstRequest = null,
   } = {}) {
     if (!harnessHome) throw new Error("HarnessBackend requires the directory where dsh is installed");
     this.harnessHome = harnessHome;
@@ -263,6 +280,7 @@ export class HarnessBackend {
     this.profile = capabilityProfile(profile) && profile;
     this.timeoutMs = timeoutMs;
     this.promptBuilder = promptBuilder;
+    this.stageFirstRequest = stageFirstRequest;
   }
 
   sessionLogPath(artifactDir) {
@@ -342,6 +360,7 @@ export class HarnessBackend {
       baseUrl: this.baseUrl,
       apiKeyEnv: this.apiKeyEnv,
       reasoningEffort: this.reasoningEffort,
+      stageFirstRequest: this.stageFirstRequest,
       profile: this.profile,
     }));
 

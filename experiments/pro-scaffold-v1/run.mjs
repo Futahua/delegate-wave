@@ -35,6 +35,15 @@ const CONFIGS = {
     label: "Pro / headless / max / bare opening request",
     promptBuilder: MINIMAL_PROMPT,
   },
+  // The actual hypothesis: a narrow tool surface on request #1, widened once the worker has used it.
+  // Matches the frozen Windows run that scored 98/99 -- pwsh + read first, full catalog after -- and
+  // needs no persistent shell, because that run did not use one either.
+  D: {
+    reasoningEffort: "max",
+    label: "Pro / headless / max / staged catalog (pwsh+read -> full)",
+    promptBuilder: MINIMAL_PROMPT,
+    stageFirstRequest: ["pwsh", "read"],
+  },
 };
 
 const CORPORA = { base: TASKS, hard: HARD_TASKS };
@@ -73,6 +82,32 @@ async function buildRepo(root, task, seq) {
   return repo;
 }
 
+// Collect every stage marker written under the data root, newest attempt last.
+function readStaging(dataRoot) {
+  const found = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name === "stage.jsonl") found.push(full);
+    }
+  };
+  walk(dataRoot);
+  const events = found.flatMap((file) => fs.readFileSync(file, "utf8")
+    .split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+  const narrowed = events.find((e) => e.event === "narrowed");
+  const widened = events.find((e) => e.event === "widened");
+  return {
+    narrowed_to: narrowed?.visible ?? null,
+    widened_after: widened?.after ?? null,
+    widened_to_count: widened?.count ?? null,
+    // The single fact that makes the cell valid.
+    verified: Boolean(narrowed && widened && narrowed.count < widened.count),
+  };
+}
+
 const results = [];
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), `pro-scaffold-${configName}-`));
 const root = path.join(temp, "data");
@@ -85,6 +120,7 @@ for (let round = 1; round <= repeat; round += 1) {
       apiKey,
       reasoningEffort: config.reasoningEffort,
       ...(config.promptBuilder ? { promptBuilder: config.promptBuilder } : {}),
+      ...(config.stageFirstRequest ? { stageFirstRequest: config.stageFirstRequest } : {}),
     });
     const service = new Dispatcher({ root, backend });
     const repo = await buildRepo(root, task, `${round}`);
@@ -128,6 +164,11 @@ for (let round = 1; round <= repeat; round += 1) {
         error: String(error?.message ?? error).slice(0, 120),
       };
     }
+    // The independent variable, verified rather than assumed. If the marker does not show a narrow
+    // opening catalog that later widened, the run did not test what it claims to test -- so the
+    // condition is read back off disk and carried on the result.
+    if (config.stageFirstRequest) record.staging = readStaging(root);
+
     results.push(record);
     console.log(
       `${configName}${round} ${task.id.padEnd(16)} `
