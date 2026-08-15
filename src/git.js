@@ -39,11 +39,17 @@ export async function lockWorktree(repoPath, targetPath, reason) {
 // Staging the whole tree first is what makes untracked files part of the comparison; the diff is
 // then taken against the base commit rather than against HEAD, so whatever history the worker built
 // on top of the base is irrelevant to what we believe changed.
+//
+// `--no-renames` is load-bearing, not a detail. Rename detection is a SEMANTIC convenience: it
+// reports `protected/locked.txt -> allowed.txt` as one entry, and `--name-only` prints only the
+// destination. The protected source then never reaches the policy check, so a worker could move a
+// protected file out of its protected directory and have the change accepted. Policy needs every
+// path the tree touched, not Git's interpretation of what the change meant.
 export async function changedFilesSince(worktreePath, baseSha) {
   await git(worktreePath, ["add", "--all"]);
   const output = await git(
     worktreePath,
-    ["diff", "--cached", "--name-only", "-z", "--find-renames", baseSha],
+    ["diff", "--cached", "--name-only", "-z", "--no-renames", baseSha],
     { raw: true },
   );
   if (!output) return [];

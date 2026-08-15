@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1271,6 +1272,123 @@ test("the candidate is one commit parented on the recorded base", async (t) => {
     for (const name of ["one.md", "two.md", "three.md"]) {
       assert.match(listed, new RegExp(name.replace(".", "\.")), `${name} is in the candidate`);
     }
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Rename detection must never reach a policy decision.
+//
+// `git diff --find-renames --name-only` reports `protected/locked.txt -> allowed.txt` as a single
+// entry and prints only the DESTINATION. The protected source then never reaches the check, so a
+// worker could move a protected file out of its protected directory and have it accepted. Policy
+// needs every path the tree touched, not Git's semantic interpretation of what the change meant.
+const policyWorker = (plan) => new FakeBackend(async ({ worktreePath, artifactDir }) => {
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+    type: "step_finish",
+    part: { tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 },
+  }));
+  await plan({ worktreePath, run: (...args) => gitIn(worktreePath, ...args) });
+  return { exitCode: 0, stdout: "ok", stderr: "" };
+});
+
+async function policyFixture(t, plan) {
+  const { root, repo, cleanup } = await fixture(t);
+  fs.mkdirSync(path.join(repo, "protected"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "protected", "locked.txt"), "must not move\n");
+  fs.writeFileSync(path.join(repo, "allowed-a.txt"), "ordinary\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "add protected and allowed files"], repo);
+
+  const service = new Dispatcher({ root, backend: policyWorker(plan) });
+  const project = await service.addProject({
+    name: `policy-${crypto.randomUUID().slice(0, 8)}`, repoPath: repo, validation: [],
+    protectedPaths: ["protected/"],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "policy probe", maxAttempts: 1 });
+  await service.runJob(job.id);
+  const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+  return { service, repo, attempt, cleanup };
+}
+
+test("renaming a protected file to an allowed path is rejected", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("mv", "protected/locked.txt", "allowed.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "rename detection must not hide the protected source from the policy check");
+    assert.equal(attempt.result_commit, null, "and no candidate is produced");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The counterpart: legitimate renames must still work, or the fix would be a blunt instrument.
+test("renaming one allowed file to another allowed path succeeds", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("mv", "allowed-a.txt", "allowed-b.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    // Asserted on the candidate's TREE, not on `git show`, which applies its own rename detection
+    // when formatting and would report one path either way.
+    const tree = await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit);
+    const names = tree.split("\n").map((line) => line.trim());
+    assert.ok(names.includes("allowed-b.txt"), "the destination exists in the candidate tree");
+    assert.ok(!names.includes("allowed-a.txt"), "and the source is gone from it");
+    assert.ok(names.includes("protected/locked.txt"), "the untouched protected file is still there");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("deleting a protected file is caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("rm", "protected/locked.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED", "a deletion is a change to a protected path");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The combination that would most plausibly slip past: a protected move buried among ordinary edits,
+// where rename detection could pair the protected source with an unrelated destination.
+test("a protected move hidden among ordinary changes is still caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    fs.writeFileSync(path.join(worktreePath, "NOTES.md"), "ordinary work\n");
+    fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "edited\n");
+    await run("mv", "protected/locked.txt", "docs-copy.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Replacement: the protected file is deleted and an allowed file takes a similar shape. Content
+// similarity is exactly what rename detection keys on, so this is the case most likely to be paired.
+test("replacing a protected file with an identical allowed file is caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    const body = fs.readFileSync(path.join(worktreePath, "protected", "locked.txt"), "utf8");
+    await run("rm", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "copied.txt"), body);
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "identical content is what rename detection pairs on, so this must not hide the deletion");
+    assert.equal(attempt.result_commit, null);
   } finally {
     service.close();
     await cleanup();
