@@ -1,0 +1,65 @@
+{
+  "config": "Pro / headless / max",
+  "results": [
+    {
+      "config": "B",
+      "round": 1,
+      "task": "range-index",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 125,
+      "cost_usd": 0.005551,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "template-render",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 94,
+      "cost_usd": 0.004224,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "compensated-sum",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 52,
+      "cost_usd": 0.003174,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "grapheme-text",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 46,
+      "cost_usd": 0.003111,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "calendar-duration",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 99,
+      "cost_usd": 0.005345,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    }
+  ]
+}
