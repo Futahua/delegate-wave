@@ -18,9 +18,11 @@
 //    directory makes the full event stream durable -- including per-call usage and the `turn/end`
 //    that marks the turn genuinely finished.
 //
-//  * Authority. The restricted patch removes every capability the worker contract forbids, and the
-//    filesystem service is replaced outright, because Harness's sandbox fences writes only and a
-//    live worker demonstrated reading an absolute path outside its workspace.
+//  * Capability vs authority. What a worker MAY DO is a selectable profile, and `trusted` -- broad
+//    machine access including shell and code execution -- is the default. What delegate-wave
+//    ACCEPTS AS TRUE is not selectable: no profile changes who computes the Git diff, who runs
+//    validation, what counts as cost evidence, or what may be integrated. A worker may affect the
+//    machine; delegate-wave decides which effects become product state.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -33,21 +35,57 @@ export const HARNESS_PACKAGE = "@deepseek-ai/dsh";
 export const HARNESS_VERSION = "0.1.0-rc.6";
 export const SESSION_LOG_NAME = "harness-session.jsonl";
 
-// Capabilities removed from the stock headless profile.
+// What a worker may DO. Deliberately separate from what delegate-wave accepts as true.
 //
-// Each is a capability the worker contract does not grant, not a preference. `permission` is
-// disabled because the presets service waits on the shell service, so removing the shell requires
-// removing its dependent; its presets exist to gate shell and exec permissions this worker has no
-// way to use. `code-runtime` is included because Harness documents its worker-thread runtime as
-// containment rather than a security boundary, with authority comparable to a shell -- and unlike
-// what an earlier survey assumed, it IS present in stock headless.
-const DISABLED_PLUGINS = Object.freeze([
-  "tool-bash", "tool-pwsh", "bash-sandbox", "pwsh-sandbox", "shell-env",
-  "permission",
-  "tool-skill", "skill", "skill-filesystem", "skill-badge",
-  "user-questions",
-  "code-runtime",
-]);
+// These are the two different concerns this system kept conflating: capability policy and
+// authoritative control. Capability is a preference and may be broad. Authority is not a preference:
+// no profile below changes who computes the Git diff, who runs validation, what counts as cost
+// evidence, or what may be integrated. A worker can be powerful without being believed.
+//
+// `trusted` is the default because these workers are extensions of their operator, not adversaries.
+// Denying a coding agent a shell makes it worse at its job, and the value delegate-wave adds was
+// never "the worker couldn't reach the filesystem" -- it is that the worker's claims are checked.
+//
+// `restricted` exists for the case where containment genuinely is the point: the frozen executor
+// comparison, whose trusted verifiers live outside the worker repository. A worker that can read
+// them can pass every task without doing the work, which destroys the experiment rather than
+// endangering the machine.
+export const CAPABILITY_PROFILES = Object.freeze({
+  // Broad machine access: shell, code execution, subprocesses, developer tooling, skills, and
+  // filesystem reads beyond the worktree. Only the unattended-hang case is removed.
+  trusted: Object.freeze({
+    disabled: Object.freeze(["user-questions"]),
+    fenced: false,
+    description: "broad machine access; delegate-wave still decides what becomes true",
+  }),
+  // The original contract, preserved exactly. `permission` is disabled because its presets service
+  // waits on the shell service, so removing the shell requires removing its dependent.
+  // `code-runtime` is listed explicitly because it IS present in stock headless, contrary to an
+  // earlier survey, and Harness documents it as containment rather than a security boundary.
+  restricted: Object.freeze({
+    disabled: Object.freeze([
+      "tool-bash", "tool-pwsh", "bash-sandbox", "pwsh-sandbox", "shell-env",
+      "permission",
+      "tool-skill", "skill", "skill-filesystem", "skill-badge",
+      "user-questions",
+      "code-runtime",
+    ]),
+    fenced: true,
+    description: "attempt-root filesystem fence and no shell, code, skills, or questions",
+  }),
+});
+
+export const DEFAULT_CAPABILITY_PROFILE = "trusted";
+
+export function capabilityProfile(name) {
+  const profile = CAPABILITY_PROFILES[name];
+  if (!profile) {
+    throw new Error(
+      `Unknown capability profile: ${name}. Known: ${Object.keys(CAPABILITY_PROFILES).join(", ")}`,
+    );
+  }
+  return profile;
+}
 
 const yamlString = (value) => JSON.stringify(String(value));
 
@@ -85,8 +123,12 @@ export function wireModel(model) {
 //
 // Written per attempt rather than shared, because the persistence root and the fence root are both
 // attempt-specific. A shared patch would leak one attempt's session log into another's evidence.
-export function buildAttemptPatch({ worktreePath, artifactDir, model, baseUrl, apiKeyEnv, reasoningEffort }) {
-  const lines = DISABLED_PLUGINS.map((id) => `- id: ${id}\n  disabled: true`);
+export function buildAttemptPatch({
+  worktreePath, artifactDir, model, baseUrl, apiKeyEnv, reasoningEffort,
+  profile = DEFAULT_CAPABILITY_PROFILE,
+}) {
+  const capabilities = capabilityProfile(profile);
+  const lines = capabilities.disabled.map((id) => `- id: ${id}\n  disabled: true`);
 
   lines.push([
     "- id: llm-deepseek",
@@ -121,12 +163,17 @@ export function buildAttemptPatch({ worktreePath, artifactDir, model, baseUrl, a
     "    writeBatchMaxDelayMs: 1",
   ].join("\n"));
 
-  // The filesystem fence. Replaces the provider rather than configuring the sandbox, because the
-  // sandbox permits reads in every mode.
-  // The filesystem provider is swapped: the stock one is disabled and the fenced one inserted.
+  // The filesystem provider.
   //
-  // Two details of the loader make this the only correct shape, both learned by watching it refuse
-  // the alternatives:
+  // Fencing is a PROFILE decision, not an architectural invariant. Under `trusted` the worker keeps
+  // Harness's own provider and may read the machine freely, because these workers are extensions of
+  // their operator rather than adversaries -- and delegate-wave's guarantees never rested on the
+  // worker being unable to reach a file. Under `restricted` the provider is replaced outright,
+  // because there containment IS the point: the frozen comparison's verifiers live outside the
+  // worker repository, and a worker that reads them passes every task without doing the work.
+  //
+  // Two details of the loader make the swap's shape the only correct one, both learned by watching
+  // it refuse the alternatives:
   //
   //  * Headless has no `fs-local` entry. `fs-sandbox` IS the provider of the `fs` service, so
   //    disabling it without inserting a replacement leaves the boot failing with
@@ -134,18 +181,20 @@ export function buildAttemptPatch({ worktreePath, artifactDir, model, baseUrl, a
   //  * `name` on an existing id is an ASSERTION, not a substitution. Pointing `fs-sandbox` at a
   //    different module logs "name mismatch ... skipping" and silently keeps the stock provider --
   //    a fence that looks configured and is not. `insert` adds a genuinely new entry instead.
-  lines.push("- id: fs-sandbox\n  name: '@deepseek-ai/dsh-fs-sandbox'\n  disabled: true");
-  lines.push([
-    "- insert:",
-    "    - id: delegate-wave-fenced-fs",
-    // A file:// URL, not a path: Node's ESM loader reads a bare Windows path's drive letter as a
-    // URL scheme and refuses it.
-    `      name: ${yamlString(pathToFileURL(path.join(here, "fs-plugin.js")).href)}`,
-    "      config:",
-    `        attemptRoot: ${yamlString(worktreePath.replace(/\\/g, "/"))}`,
-    // Inherited from fs-local's own config contract, which validates it regardless of subclassing.
-    `        diffBasisMaxBytes: ${DIFF_BASIS_MAX_BYTES}`,
-  ].join("\n"));
+  if (capabilities.fenced) {
+    lines.push("- id: fs-sandbox\n  name: '@deepseek-ai/dsh-fs-sandbox'\n  disabled: true");
+    lines.push([
+      "- insert:",
+      "    - id: delegate-wave-fenced-fs",
+      // A file:// URL, not a path: Node's ESM loader reads a bare Windows path's drive letter as a
+      // URL scheme and refuses it.
+      `      name: ${yamlString(pathToFileURL(path.join(here, "fs-plugin.js")).href)}`,
+      "      config:",
+      `        attemptRoot: ${yamlString(worktreePath.replace(/\\/g, "/"))}`,
+      // Inherited from fs-local's own config contract, which validates it regardless of subclassing.
+      `        diffBasisMaxBytes: ${DIFF_BASIS_MAX_BYTES}`,
+    ].join("\n"));
+  }
 
   return `${lines.join("\n")}\n`;
 }
@@ -159,6 +208,7 @@ export class HarnessBackend {
     apiKeyEnv = "OPENCODE_GO_API_KEY",
     apiKey = null,
     reasoningEffort = "high",
+    profile = DEFAULT_CAPABILITY_PROFILE,
     timeoutMs = 30 * 60_000,
   } = {}) {
     if (!harnessHome) throw new Error("HarnessBackend requires the directory where dsh is installed");
@@ -169,6 +219,9 @@ export class HarnessBackend {
     this.apiKeyEnv = apiKeyEnv;
     this.apiKey = apiKey;
     this.reasoningEffort = reasoningEffort;
+    // Validated here rather than at first use, so an unknown profile fails before any attempt row
+    // exists instead of partway through one.
+    this.profile = capabilityProfile(profile) && profile;
     this.timeoutMs = timeoutMs;
   }
 
@@ -249,6 +302,7 @@ export class HarnessBackend {
       baseUrl: this.baseUrl,
       apiKeyEnv: this.apiKeyEnv,
       reasoningEffort: this.reasoningEffort,
+      profile: this.profile,
     }));
 
     // Verify the fence is actually in the tree the process will boot, before any worker runs.
@@ -257,7 +311,7 @@ export class HarnessBackend {
     // rejected fence would leave the worker running against the stock provider, which permits every
     // read, while every visible signal said the attempt was confined. That failure is silent by
     // construction, so it is checked rather than assumed.
-    await this.assertFenceComposed(patchPath, artifactDir);
+    if (capabilityProfile(this.profile).fenced) await this.assertFenceComposed(patchPath, artifactDir);
 
     const stdoutPath = path.join(artifactDir, "harness-stdout.log");
     const stderrPath = path.join(artifactDir, "harness-stderr.log");
@@ -291,6 +345,10 @@ export class HarnessBackend {
       new Promise((resolve) => stderrStream.end(resolve)),
     ]);
 
-    return { ...result, stdoutPath, stderrPath, sessionLogPath: this.sessionLogPath(artifactDir) };
+    return {
+      ...result, stdoutPath, stderrPath,
+      sessionLogPath: this.sessionLogPath(artifactDir),
+      capabilityProfile: this.profile,
+    };
   }
 }

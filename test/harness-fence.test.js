@@ -1,13 +1,15 @@
-// Proves the Harness filesystem provider is actually confined to one attempt worktree.
+// The `restricted` capability profile, and the capability/authority split it belongs to.
+//
+// Fencing is NOT a system-wide invariant here. Workers are extensions of their operator, so the
+// default profile is `trusted` and a worker keeps its shell, code execution, and machine access.
+// `restricted` exists for the case where containment genuinely is the point: the frozen executor
+// comparison, whose trusted verifiers live outside the worker repository. A worker that reads them
+// passes every task without doing the work -- that destroys the experiment, which is a
+// methodological failure rather than a security one.
 //
 // These tests run against the real @deepseek-ai/dsh-fs-local class, not a stand-in, because the
 // property under test is precisely that our subclass constrains THAT implementation. A mock would
 // assert only that our own code calls our own fence.
-//
-// Harness's shipped sandbox fences mutations only and documents that reads pass through in every
-// mode; a live worker demonstrated the escape by reading an absolute path outside its workspace. The
-// verifiers for the frozen corpus live outside the worker repository, so an unfenced read is a
-// correctness failure, not a hardening nicety.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -158,6 +160,7 @@ test("the profile patch replaces the filesystem provider rather than renaming th
     baseUrl: "https://example.invalid/v1",
     apiKeyEnv: "SOME_KEY",
     reasoningEffort: "high",
+    profile: "restricted",
   });
 
   assert.match(patch, /- id: fs-sandbox\n\s+name: '@deepseek-ai\/dsh-fs-sandbox'\n\s+disabled: true/,
@@ -170,11 +173,12 @@ test("the profile patch replaces the filesystem provider rather than renaming th
     "the plugin is named by file:// URL; a bare Windows path is rejected as an unknown URL scheme");
 });
 
-test("the attempt patch disables every capability the worker contract forbids", async () => {
+test("the restricted profile disables every capability that profile forbids", async () => {
   const { buildAttemptPatch } = await import("../src/harness/backend.js");
   const patch = buildAttemptPatch({
     worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
     baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high",
+    profile: "restricted",
   });
   // code-runtime is included deliberately: it IS present in stock headless, and Harness documents
   // it as containment rather than a security boundary, with authority comparable to a shell.
@@ -205,4 +209,45 @@ test("session persistence is configured to flush into the attempt's own artifact
   assert.match(patch, /root: "D:\/art\/sessions"/, "one attempt's log must not land in another's evidence");
   assert.match(patch, /compression: none/);
   assert.match(patch, /writeBatchMaxDelayMs: 1/, "headless exits before a batched write drains");
+});
+
+// Capability is a policy choice; authority is not. These pin the split.
+test("the trusted profile keeps shell, code execution, and machine access", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
+    baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high",
+    profile: "trusted",
+  });
+  // A coding agent without a shell is simply worse at the job, and delegate-wave's guarantees never
+  // rested on the worker being unable to run one.
+  for (const id of ["tool-bash", "tool-pwsh", "shell-env", "code-runtime", "skill", "permission"]) {
+    assert.ok(!patch.includes(`- id: ${id}\n  disabled: true`), `${id} must remain available`);
+  }
+  assert.ok(!patch.includes("delegate-wave-fenced-fs"), "and the filesystem is not fenced");
+  // The one exclusion that is not about containment: an unattended worker asking a question hangs.
+  assert.match(patch, /- id: user-questions\n\s*disabled: true/);
+});
+
+// Evidence must still be durable and effort still pinned, whichever profile is in force -- those are
+// measurement properties, not capability policy.
+test("both profiles pin reasoning effort and durable usage evidence", async () => {
+  const { buildAttemptPatch, CAPABILITY_PROFILES } = await import("../src/harness/backend.js");
+  for (const profile of Object.keys(CAPABILITY_PROFILES)) {
+    const patch = buildAttemptPatch({
+      worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
+      baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high", profile,
+    });
+    assert.match(patch, /reasoningEffort: high/, `${profile} pins effort`);
+    assert.match(patch, /writeBatchMaxDelayMs: 1/, `${profile} keeps durable evidence`);
+  }
+});
+
+test("the default profile is trusted, and an unknown one is refused", async () => {
+  const { DEFAULT_CAPABILITY_PROFILE, capabilityProfile } = await import("../src/harness/backend.js");
+  assert.equal(DEFAULT_CAPABILITY_PROFILE, "trusted",
+    "workers are extensions of their operator, not adversaries");
+  assert.equal(capabilityProfile("restricted").fenced, true, "restricted still fences reads");
+  assert.throws(() => capabilityProfile("bounded"), /Unknown capability profile/,
+    "no silent fallback to a profile that was not asked for");
 });

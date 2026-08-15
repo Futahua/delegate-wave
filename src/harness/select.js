@@ -1,9 +1,9 @@
 // Which executor backend performs ordinary work.
 //
 // Harness is preferred. It is the executor this product wants: reasoning effort is pinned rather
-// than inherited from a route default, the filesystem is confined to the attempt worktree by
-// delegate-wave's own fence, and usage arrives as durable per-call evidence rather than being
-// scraped from a transcript.
+// than inherited from a route default, usage arrives as durable per-call evidence rather than being
+// scraped from a transcript, and its capability profile is selectable -- `trusted` by default, so a
+// worker keeps the shell and tooling that make it good at the job.
 //
 // OpenCode remains the fallback, unchanged and undiminished. It is the executor with a production
 // record here, so when Harness cannot run -- not installed, no credential, a profile that will not
@@ -16,7 +16,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { OpenCodeBackend } from "../backend.js";
-import { HarnessBackend, HARNESS_PACKAGE, HARNESS_VERSION, wireModel } from "./backend.js";
+import {
+  HarnessBackend, HARNESS_PACKAGE, HARNESS_VERSION, wireModel, DEFAULT_CAPABILITY_PROFILE,
+} from "./backend.js";
 
 export const HARNESS_HOME = process.env.DELEGATE_WAVE_HARNESS_HOME
   || path.join("D:", "AssistantSystem", "delegate-wave", "harness");
@@ -53,7 +55,10 @@ export function harnessReadiness({ harnessHome = HARNESS_HOME, apiKey = null } =
 //
 // Returns the choice and its justification together, so the reason a fallback happened is a
 // recorded fact rather than something to be inferred from which executor's artifacts appeared.
-export function selectBackendForModel(model, { harnessHome = HARNESS_HOME, apiKey = null, prefer = "harness" } = {}) {
+export function selectBackendForModel(model, {
+  harnessHome = HARNESS_HOME, apiKey = null, prefer = "harness",
+  profile = DEFAULT_CAPABILITY_PROFILE,
+} = {}) {
   const openCode = () => new OpenCodeBackend({ attach: process.env.DELEGATE_WAVE_OPENCODE_ATTACH });
 
   if (prefer !== "harness") {
@@ -76,9 +81,9 @@ export function selectBackendForModel(model, { harnessHome = HARNESS_HOME, apiKe
     return { backend: openCode(), selected: "opencode", reason: readiness.reason, fellBack: true };
   }
   return {
-    backend: new HarnessBackend({ harnessHome, apiKey }),
+    backend: new HarnessBackend({ harnessHome, apiKey, profile }),
     selected: "harness",
-    reason: `Harness ${readiness.version}`,
+    reason: `Harness ${readiness.version} (${profile})`,
     fellBack: false,
   };
 }
@@ -93,14 +98,18 @@ export function selectBackendForModel(model, { harnessHome = HARNESS_HOME, apiKe
 //
 // Each attempt still gets a fresh worktree; nothing about an interrupted attempt is reused.
 export class BackendRouter {
-  constructor({ harnessHome = HARNESS_HOME, apiKey = null, prefer = "harness" } = {}) {
+  constructor({
+    harnessHome = HARNESS_HOME, apiKey = null, prefer = "harness",
+    profile = DEFAULT_CAPABILITY_PROFILE,
+  } = {}) {
     this.harnessHome = harnessHome;
     this.apiKey = apiKey;
     this.prefer = prefer;
+    this.profile = profile;
     this.harnessDisabled = null;
   }
 
-  select(model) {
+  select(model, { profile = this.profile } = {}) {
     if (this.harnessDisabled) {
       return {
         backend: new OpenCodeBackend({ attach: process.env.DELEGATE_WAVE_OPENCODE_ATTACH }),
@@ -110,7 +119,7 @@ export class BackendRouter {
       };
     }
     return selectBackendForModel(model, {
-      harnessHome: this.harnessHome, apiKey: this.apiKey, prefer: this.prefer,
+      harnessHome: this.harnessHome, apiKey: this.apiKey, prefer: this.prefer, profile,
     });
   }
 

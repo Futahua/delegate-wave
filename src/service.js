@@ -18,6 +18,7 @@ import {
   updateRefCas,
 } from "./git.js";
 import { runShell } from "./process.js";
+import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
 import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
@@ -99,9 +100,9 @@ export class Dispatcher {
   //
   // Chosen once, before the attempt row exists, and then used for the whole attempt. There is no
   // mid-attempt reselection: one attempt has one identity, one epoch, one worktree, one executor.
-  selectBackend(model) {
+  selectBackend(model, profile = undefined) {
     if (!this.router) return { backend: this.backend, selected: this.backend?.constructor?.name ?? "UnknownBackend" };
-    return this.router.select(model);
+    return this.router.select(model, profile ? { profile } : {});
   }
 
   close() { this.db.close(); }
@@ -137,24 +138,33 @@ export class Dispatcher {
 
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
-  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null }) {
+  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null }) {
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
-      id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)`).run(
-      jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost, timestamp, timestamp,
+      id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+      capability_profile, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`).run(
+      jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost,
+      capabilityProfile, timestamp, timestamp,
     );
     recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
     return this.getJob(jobId);
   }
 
-  async createJob({ projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null }) {
+  async createJob({
+    projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null, capabilityProfile = null,
+  }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
-    return transaction(this.db, () => this.insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost }));
+    // Validated at creation, so an unusable profile is refused when the job is described rather
+    // than discovered when a worker is about to run.
+    if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
+    return transaction(this.db, () => this.insertJobRow({
+      projectId, goal, mode, maxAttempts, baseSha, maximumCost, capabilityProfile,
+    }));
   }
 
   // --- Proposal-only work authority -------------------------------------------------------------
@@ -511,7 +521,9 @@ export class Dispatcher {
   async runJob(jobId, { model = null } = {}) {
     model = this.resolveModel(model);
     // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
-    const selection = this.selectBackend(model);
+    // A job may ask for a narrower worker; otherwise the system default applies.
+    const requestedProfile = this.getJob(jobId)?.capability_profile ?? undefined;
+    const selection = this.selectBackend(model, requestedProfile);
     const backend = selection.backend;
     if (!backend) throw new Error("No executor backend is available for this attempt");
     const job = this.getJob(jobId);
@@ -539,9 +551,14 @@ export class Dispatcher {
       const epoch = currentEpoch + 1;
       this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
       this.db.prepare(`INSERT INTO attempts(
-        id, job_id, ordinal, scheduler_epoch, backend, model, scheduler_pid, worktree_path, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        attemptId, jobId, ordinal, epoch, backend.constructor.name, model, process.pid, worktreePath, now(),
+        id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
+        scheduler_pid, worktree_path, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        attemptId, jobId, ordinal, epoch, backend.constructor.name,
+        // Recorded before the worker starts: the authority a worker ran under is evidence, not a
+        // detail to be reconstructed afterwards from which artifacts happen to exist.
+        backend.profile ?? null,
+        model, process.pid, worktreePath, now(),
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });

@@ -68,6 +68,7 @@ Commands:
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
   project list
   job create --project ID --goal TEXT [--mode read|write] [--max-attempts 2]
+                              [--capability-profile restricted] narrow the worker for this job
   job run --job ID [--model provider/model]
   job status --job ID
   job list [--project ID]
@@ -222,6 +223,8 @@ async function main() {
     print(await client.post("/v1/jobs", {
       projectId: required(options, "project"), goal: required(options, "goal"), mode: options.mode || "write",
       maxAttempts: Number(options["max-attempts"] || 2),
+      // Omitted means the system default, which is broad. Naming one asks for a narrower worker.
+      ...(options["capability-profile"] ? { capabilityProfile: options["capability-profile"] } : {}),
     }, requestId(options)));
   } else if (resource === "job" && action === "run") {
     const jobId = required(options, "job");

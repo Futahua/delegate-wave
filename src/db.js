@@ -11,7 +11,7 @@ import { managedPaths } from "./paths.js";
 // 13: durable cancellation intents and results.
 // 14: jobs carry an enforced cost ceiling.
 // 15: integration rollbacks are a first-class recorded outcome.
-export const SCHEMA_VERSION = "15";
+export const SCHEMA_VERSION = "16";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- A recorded ceiling in reference dollars. NULL means no ceiling; a value is enforced before each
   -- attempt starts, and unaccounted spend blocks rather than passes.
   maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
+  -- An explicit request for a narrower worker: a task run against something untrusted, or an
+  -- experiment with hidden verifiers. Null means the system default, which is broad.
+  capability_profile TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -59,6 +62,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     'NOT_RUN', 'PENDING', 'PASSED', 'FAILED'
   )),
   backend TEXT NOT NULL,
+  -- Under what authority this worker ran. Recorded because "what the worker could do" is a
+  -- selectable policy: reading an attempt's evidence later must not require guessing which one
+  -- was in force.
+  capability_profile TEXT,
   model TEXT,
   scheduler_pid INTEGER,
   executor_intent_id TEXT,
@@ -423,7 +430,15 @@ function migrate(db) {
   if (!jobColumns.includes("maximum_cost")) {
     db.exec("ALTER TABLE jobs ADD COLUMN maximum_cost REAL");
   }
+  if (!jobColumns.includes("capability_profile")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN capability_profile TEXT");
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
+  if (!attemptColumns.includes("capability_profile")) {
+    // Left null for attempts that predate capability profiles: they ran under the single fixed
+    // contract, and inventing a label for them would misreport history.
+    db.exec("ALTER TABLE attempts ADD COLUMN capability_profile TEXT");
+  }
   if (!attemptColumns.includes("validation_state")) {
     db.exec("ALTER TABLE attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT 'NOT_RUN'");
   }
