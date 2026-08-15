@@ -90,10 +90,10 @@ same reason a developer uses a branch despite trusting themselves.
 
 ```text
 head                 (see PR #15)
-tests                308, 307 passing, 1 skipped (file symlinks need Windows elevation;
+tests                318, 317 passing, 1 skipped (file symlinks need Windows elevation;
                      the directory-junction case covers the same property)
 frozen corpus        experiments/executor-ab-v1, digest b34387db..., recomputed and unchanged
-live gauntlet        10/10 (execution 7, recovery 3)
+live gauntlet        8/8 final sweep, plus the full Hermes-initiated product path
 doctor               healthy
 ```
 

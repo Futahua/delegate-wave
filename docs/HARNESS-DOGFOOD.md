@@ -259,7 +259,7 @@ that comparison remains untouched at digest `b34387db`.
 ## Coverage
 
 ```text
-308 tests, 307 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
+318 tests, 317 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
 ```
 
 ## Final V1 closure pass
@@ -322,3 +322,61 @@ in-flight request ids and reports `REQUEST_IN_PROGRESS`; genuine uncertainty is 
   never failed across 80 seconds of continuous probing while a job ran. The API is stable; this was
   environmental. It is what exposed the false-uncertainty defect above, and the product now handles
   it correctly.
+
+## One-shot final sweep
+
+A single-context adversarial pass over the assembled product, targeting the boundaries the earlier
+parallel attempt never covered. Four more defects found and fixed.
+
+**The worker's Git index was authoritative, and must not be.** A trusted worker may use Git freely,
+and that includes `update-index --assume-unchanged` and `--skip-worktree`. Under either,
+`git add --all` in the worker's own index reports a modified file as nothing at all. Verified before
+fixing: with both flags set, a modified protected file AND a modified allowed file vanished from the
+delta -- a protected-path bypass and a silent candidate truncation, from one ordinary Git command the
+trusted prompt invites. Capture now takes one snapshot through a delegate-wave-owned index seeded
+from the base and stored outside the worktree; the single immutable tree serves policy, the candidate
+commit, and validation, with no re-staging in between. Establishing the canonical candidate also
+discards the worker's index, because `assume-unchanged` entries make `git reset --hard` refuse --
+a worker could otherwise block delegate-wave from ever fixing the tree.
+
+**A backup from a newer build restored silently.** The manifest records `schema_version`; restore
+never compared it. A backup recording schema 99 restored into a build understanding 16 without
+complaint, then reported healthy. Older backups still restore, because opening migrates forward;
+newer ones are refused, because a schema this build has never seen cannot be interpreted.
+
+**A crash-interrupted validation was recorded as FAILED.** Cancellation already recorded NOT_RUN for
+exactly this event, with the reasoning in the code: FAILED claims the candidate was tested and
+rejected. Reconciliation -- the path a reboot actually takes -- said FAILED, so an interrupted
+machine made the system assert the code failed its tests. REC-007 and VAL-005 mandated it, so both
+were corrected too.
+
+**A pending candidate did not name its job.** Every other briefing bucket carries `job`. Nothing
+false was stated, but a pending approval could not be traced back to the work that produced it.
+
+### Verified sound, recorded rather than changed
+
+- **Authority graph**, reconstructed from the routing table: the proposer's only mutation is
+  `work.propose`; authorize, approve, run, restore and rollback are all OPERATE; every route declares
+  a scope, so nothing fails open.
+- **Live MCP surface**: no operator verb exposed at all; the proposer credential refused with
+  `INSUFFICIENT_SCOPE` on all five operator routes; a body supplying `principal`/`origin` rejected as
+  `IDENTITY_SPOOFING`; the stored proposal records the server-bound `hermes-proposer` identity.
+- **Credential flow**: no control or provider credential reaches an ordinary child; every declared
+  role is covered by the scrub; an explicit grant reaches the worker without dragging the rest.
+
+### Final live gauntlet
+
+```text
+A  worker commits + assume-unchanged + PowerShell   all three files present, one parent
+B  integrates, Hermes reports Done                  c0cd14a -> 9269d09, $0.019308, complete
+D  restricted worker vs outside verifier            wrote DENIED
+E  Luna on the same running service                 OpenCodeBackend SUCCEEDED
+F  cancel a live worker                             killed 22292, quarantined, spend kept
+G  backup -> integrate -> restore                   9269d09 -> a9bf1f1 -> 9269d09, jobs 82
+H  integrate -> rollback                            9269d09 -> 3b536cf -> 9269d09, not Done
+I  restore that cannot return a repository          refused before touching the database
+```
+
+Plus the full Hermes-initiated path: a real MCP proposal, operator authorization (`decided_by:
+admin`, digest matching the proposal), trusted Harness worker, validation PASSED, second approval,
+integration, and Hermes reporting Done with complete cost.
