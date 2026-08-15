@@ -251,3 +251,47 @@ test("the default profile is trusted, and an unknown one is refused", async () =
   assert.throws(() => capabilityProfile("bounded"), /Unknown capability profile/,
     "no silent fallback to a profile that was not asked for");
 });
+
+// The prompt must match the capability the worker was actually granted.
+//
+// A trusted worker configured with a shell but told "shell access is intentionally disabled" will
+// usually obey the instruction. The config would say trusted while the behaviour stayed restricted,
+// and the whole point of the default would be lost silently -- no error, just a weaker worker.
+test("the trusted prompt grants the tools the trusted profile actually enables", async () => {
+  const { workerPrompt } = await import("../src/harness/backend.js");
+  const prompt = workerPrompt({ goal: "add a totals file", mode: "write", profile: "trusted" });
+
+  assert.ok(!/shell access is intentionally disabled/i.test(prompt),
+    "a worker holding a shell must not be told it has none");
+  assert.ok(!/outside this worktree/i.test(prompt),
+    "an unfenced worker must not be told the filesystem is fenced");
+  assert.match(prompt, /shell/i, "and the tools it has are named, so it knows to use them");
+  assert.match(prompt, /code execution/i);
+});
+
+test("the restricted prompt still states the confinement it really has", async () => {
+  const { workerPrompt } = await import("../src/harness/backend.js");
+  const prompt = workerPrompt({ goal: "add a totals file", mode: "write", profile: "restricted" });
+  assert.match(prompt, /shell access is intentionally disabled/i);
+  assert.match(prompt, /outside this worktree/i);
+});
+
+// The one instruction that belongs in every write prompt: capability is broad, authority is not.
+test("both write prompts tell the worker its claims are not acceptance", async () => {
+  const { workerPrompt, CAPABILITY_PROFILES } = await import("../src/harness/backend.js");
+  for (const profile of Object.keys(CAPABILITY_PROFILES)) {
+    const prompt = workerPrompt({ goal: "x", mode: "write", profile });
+    assert.match(prompt, /not treat your own claims as acceptance/i, `${profile} states the invariant`);
+    assert.ok(!/\bgit (commit|push)\b/i.test(prompt.replace(/Do not commit[^.]*\./i, "")),
+      `${profile} does not invite the worker to commit`);
+  }
+});
+
+// Read mode changes nothing about capability; it changes what the worker is asked to produce.
+test("read mode is unchanged by the capability profile", async () => {
+  const { workerPrompt } = await import("../src/harness/backend.js");
+  assert.equal(
+    workerPrompt({ goal: "x", mode: "read", profile: "trusted" }),
+    workerPrompt({ goal: "x", mode: "read", profile: "restricted" }),
+  );
+});

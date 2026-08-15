@@ -119,6 +119,39 @@ export function wireModel(model) {
   return wire;
 }
 
+// What the worker is told it may do.
+//
+// This must match the profile it was actually granted. A worker configured with a shell but
+// instructed that "shell access is intentionally disabled" will usually obey the instruction, which
+// silently throws away the capability the profile was chosen to provide -- the config says trusted
+// and the behaviour stays restricted.
+//
+// The line that belongs in BOTH prompts is the one about acceptance. A worker may use the machine
+// freely; what it may not do is treat its own claims as the verdict. That is the invariant, and it
+// is stated to the worker rather than left implicit.
+export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+  const capabilities = capabilityProfile(profile);
+  const acceptance = "Do not treat your own claims as acceptance: delegate-wave validates the result "
+    + "afterwards and decides independently what is integrated.";
+
+  if (mode === "read") {
+    return "Investigate this task without modifying files. Return concise findings with exact file "
+      + `paths and evidence.\n\nTask: ${goal}`;
+  }
+
+  if (capabilities.fenced) {
+    return "Implement this bounded task in the current worktree. Do not commit, push, modify Git "
+      + "metadata, or access files outside this worktree. Shell access is intentionally disabled; "
+      + `edit only the necessary files. ${acceptance}\n\nTask: ${goal}`;
+  }
+
+  return "Implement this task, working from the current attempt worktree. Use the machine and "
+    + "developer tools available to you: shell, code execution, package and build tools, network, "
+    + "tests, and other local project resources, whenever they help you get it right. Do not commit "
+    + `or push -- delegate-wave captures the candidate from your worktree itself. ${acceptance}`
+    + `\n\nTask: ${goal}`;
+}
+
 // Builds the profile patch for one attempt.
 //
 // Written per attempt rather than shared, because the persistence root and the fence root are both
@@ -318,9 +351,7 @@ export class HarnessBackend {
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
 
-    const prompt = mode === "read"
-      ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${goal}`
-      : `Implement this bounded task in the current worktree. Do not commit, push, modify Git metadata, or access files outside this worktree. Shell access is intentionally disabled; edit only the necessary files.\n\nTask: ${goal}`;
+    const prompt = workerPrompt({ goal, mode, profile: this.profile });
 
     const result = await runProcess(process.execPath, [
       this.entry, "--profile", "headless", "--patch", patchPath, prompt,

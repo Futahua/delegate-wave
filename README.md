@@ -195,9 +195,12 @@ is created, so an executor's ambient default is never used.
 ## Limits worth knowing
 
 - One machine, one user, one integration branch, serial integration.
-- Workers get read and edit inside their attempt worktree, and nothing else: no shell, no network, no
-  access outside the worktree. That fence is a trusted in-process boundary, not a kernel one; it is
-  sufficient only because workers cannot execute code.
+- Under the default `trusted` profile, workers have broad machine access and **no containment is
+  claimed**. That is deliberate: they are extensions of you, and the threat model is mistakes, not
+  malice. The disposable worktree is what makes a mistake cheap to undo.
+- Under `restricted`, the fence is a trusted in-process boundary, not a kernel one. It is sufficient
+  only because that profile has no shell, subprocess, or code runtime. Real isolation would need a
+  separate OS identity, a container, or a VM.
 - DPAPI protects credentials at rest. It is not a sandbox against code running as the same Windows
   user.
 - Integration never runs through your working checkout.

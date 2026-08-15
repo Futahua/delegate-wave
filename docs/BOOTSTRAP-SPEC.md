@@ -52,9 +52,28 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 ## Worker permissions
 
-**WRK-001** Bootstrap workers MAY read and edit only inside their attempt worktree.
+Worker capability is a policy choice, not an invariant of this system. What a worker may DO is
+selected per attempt by a capability profile; what delegate-wave ACCEPTS AS TRUE is fixed and appears
+in the rules below it. A worker may be powerful without being believed.
 
-**WRK-002** Bootstrap workers MUST NOT receive shell, external-directory, web, skill, question, or subagent permission.
+**WRK-001** Every attempt MUST run in its own disposable worktree, and a failed or interrupted
+attempt's worktree MUST be quarantined rather than reused. This is a recoverability and
+candidate-capture requirement, not a containment one: it holds under every capability profile.
+
+**WRK-002** The capability profile in force MUST be chosen before the attempt row is written and
+recorded on it. A worker MUST NOT be granted a capability its profile withholds, and MUST NOT be
+instructed that it lacks a capability its profile grants -- a prompt that contradicts the profile
+silently discards the capability, because a worker generally obeys the instruction.
+
+**WRK-002a** Under the `restricted` profile, workers MAY read and edit only inside their attempt
+worktree, and MUST NOT receive shell, external-directory, web, skill, question, or subagent
+permission. The confinement of reads is required wherever a task's oracle lives outside the worker's
+repository, since a worker that reads it can pass without doing the work.
+
+**WRK-002b** Under the `trusted` profile, workers MAY use shell, code execution, subprocesses,
+package and build tooling, network, and filesystem access beyond the worktree. No containment is
+claimed. This grants no authority: WRK-003 and WRK-006 through WRK-011 apply unchanged, and a
+worker's claim of success remains an observation.
 
 **WRK-003** Validation commands MUST run under dispatcher control after executor completion.
 
@@ -160,7 +179,11 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
 | AUTH-001, TRUTH-001 | `Dispatcher`, SQLite transactions | all dispatcher tests |
-| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
+| AUTH-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
+| WRK-001 | worktree per attempt; quarantine on failure | `dispatcher.test.js` (fresh worktree on fallback), `gauntlet.test.js` |
+| WRK-002 | profile recorded on the attempt; prompt matches the profile | `harness-fence.test.js` (trusted/restricted prompt), `dispatcher.test.js` |
+| WRK-002a | restricted fences reads, removes shell/code/skills | `harness-fence.test.js`; live restricted worker wrote DENIED (`HARNESS-DOGFOOD.md`) |
+| WRK-002b | trusted grants shell and broad access without authority | `harness-fence.test.js`; live trusted worker ran PowerShell and read outside (`HARNESS-DOGFOOD.md`) |
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
