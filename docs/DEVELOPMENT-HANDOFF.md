@@ -26,20 +26,50 @@ auto-advance      two human decisions instead of six operator steps
 Hermes surface    working / needs a decision / ready to check / done, with honest cost
 fence             symlink and junction aware attempt-root read/write/list/search confinement
 gauntlet          sixteen failure modes asserted as tests
+Harness           default executor, fenced filesystem, per-call usage evidence
 ```
+
+## Executors
+
+DeepSeek Harness is the default executor for ordinary work; OpenCode is the proven fallback, intact
+and unchanged. Selection is explicit, happens between attempts, and reports its reason, so a fallback
+is a readable fact rather than an inference from which artifacts appeared.
+
+```text
+preferred    HarnessBackend    @deepseek-ai/dsh@0.1.0-rc.6, pinned, via the OpenCode Go route
+fallback     OpenCodeBackend   chosen when Harness is absent, mis-versioned, or has no credential
+switch       DELEGATE_WAVE_BACKEND=opencode selects OpenCode explicitly (not a degradation)
+```
+
+Never mid-attempt: a failover inside an attempt would put two executors behind one attempt identity.
+A Harness attempt that dies is a failed attempt, and its worktree is quarantined, never reused.
+
+Why Harness is preferred: reasoning effort is pinned rather than inherited from a route default, the
+filesystem is confined to the attempt worktree by delegate-wave's own fence, and usage arrives as
+durable per-call evidence instead of being scraped from a transcript.
+
+The filesystem fence is a correctness requirement, not hardening. Harness's own sandbox fences writes
+only -- its source says reads pass through in every mode -- and a live worker proved it by returning
+the contents of an absolute path outside its workspace. The trusted verifiers deliberately live
+outside the worker repository, so an unfenced worker could pass every task without doing the work.
+The fence replaces the `fs` provider outright, and the backend boots the composed profile first and
+refuses to run if the fence is not really in it.
+
+Still a trusted in-process path check, not a kernel boundary. It holds only because this worker has
+no shell, no subprocess, and no code runtime.
 
 ## Still deferred, deliberately
 
 ```text
-HarnessBackend       the restricted profile and wire compatibility are proven; the JSON-RPC usage
-                     path is not, so no route protocol is frozen and no A/B has been run
-executor A/B         blocked on the above; OpenCode remains production
+executor A/B         Harness shipped on its merits; no comparison has been run
 concurrent waves     one integration branch, serial integration
 T3-native execution, multi-machine scheduling, hosted CI, automatic routing
 ```
 
-The Harness work is recorded in `experiments/records/`. The frozen task corpus for that comparison is
-`experiments/executor-ab-v1`, digest b34387db, merge commit 7ef7b74f, untouched.
+The Harness work is recorded in `experiments/records/`, including
+`harness-rc6-integration-findings.md`, which corrects three assumptions made before the package was
+installed. The frozen task corpus for a future comparison is `experiments/executor-ab-v1`, digest
+b34387db, merge commit 7ef7b74f, untouched.
 
 ## Mission
 
