@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { backup as sqliteBackup } from "node:sqlite";
 import { managedPaths } from "./paths.js";
+import { SCHEMA_VERSION } from "./db.js";
 import { resolveRevision, updateRefCas, isAncestor } from "./git.js";
 
 const now = () => new Date().toISOString();
@@ -176,6 +177,23 @@ export async function restoreBackup({
   const verified = verifyBackup(backupDirectory);
   if (!verified.intact) {
     throw new Error(`Refusing to restore a damaged backup: ${JSON.stringify(verified.damaged)}`);
+  }
+
+  // A backup from a NEWER build cannot be restored into this one.
+  //
+  // Opening a database migrates it forward, so an older backup is fine -- that is the ordinary case
+  // and it stays supported. The reverse is not knowable: a newer schema may carry tables, columns,
+  // or column meanings this build has never heard of, and `CREATE TABLE IF NOT EXISTS` plus additive
+  // migration would leave them in place while reporting healthy. Refusing is the only honest answer,
+  // because the alternative is operating confidently on a database we cannot interpret.
+  const recorded = Number(verified.manifest.schema_version);
+  const current = Number(SCHEMA_VERSION);
+  if (Number.isFinite(recorded) && Number.isFinite(current) && recorded > current) {
+    throw new Error(
+      `Refusing to restore a backup from a newer delegate-wave: the backup records schema `
+      + `${verified.manifest.schema_version} but this build understands ${SCHEMA_VERSION}. `
+      + "Run the newer build to restore it.",
+    );
   }
 
   // Default restore is all-or-nothing. `--database-only` is the escape hatch, and it is incoherent

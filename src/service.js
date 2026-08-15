@@ -920,6 +920,9 @@ export class Dispatcher {
       .map((row) => ({
         decision: "approve to integrate, or roll back later",
         proposal: row.id,
+        // Carried like every other bucket. Without it a pending approval cannot be correlated back
+        // to the work that produced it, so Hermes cannot answer "what happened to what I proposed".
+        job: row.job_id,
         project: row.project,
         goal: short(row.goal),
         cost: jobCost(row.job_id),

@@ -465,3 +465,68 @@ test("restoreBackup itself records the unresolved condition and refuses to repor
     await cleanup();
   }
 });
+
+// A backup from a newer build must be refused, not silently accepted.
+//
+// Opening a database migrates it forward, so restoring an OLDER backup is the ordinary supported
+// case. The reverse is not knowable: a newer schema may carry tables, columns, or column meanings
+// this build has never seen, and `CREATE TABLE IF NOT EXISTS` plus additive migration would leave
+// them in place while `doctor` reported healthy -- operating confidently on a database it cannot
+// interpret.
+test("a backup recording a newer schema version is refused", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  let backupDir = null;
+  try {
+    await service.addProject({ name: "schema-guard", repoPath: repo, validation: [] });
+    backupDir = (await service.backup("newer")).backup;
+  } finally {
+    service.close();
+  }
+
+  // Rewrite the manifest as a genuinely newer build would have produced it, checksums included, so
+  // the damaged-backup guard is not what fires.
+  const manifestPath = path.join(backupDir, "manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  manifest.schema_version = String(Number(SCHEMA_VERSION) + 7);
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const reopened = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    await assert.rejects(
+      () => reopened.restore(backupDir),
+      /newer delegate-wave/,
+      "restoring a future schema into this build must fail closed",
+    );
+    assert.equal(reopened.doctor().healthy, true, "and the untouched system stays healthy");
+  } finally {
+    reopened.close();
+    await cleanup();
+  }
+});
+
+test("a backup from an older schema still restores", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  let backupDir = null;
+  try {
+    await service.addProject({ name: "older", repoPath: repo, validation: [] });
+    backupDir = (await service.backup("older")).backup;
+  } finally {
+    service.close();
+  }
+
+  const manifestPath = path.join(backupDir, "manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  manifest.schema_version = "1";
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const reopened = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    const restored = await reopened.restore(backupDir);
+    assert.equal(restored.coherent, true, "forward migration is the ordinary supported case");
+  } finally {
+    reopened.close();
+    await cleanup();
+  }
+});

@@ -170,3 +170,29 @@ test("an already-integrated proposal stops asking for a decision", async (t) => 
   assert.deepEqual(after.needs_your_decision, [], "after integration it needs nothing");
   assert.equal(after.done.length, 1);
 });
+
+// Every briefing bucket must identify the job it is talking about.
+//
+// Candidate entries carried a proposal id but no job id, so a pending approval could not be
+// correlated back to the work that produced it. Nothing false was stated, but Hermes could not
+// answer "what happened to the thing I proposed", and the inconsistency misled a test written
+// against the surface.
+test("a pending candidate names the job it came from", async (t) => {
+  const { service, repo } = await fixture(t);
+  const project = await service.addProject({
+    name: "candidate-identity", repoPath: repo, branch: "integration", validation: [],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "produce a candidate" });
+  await service.runJob(job.id);
+  await service.proposeIntegration({ jobId: job.id });
+
+  const briefing = service.briefing();
+  const candidate = briefing.needs_your_decision.find((entry) => String(entry.proposal).startsWith("proposal_"));
+  assert.ok(candidate, "the candidate awaits a decision");
+  assert.equal(candidate.job, job.id, "and says which job it belongs to");
+  for (const bucket of ["working", "ready_to_check", "done"]) {
+    for (const entry of briefing[bucket]) {
+      assert.ok(entry.job, `${bucket} entries identify their job`);
+    }
+  }
+});
