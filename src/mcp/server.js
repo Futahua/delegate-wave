@@ -8,7 +8,8 @@ const TOOLS = Object.freeze([
     name: "get_status",
     description:
       "The everyday answer to 'what is happening': what is working, what needs your decision, what "
-      + "is ready to check, and what finished, with cost. Start here.",
+      + "is ready to check, what finished, and what was integrated and then rolled back, with cost. "
+      + "Start here.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -156,6 +157,21 @@ export function summarizeStatus(status) {
     const spent = status.done.reduce((total, job) => total + (job.cost.reference_cost_usd ?? 0), 0);
     const partial = status.done.some((job) => !job.cost.complete);
     parts.push(`Done recently: ${status.done.length}, about $${spent.toFixed(4)}${partial ? " (some cost unmeasured)" : ""}`);
+  }
+  // Named explicitly rather than folded into a count. Someone who watched this work succeed needs
+  // to be told its change is no longer present -- and told what the branch went back to, so the
+  // statement can be checked rather than taken on trust.
+  if (status.reverted?.length) {
+    const first = status.reverted[0];
+    const rest = status.reverted.length - 1;
+    // The goal is a sentence of its own and usually ends in a period; embedded mid-sentence that
+    // reads as "...taken-back. was rolled back". Trailing punctuation is dropped so the line is one
+    // sentence rather than two collided together.
+    const goal = String(first.goal).replace(/[.!?\s]+$/, "");
+    parts.push(
+      `Reverted: "${goal}" was rolled back to ${first.restored_to.slice(0, 7)}; it had succeeded, `
+      + `but its change is no longer present${rest > 0 ? `, and ${rest} more` : ""}`,
+    );
   }
   if (!parts.length) parts.push("Nothing running, nothing waiting on you");
   if (!status.healthy) parts.push("delegate-wave reports a health problem; run doctor");

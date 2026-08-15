@@ -196,3 +196,60 @@ test("a pending candidate names the job it came from", async (t) => {
     }
   }
 });
+
+// A rolled-back job must be accounted for, not merely removed.
+//
+// Rollback truth was already correct: the job leaves `done`, because its change is no longer
+// present. But it then appeared in no bucket at all, so work the person watched succeed simply
+// vanished from the everyday answer with no statement of what happened to it.
+test("an integration that was rolled back is reported as reverted", async (t) => {
+  const { service, repo } = await fixture(t);
+  const project = await service.addProject({
+    name: "reverted-bucket", repoPath: repo, branch: "integration", validation: [],
+  });
+  const before = await command("git", ["-C", repo, "rev-parse", "integration"], repo);
+
+  const job = await service.createJob({ projectId: project.id, goal: "work that gets taken back" });
+  await service.runJob(job.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+
+  const integrated = service.briefing();
+  assert.ok(integrated.done.some((entry) => entry.job === job.id), "first it is done");
+  assert.equal(integrated.reverted.length, 0, "and nothing is reverted yet");
+
+  await service.rollbackIntegration({ proposalId: proposal.id, principal: "john", origin: "local-cli" });
+
+  const after = service.briefing();
+  assert.ok(!after.done.some((entry) => entry.job === job.id), "it is no longer done");
+  const entry = after.reverted.find((row) => row.job === job.id);
+  assert.ok(entry, "and it is reported as reverted rather than disappearing");
+  assert.equal(entry.restored_to, before, "the account names what the branch went back to");
+  assert.ok(entry.reverted_from && entry.reverted_from !== before, "and what it came from");
+  assert.ok(entry.rolled_back_at, "and when");
+
+  // Exactly one bucket: an item in two places is as confusing as an item in none.
+  const buckets = ["working", "needs_your_decision", "ready_to_check", "done", "reverted"]
+    .filter((name) => after[name].some((row) => row.job === job.id));
+  assert.deepEqual(buckets, ["reverted"]);
+});
+
+test("Hermes says a reverted change is no longer present", async (t) => {
+  const { service, repo } = await fixture(t);
+  const { summarizeStatus } = await import("../src/mcp/server.js");
+  const project = await service.addProject({
+    name: "reverted-wording", repoPath: repo, branch: "integration", validation: [],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "add a totals file" });
+  await service.runJob(job.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  service.grantApproval({ proposalId: proposal.id, principal: "john", origin: "terminal" });
+  await service.runIntegration(proposal.id);
+  await service.rollbackIntegration({ proposalId: proposal.id, principal: "john", origin: "local-cli" });
+
+  const sentence = summarizeStatus(service.briefing());
+  assert.match(sentence, /Reverted/, "the state is named");
+  assert.match(sentence, /no longer present/, "and its consequence stated plainly");
+  assert.match(sentence, /had succeeded/, "without implying the work itself failed");
+});

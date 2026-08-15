@@ -869,10 +869,15 @@ export class Dispatcher {
   //
   // One bounded answer to "what is happening", written for a person rather than for a machine.
   //
-  // Four states, because those are the four things worth knowing: something is running, something
-  // needs a decision, something is ready to check, or something finished. Raw transcripts, worktree
-  // paths, and internal identifiers are deliberately absent -- they are available on request through
-  // the detailed endpoints, and putting them here would bury the answer.
+  // Five states, because those are the things worth knowing: something is running, something needs a
+  // decision, something is ready to check, something finished, or something finished and was then
+  // taken back. Raw transcripts, worktree paths, and internal identifiers are deliberately absent --
+  // they are available on request through the detailed endpoints, and putting them here would bury
+  // the answer.
+  //
+  // `reverted` exists because a rolled-back job was correctly removed from `done` and then appeared
+  // nowhere at all. The truth was right and the account of it was missing: work the person watched
+  // succeed simply vanished, with no statement that its change is no longer present.
   briefing({ limit = 8 } = {}) {
     const doctor = this.doctor();
     const short = (text, max = 90) => {
@@ -960,6 +965,28 @@ export class Dispatcher {
         cost: jobCost(row.id),
       }));
 
+    // Integrated, then taken back. The job's own SUCCEEDED state is untouched -- the work really did
+    // succeed -- so the honest account is that the change is no longer present, not that the job
+    // failed. Ordered by when the rollback happened, since that is the event being reported.
+    const reverted = this.db.prepare(`SELECT j.id, j.goal, p.name AS project,
+        rb.to_sha, rb.from_sha, rb.integration_branch, rb.created_at AS rolled_back_at
+      FROM integration_rollbacks rb
+      JOIN integration_proposals ip ON ip.id = rb.proposal_id
+      JOIN jobs j ON j.id = ip.job_id
+      JOIN projects p ON p.id = j.project_id
+      ORDER BY rb.created_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        job: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        rolled_back_at: row.rolled_back_at,
+        // Both ends of the move, so the account is checkable rather than merely reassuring.
+        integration_branch: row.integration_branch,
+        reverted_from: row.from_sha,
+        restored_to: row.to_sha,
+        cost: jobCost(row.id),
+      }));
+
     return {
       schema_version: 1,
       healthy: doctor.healthy,
@@ -967,6 +994,7 @@ export class Dispatcher {
       needs_your_decision: [...proposals, ...candidates],
       ready_to_check: attention,
       done,
+      reverted,
       ...(doctor.healthy ? {} : { health_detail: {
         missing_repositories: doctor.missing_repositories.length,
         unresolved_integrations: doctor.unresolved_integrations.length,
