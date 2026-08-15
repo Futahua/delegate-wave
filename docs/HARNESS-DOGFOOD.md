@@ -162,12 +162,49 @@ One defect found by the first live job. The dispatcher names models by route
 `Model opencode-go/deepseek-v4-flash is not supported`. Ids are now translated through an explicit
 table that refuses unknown models rather than stripping any prefix.
 
+## Capability profiles: the fence became policy, not architecture
+
+The work above treated confinement as a system-wide invariant. That was the wrong frame for this
+product. Containment and governance are different concerns, and only one of them is what
+delegate-wave is for:
+
+```text
+capability policy   what a worker MAY DO          configurable, and broad by default
+authoritative       what delegate-wave ACCEPTS    never configurable
+```
+
+So `trusted` is now the default profile -- shell, PowerShell, code execution, subprocesses,
+developer tooling, skills, filesystem access beyond the worktree. A coding agent without a shell is
+simply worse at the job, and none of this system's guarantees ever rested on the worker being unable
+to reach a file.
+
+`restricted` is retained unchanged for the case where containment genuinely is the point: the frozen
+executor comparison, whose verifiers live outside the worker repository. A worker that reads them
+passes every task without doing the work -- a methodological failure, not a security one.
+
+Verified live on one running server, same prompt to both:
+
+```text
+trusted     ran `Get-ChildItem | Format-Table -AutoSize`, read the outside file, returned
+            SECRET-VERIFIER-CANARY-9f3a
+restricted  wrote DENIED; nothing leaked
+luna        routed to OpenCode, unaffected
+```
+
+All three produced COMPLETE receipts, and in every case validation, the candidate commit, and the
+second decision were delegate-wave's. The profile is chosen before the attempt row is written and
+recorded on it, so an attempt's evidence never requires guessing what authority it ran under.
+
 ## Limits, stated
 
-The fence is a trusted in-process path check, not a kernel boundary. It is sufficient only because
-this worker has no shell, no subprocess, and no code runtime -- `code-runtime` is disabled explicitly
-rather than assumed absent, since it *is* present in stock headless and Harness documents it as
-containment with authority comparable to a shell.
+Under `restricted`, the fence is a trusted in-process path check, not a kernel boundary. It is
+sufficient only because that profile has no shell, no subprocess, and no code runtime --
+`code-runtime` is disabled explicitly rather than assumed absent, since it *is* present in stock
+headless and Harness documents it as containment with authority comparable to a shell.
+
+Under `trusted`, no containment is claimed. That is deliberate: the worker is an extension of its
+operator, and the threat model is mistakes, not malice. Worktrees remain mandatory for exactly that
+reason -- cheap rollback and clean candidate capture, the same reason a developer uses a branch.
 
 No A/B has been run. Harness ships on its merits, not on a measured comparison; the frozen corpus for
 that comparison remains untouched at digest `b34387db`.
@@ -175,5 +212,5 @@ that comparison remains untouched at digest `b34387db`.
 ## Coverage
 
 ```text
-273 tests, 272 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
+290 tests, 289 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
 ```
