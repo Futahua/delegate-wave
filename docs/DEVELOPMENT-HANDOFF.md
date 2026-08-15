@@ -24,9 +24,9 @@ budget            enforced ceilings; unmeasured spend blocks rather than passes
 recovery          backup with checksums, verified restore, compare-and-swap rollback
 auto-advance      two human decisions instead of six operator steps
 Hermes surface    working / needs a decision / ready to check / done, with honest cost
-fence             symlink and junction aware attempt-root read/write/list/search confinement
+fence             symlink and junction aware attempt-root confinement, for `restricted` work
 gauntlet          sixteen failure modes asserted as tests
-Harness           default executor, fenced filesystem, per-call usage evidence
+Harness           default executor, selectable capability profile, per-call usage evidence
 ```
 
 ## Executors
@@ -36,27 +36,51 @@ and unchanged. Selection is explicit, happens between attempts, and reports its 
 is a readable fact rather than an inference from which artifacts appeared.
 
 ```text
-preferred    HarnessBackend    @deepseek-ai/dsh@0.1.0-rc.6, pinned, via the OpenCode Go route
-fallback     OpenCodeBackend   chosen when Harness is absent, mis-versioned, or has no credential
+Flash, Pro   HarnessBackend    @deepseek-ai/dsh@0.1.0-rc.6, pinned, via the OpenCode Go route
+Luna         OpenCodeBackend   the review lane by design; Harness cannot run this model
+fallback     OpenCodeBackend   when Harness is absent, mis-versioned, or has no credential
 switch       DELEGATE_WAVE_BACKEND=opencode selects OpenCode explicitly (not a degradation)
 ```
+
+Selection is per attempt, from the resolved model, and recorded on the attempt row alongside the
+capability profile.
 
 Never mid-attempt: a failover inside an attempt would put two executors behind one attempt identity.
 A Harness attempt that dies is a failed attempt, and its worktree is quarantined, never reused.
 
-Why Harness is preferred: reasoning effort is pinned rather than inherited from a route default, the
-filesystem is confined to the attempt worktree by delegate-wave's own fence, and usage arrives as
-durable per-call evidence instead of being scraped from a transcript.
+Why Harness is preferred: reasoning effort is pinned rather than inherited from a route default,
+usage arrives as durable per-call evidence instead of being scraped from a transcript, and its
+capability profile is selectable.
 
-The filesystem fence is a correctness requirement, not hardening. Harness's own sandbox fences writes
-only -- its source says reads pass through in every mode -- and a live worker proved it by returning
-the contents of an absolute path outside its workspace. The trusted verifiers deliberately live
-outside the worker repository, so an unfenced worker could pass every task without doing the work.
-The fence replaces the `fs` provider outright, and the backend boots the composed profile first and
-refuses to run if the fence is not really in it.
+## Capability is policy; authority is not
 
-Still a trusted in-process path check, not a kernel boundary. It holds only because this worker has
-no shell, no subprocess, and no code runtime.
+The governing rule: **agents are trusted operators, not trusted authorities.** Capability may be
+broad. Permanence stays governed.
+
+```text
+trusted     default. Shell, PowerShell, code execution, subprocesses, developer tooling,
+            skills, filesystem access beyond the worktree.
+restricted  attempt-root filesystem fence; no shell, code runtime, or skills.
+```
+
+`trusted` is the default because these workers are extensions of their operator. Denying a coding
+agent a shell makes it worse at the job, and this system's value never rested on the worker being
+unable to reach a file -- it rests on the worker's claims being checked.
+
+`restricted` is not deprecated. It is required wherever containment is genuinely the point: the
+frozen executor comparison's trusted verifiers live outside the worker repository, and a worker that
+reads them passes every task without doing the work. That is a methodological failure, not a security
+one. Its fence replaces the `fs` provider outright, because Harness's own sandbox fences writes only
+-- its source says reads pass through in every mode -- and the backend boots the composed profile
+first and refuses to run if the fence is not really in it.
+
+The fence remains a trusted in-process path check, not a kernel boundary. Under `restricted` that
+holds because the worker has no shell, subprocess, or code runtime.
+
+No profile changes who computes the Git diff, who runs validation, what counts as cost evidence, what
+may be integrated, attempt identity and fencing, worktree quarantine, or the two-decision flow.
+Worktrees stay mandatory for mutating jobs -- for recoverability and clean candidate capture, the
+same reason a developer uses a branch despite trusting themselves.
 
 ## Still deferred, deliberately
 
@@ -94,7 +118,7 @@ Human intent
   -> Control API (the authority boundary)
   -> deterministic policy and state machines
   -> SQLite operational truth + Git code truth
-  -> disposable OpenCode workers
+  -> disposable workers (Harness by default, OpenCode for review and fallback)
   -> Codex only for judgment, escalation, integration conflict
 ```
 
