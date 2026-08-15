@@ -168,3 +168,21 @@ test("the same real usage prices identically from either backend", async () => {
   }).reference_cost_usd;
   assert.equal(price(harness, "harness"), price(opencode, "opencode"));
 });
+
+// The dispatcher names models by route (`provider/model`); Harness's adapter wants the bare wire
+// model, with the route carried separately by baseURL. Passing the qualified id straight through
+// produced "Model opencode-go/deepseek-v4-flash is not supported" from an otherwise correct run.
+test("route-qualified model ids are translated to wire models", async () => {
+  const { wireModel } = await import("../src/harness/backend.js");
+  assert.equal(wireModel("opencode-go/deepseek-v4-flash"), "deepseek-v4-flash");
+  assert.equal(wireModel("opencode-go/deepseek-v4-pro"), "deepseek-v4-pro");
+  assert.equal(wireModel("deepseek-v4-flash"), "deepseek-v4-flash", "an already-bare id passes through");
+});
+
+// Guessing by stripping any prefix would turn a typo, or a model this route does not carry, into a
+// confusing auth failure deep inside the worker instead of a clear refusal before it starts.
+test("an unknown model is refused rather than guessed", async () => {
+  const { wireModel } = await import("../src/harness/backend.js");
+  assert.throws(() => wireModel("some-other-provider/gpt-9"), /no wire model/);
+  assert.throws(() => wireModel("deepseek-v9-imaginary"), /no wire model/);
+});

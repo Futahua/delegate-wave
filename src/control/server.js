@@ -4,7 +4,7 @@ import os from "node:os";
 import { initializeDataRoot } from "../db.js";
 import { dataRoot } from "../paths.js";
 import { Dispatcher } from "../service.js";
-import { OpenCodeBackend } from "../backend.js";
+import { selectBackend } from "../harness/select.js";
 import { matchRoute, PRINCIPAL_SCOPES, SCOPES } from "./contract.js";
 import { ControlError, asControlError } from "./errors.js";
 import { ControlService } from "./service.js";
@@ -116,10 +116,18 @@ export async function startControlServer({
   observerPrincipalId = process.env.DELEGATE_WAVE_CONTROL_OBSERVER_PRINCIPAL || "hermes",
   proposerToken = process.env.DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN || null,
   proposerPrincipalId = process.env.DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL || "hermes-proposer",
-  backend = new OpenCodeBackend({ attach: process.env.DELEGATE_WAVE_OPENCODE_ATTACH }),
+  executorApiKey = process.env.DELEGATE_WAVE_EXECUTOR_API_KEY || null,
+  preferBackend = process.env.DELEGATE_WAVE_BACKEND || "harness",
+  backend = null,
 } = {}) {
   initializeDataRoot(root);
-  const dispatcher = new Dispatcher({ root, backend });
+  // Harness is the preferred executor; OpenCode is the proven fallback. The choice is made once,
+  // here, between attempts -- never inside one, which would put two executors behind a single
+  // attempt identity.
+  const selection = backend
+    ? { backend, selected: "supplied", reason: "supplied by the caller", fellBack: false }
+    : selectBackend({ apiKey: executorApiKey, prefer: preferBackend });
+  const dispatcher = new Dispatcher({ root, backend: selection.backend });
   const service = new ControlService({ dispatcher });
   const server = createControlServer({
     service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
@@ -132,6 +140,9 @@ export async function startControlServer({
   return {
     server,
     dispatcher,
+    // Reported, not inferred from which executor's artifacts turn up. A fallback to OpenCode is an
+    // operational fact the operator should be able to read directly.
+    executor: { selected: selection.selected, reason: selection.reason, fell_back: selection.fellBack },
     url: `http://${host}:${address.port}`,
     async close() {
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

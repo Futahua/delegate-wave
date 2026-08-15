@@ -55,6 +55,32 @@ const yamlString = (value) => JSON.stringify(String(value));
 // of a file is held for diff comparison.
 const DIFF_BASIS_MAX_BYTES = 1024 * 1024;
 
+// The dispatcher names models by route, as `provider/model`. Harness's DeepSeek adapter wants the
+// bare wire model, and the route is expressed separately by baseURL -- so the prefix is stripped
+// rather than passed through, which is what produced "Model opencode-go/deepseek-v4-flash is not
+// supported" from a run that was otherwise correct.
+//
+// Only models known to exist on this route are accepted. Guessing by stripping any prefix would
+// turn a typo, or a model this route does not carry, into a confusing auth failure deep inside the
+// worker instead of a clear refusal here.
+export const WIRE_MODELS = Object.freeze({
+  "opencode-go/deepseek-v4-flash": "deepseek-v4-flash",
+  "opencode-go/deepseek-v4-pro": "deepseek-v4-pro",
+  "deepseek-v4-flash": "deepseek-v4-flash",
+  "deepseek-v4-pro": "deepseek-v4-pro",
+});
+
+export function wireModel(model) {
+  const wire = WIRE_MODELS[model];
+  if (!wire) {
+    throw new Error(
+      `HarnessBackend has no wire model for ${model}. `
+      + `Known: ${Object.keys(WIRE_MODELS).join(", ")}`,
+    );
+  }
+  return wire;
+}
+
 // Builds the profile patch for one attempt.
 //
 // Written per attempt rather than shared, because the persistence root and the fence root are both
@@ -127,7 +153,8 @@ export function buildAttemptPatch({ worktreePath, artifactDir, model, baseUrl, a
 export class HarnessBackend {
   constructor({
     harnessHome,
-    model = "deepseek-v4-flash",
+    // Route-qualified, matching how the dispatcher names models; wireModel() strips the route.
+    model = "opencode-go/deepseek-v4-flash",
     baseUrl = "https://opencode.ai/zen/go/v1",
     apiKeyEnv = "OPENCODE_GO_API_KEY",
     apiKey = null,
@@ -216,7 +243,9 @@ export class HarnessBackend {
     fs.writeFileSync(patchPath, buildAttemptPatch({
       worktreePath,
       artifactDir,
-      model,
+      // Translated, not passed through: the route is carried by baseUrl, and the adapter wants the
+      // bare wire model. An unknown id throws here rather than failing as an auth error mid-run.
+      model: wireModel(model),
       baseUrl: this.baseUrl,
       apiKeyEnv: this.apiKeyEnv,
       reasoningEffort: this.reasoningEffort,

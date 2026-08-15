@@ -25,6 +25,13 @@ const PROPOSER_SECRET_NAMES = [
   "DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL",
 ];
 
+// The model-provider key a worker needs. It is not a control-plane credential -- it grants no
+// authority over this system -- but it is a secret, so it is stored the same way and loaded only by
+// the process that spawns workers.
+const EXECUTOR_SECRET_NAMES = [
+  "DELEGATE_WAVE_EXECUTOR_API_KEY",
+];
+
 // Each record is protected as its own DPAPI blob so that a process may decrypt the credential it
 // needs without ever materializing the credential it must not hold (SUP-005).
 //
@@ -39,6 +46,9 @@ export const SECRET_RECORDS = {
   // existed and must keep validating. Flipping this to `required: true` once installs provision a
   // proposal credential is an explicit cutover, not something "optional" silently becomes.
   proposer: { names: PROPOSER_SECRET_NAMES, token: "DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN", required: false },
+  // Optional for the same reason: an installation without it still runs, falling back to the
+  // executor that carries its own credential. Requiring it would break existing installs on upgrade.
+  executor: { names: EXECUTOR_SECRET_NAMES, token: "DELEGATE_WAVE_EXECUTOR_API_KEY", required: false },
 };
 
 export const REQUIRED_SECRET_ROLES = Object.entries(SECRET_RECORDS)

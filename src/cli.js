@@ -92,7 +92,7 @@ Environment:
 async function serve() {
   const { startControlServer } = await import("./control/server.js");
   const running = await startControlServer();
-  print({ serving: true, url: running.url });
+  print({ serving: true, url: running.url, executor: running.executor });
   const stop = async () => { await running.close(); process.exit(0); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
