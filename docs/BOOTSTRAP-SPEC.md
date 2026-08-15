@@ -50,11 +50,22 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **FS-004** Protected-path changes and Git-metadata changes MUST reject the candidate.
 
-**FS-005** The changed-file set MUST be computed as the worker's resulting tree compared to the
-recorded `base_sha`, with untracked files staged first. It MUST NOT be read from working-tree status:
-a worker may use Git normally, and one that commits its work leaves a clean status, while one that
-commits part of it leaves only the remainder visible. Both would understate the change, and the
-second would hide a committed protected-path change from FS-004.
+**FS-005** The changed-file set MUST be computed as the worker's resulting non-ignored filesystem
+tree compared to the recorded `base_sha`. It MUST NOT be derived from working-tree status, from the
+worker's HEAD, or from the worker's index. A worker may use Git normally: one that commits its work
+leaves a clean status; one that commits part of it leaves only the remainder visible; and one that
+sets `assume-unchanged` or `skip-worktree` makes a modified file invisible to its own index
+entirely. Each would understate the change, and each would hide a protected-path change from FS-004.
+
+**FS-005a** The snapshot MUST be taken through a delegate-wave-owned index, seeded from `base_sha`
+and stored outside the worktree, so that no worker index state can shape what is captured and the
+index file cannot capture itself. Exactly one snapshot MUST serve the policy check, the candidate
+commit, and the tree validation runs against; content MUST NOT be re-staged between them, because a
+second snapshot could admit content the policy check never saw.
+
+**FS-005b** Establishing the canonical candidate in the worktree MUST NOT be blockable by worker
+index state. `assume-unchanged` entries cause `git reset --hard` to refuse, so the worker's index is
+discarded rather than reset through; it is authoritative for nothing.
 
 **FS-006** The candidate MUST be one delegate-wave-owned commit whose parent is exactly the recorded
 `base_sha` and whose tree is the worker's resulting tree. Worker-created commits and branches are
@@ -169,7 +180,7 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 
 **VAL-004** Automatic integration MUST NOT occur in the bootstrap release.
 
-**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
+**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'NOT_RUN'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event. `FAILED` is reserved for a validation that actually ran and returned a failing verdict.
 
 **VAL-006** A validation MUST record fenced durable intent on its attempt row before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
 
@@ -189,7 +200,11 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 
 **REC-006** `doctor` and `reconcile` MUST detect both the executor-running (`terminal_state IS NULL`) and validation-pending (`SUCCEEDED` with `PENDING`) lifecycle phases.
 
-**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as `validation_state = 'FAILED'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to `PENDING` or `NEEDS_ATTENTION` by attempt limit.
+**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as
+`validation_state = 'NOT_RUN'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to
+`PENDING` or `NEEDS_ATTENTION` by attempt limit. It MUST NOT record `FAILED`: an interrupted
+validation reached no verdict, and `FAILED` asserts that the candidate was tested and rejected. The
+executor's own `SUCCEEDED` state is unaffected, because the executor really did succeed.
 
 **REC-008** Process-liveness probing MUST treat only definite process nonexistence as dead; access denial or an unknown probe failure MUST be treated as alive.
 
@@ -211,6 +226,8 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | ATT-007–ATT-012 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID and executor intent/PID receipts | invalid invocation, live executor, uncertain executor start, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-005 | base-relative changed-file set | `dispatcher.test.js` (worker commits all; commits A leaves B; protected path inside a commit) |
+| FS-005a | delegate-wave-owned snapshot index | `dispatcher.test.js` (assume-unchanged and skip-worktree, allowed and protected; arbitrary index/history state; index not self-captured) |
+| FS-005b | worker index cannot block the canonical reset | `dispatcher.test.js` (assume-unchanged allowed file still reaches the candidate) |
 | FS-006 | canonical candidate on `base_sha` | `dispatcher.test.js` (single parent, complete tree); live trusted worker in `HARNESS-DOGFOOD.md` |
 | FS-007 | no rename detection in the policy path | `dispatcher.test.js` (protected rename/move/replace rejected; allowed rename still succeeds) |
 | FS-008 | ignored output reported honestly | `dispatcher.test.js` (ignored-only output names the excluded files) |

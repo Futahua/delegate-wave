@@ -530,3 +530,44 @@ test("a backup from an older schema still restores", async (t) => {
     await cleanup();
   }
 });
+
+// A validation the machine interrupted produced no verdict.
+//
+// Cancellation already records NOT_RUN for exactly this situation, with the reasoning written into
+// the code: marking it FAILED would claim the candidate was tested and rejected. Reconciliation --
+// the path a crash or reboot actually takes -- recorded FAILED for the same real-world event, so an
+// interrupted machine made the system assert that the code failed its tests.
+test("reconciling an interrupted validation records NOT_RUN, not FAILED", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("candidate.txt") });
+  try {
+    const project = await service.addProject({
+      name: "interrupted", repoPath: repo, branch: "integration", validation: [],
+    });
+    const job = await service.createJob({ projectId: project.id, goal: "produce a candidate" });
+    await service.runJob(job.id);
+
+    // Put the attempt back into the validation-pending phase a crash would leave behind: the
+    // executor succeeded, validation was owned by a process that is now gone.
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    service.db.prepare(`UPDATE attempts SET validation_state = 'PENDING', finished_at = NULL,
+      validation_pid = 999999, scheduler_pid = 999998 WHERE id = ?`).run(attempt.id);
+
+    const reconciled = await service.reconcile({ apply: true });
+    assert.ok(reconciled.applied, "the dead attempt is reconcilable");
+
+    const after = service.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attempt.id);
+    assert.equal(after.validation_state, "NOT_RUN",
+      "an interrupted validation reached no verdict; FAILED would assert one it never made");
+    assert.equal(after.terminal_state, "SUCCEEDED", "the executor really did succeed");
+    assert.equal(after.quarantined, 1, "and the untested candidate is still quarantined");
+
+    const recorded = service.db.prepare(
+      "SELECT 1 FROM events WHERE kind = 'VALIDATION_INTERRUPTED' AND entity_id = ?",
+    ).get(attempt.id);
+    assert.ok(recorded, "the interruption itself is still recorded");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});

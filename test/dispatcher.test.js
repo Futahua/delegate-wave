@@ -567,7 +567,10 @@ test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING val
   const state = service.status(job.id);
   assert.equal(state.job.status, "PENDING");
   assert.equal(state.attempts[0].terminal_state, "SUCCEEDED");
-  assert.equal(state.attempts[0].validation_state, "FAILED");
+  // NOT_RUN, not FAILED: an interrupted validation reached no verdict, so recording FAILED would
+  // assert the candidate was tested and rejected. The quarantine is what keeps it out of
+  // integration; the verdict field only has to be true.
+  assert.equal(state.attempts[0].validation_state, "NOT_RUN");
   assert.equal(state.attempts[0].quarantined, 1);
   assert.equal(state.attempts[0].worktree_locked, 1);
   const interrupted = service.db.prepare(

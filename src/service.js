@@ -1914,7 +1914,12 @@ export class Dispatcher {
         for (const attempt of candidates) {
           const interrupted = attempt.terminal_state === "SUCCEEDED";
           if (interrupted) {
-            this.db.prepare(`UPDATE attempts SET validation_state = 'FAILED', finished_at = ?,
+            // NOT_RUN, not FAILED -- the same reasoning cancellation already applies. A validation
+            // interrupted by a crash or restart produced no verdict, so recording FAILED would claim
+            // the candidate was tested and rejected. It was not tested at all. The attempt is still
+            // quarantined and the job still returns for another attempt; only the reason is honest.
+            this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN', finished_at = ?,
+              failure_signature = 'validation-interrupted',
               quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), attempt.id);
             recordEvent(this.db, { kind: "VALIDATION_INTERRUPTED", entityType: "attempt", entityId: attempt.id, epoch: claimedEpoch });
           } else {
