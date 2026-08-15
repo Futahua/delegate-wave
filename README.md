@@ -142,6 +142,7 @@ delegate-wave status                      # working / needs a decision / ready t
 delegate-wave proposal list               # what Hermes has proposed
 delegate-wave proposal authorize --proposal ID   # decision 1: runs the work
 delegate-wave integration approve --proposal ID  # decision 2: integrates it
+delegate-wave integration decline --proposal ID  # or decide not to; keeps every record
 ```
 
 Through Hermes, the same thing is one tool call: `get_status`, then `propose_work`.
@@ -158,7 +159,15 @@ delegate-wave backup restore --backup DIR         # database AND every repositor
 delegate-wave backup restore --backup DIR --database-only
 delegate-wave integration rollback --proposal ID  # put an integrated branch back
 delegate-wave restore resolve             # clear an unresolved restore once repos are reconciled
+delegate-wave job cancel --job ID         # also closes a queued or stuck job you are not pursuing
+delegate-wave project retire --project ID # stop tracking a project, keeping all its history
+delegate-wave project restore --project ID
 ```
+
+Retiring, closing and declining destroy nothing: every attempt, cost receipt, validation record and
+integration record survives. They only take work off the everyday surface, so a repository you no
+longer keep cannot make the health check fail forever and a job you have decided against does not sit
+in the decision queue.
 
 None of these require touching SQLite or Git by hand. Rollback is compare-and-swap and refuses if
 something else moved the branch.

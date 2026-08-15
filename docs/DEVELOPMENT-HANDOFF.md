@@ -97,9 +97,10 @@ live gauntlet        8/8 final sweep, plus the full Hermes-initiated product pat
 doctor               healthy
 ```
 
-Remaining UX work, in the order it will be taken: natural approval wording, failure phrasing (one
-useful human sentence first, technical evidence on demand), a read-only T3 cockpit, and then
-whatever actually annoys in daily use rather than anything from a roadmap.
+The Hermes polish list is done: reverted state, natural approval wording, human failure phrasing,
+and the three missing lifecycle verbs found by actually using it -- retire a project, close an open
+job, decline a candidate. What comes next is decided by use, not by a roadmap. A read-only T3 cockpit
+remains the obvious eventual UI.
 
 ## Still deferred, deliberately
 
