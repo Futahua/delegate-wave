@@ -29,31 +29,57 @@ export async function lockWorktree(repoPath, targetPath, reason) {
   await git(repoPath, ["worktree", "lock", "--reason", reason, targetPath]);
 }
 
-// The authoritative changed-file set: the worker's resulting tree compared to the recorded base.
+// One authoritative snapshot of what the attempt actually produced.
 //
-// NOT `git status`. A trusted worker may use Git normally, and one that commits its work leaves a
-// clean status -- which would read as "changed nothing" and discard real work. Worse, a worker that
-// commits A and leaves B uncommitted would show only B, so the protected-path check would inspect
-// only B while A rode along invisibly.
+// The worker's Git index is NOT authoritative, and neither is its HEAD. A trusted worker may use Git
+// freely, which includes index flags that make real filesystem changes invisible to the index it
+// owns:
 //
-// Staging the whole tree first is what makes untracked files part of the comparison; the diff is
-// then taken against the base commit rather than against HEAD, so whatever history the worker built
-// on top of the base is irrelevant to what we believe changed.
+//   git update-index --assume-unchanged <path>
+//   git update-index --skip-worktree    <path>
 //
-// `--no-renames` is load-bearing, not a detail. Rename detection is a SEMANTIC convenience: it
-// reports `protected/locked.txt -> allowed.txt` as one entry, and `--name-only` prints only the
-// destination. The protected source then never reaches the policy check, so a worker could move a
-// protected file out of its protected directory and have the change accepted. Policy needs every
-// path the tree touched, not Git's interpretation of what the change meant.
-export async function changedFilesSince(worktreePath, baseSha) {
-  await git(worktreePath, ["add", "--all"]);
-  const output = await git(
-    worktreePath,
-    ["diff", "--cached", "--name-only", "-z", "--no-renames", baseSha],
-    { raw: true },
-  );
-  if (!output) return [];
-  return [...new Set(output.split("\0").filter(Boolean).map((file) => file.replaceAll("\\", "/")))];
+// Under either flag `git add --all` in the worker's own index picks the change up as nothing at all.
+// Verified directly: a modified protected file and a modified allowed file both vanish, so policy
+// sees an empty delta and the candidate omits real work. That is both a protected-path bypass and a
+// silent candidate truncation.
+//
+// So the snapshot is taken through a delegate-wave-owned temporary index, seeded from the recorded
+// base and populated from the filesystem. The index lives OUTSIDE the worktree, or `git add --all`
+// would capture the index file itself. `.gitignore` still applies, because ignore rules are trusted
+// project configuration describing what is not source.
+//
+// The tree returned here is immutable and is the single source for everything downstream: the
+// changed-path set that policy judges, the commit that becomes the candidate, and the tree that
+// validation runs against. There is deliberately no second `add` between policy and commit -- a
+// re-snapshot could admit content the policy check never saw.
+export async function snapshotCandidate(worktreePath, baseSha, indexDirectory) {
+  fs.mkdirSync(indexDirectory, { recursive: true });
+  const indexFile = path.join(indexDirectory, `candidate-index-${process.pid}`);
+  const env = { GIT_INDEX_FILE: indexFile };
+  try {
+    // Seeded from the base rather than from the worker's index, so nothing the worker marked is
+    // carried over and every path is judged against the recorded starting point.
+    await git(worktreePath, ["read-tree", baseSha], { env });
+    await git(worktreePath, ["add", "--all"], { env });
+    const tree = await git(worktreePath, ["write-tree"], { env });
+
+    // `--no-renames` is load-bearing. Rename detection reports a move as one entry naming only the
+    // destination, which would hide a protected SOURCE path from the policy check: a worker could
+    // move a protected file out of its protected directory and have it accepted.
+    const output = await git(
+      worktreePath,
+      ["diff", "--name-only", "-z", "--no-renames", baseSha, tree],
+      { raw: true },
+    );
+    const files = output
+      ? [...new Set(output.split("\0").filter(Boolean).map((file) => file.replaceAll("\\", "/")))]
+      : [];
+    return { tree, files };
+  } finally {
+    // Removed on every path: a leaked index file would be captured by a later attempt.
+    fs.rmSync(indexFile, { force: true });
+    fs.rmSync(`${indexFile}.lock`, { force: true });
+  }
 }
 
 // Files the worker created that the project's own ignore rules exclude from the candidate.
@@ -76,19 +102,13 @@ export async function ignoredWorkerOutput(worktreePath, limit = 10) {
   return files.slice(0, limit);
 }
 
-// Builds delegate-wave's own candidate commit: the worker's resulting tree, parented exactly on the
-// recorded base.
+// Turns the already-captured tree into delegate-wave's candidate commit.
 //
-// `commit-tree` rather than `commit`, because `commit` would parent on whatever HEAD the worker left
-// behind. The candidate must be one commit containing the complete net change, so integration can
-// cherry-pick it and get everything the attempt produced -- not just the part the worker happened to
-// leave uncommitted.
-//
-// The worker's own commits and branches remain in the worktree as evidence of how it worked. They
-// are never the integration object.
-export async function captureCandidate(worktreePath, baseSha, message) {
-  await git(worktreePath, ["add", "--all"]);
-  const tree = await git(worktreePath, ["write-tree"]);
+// Takes the tree rather than re-reading the worktree, so the object committed is exactly the one
+// policy judged. `commit-tree` rather than `commit`, because `commit` would parent on whatever HEAD
+// the worker left behind; the candidate must be one commit on the recorded base carrying the
+// complete net change.
+export async function commitCandidateTree(worktreePath, tree, baseSha, message) {
   const baseTree = await git(worktreePath, ["rev-parse", `${baseSha}^{tree}`]);
   // Comparing trees, not statuses: identical trees mean the attempt produced nothing, however much
   // Git history the worker created along the way.
@@ -97,18 +117,24 @@ export async function captureCandidate(worktreePath, baseSha, message) {
     "-c", "user.name=delegate-wave", "-c", "user.email=delegate-wave@local",
     "commit-tree", tree, "-p", baseSha, "-m", message,
   ], {
-    // commit-tree reads identity and timestamps from the environment. Supplied explicitly so the
-    // candidate does not inherit whatever the worker configured, and so the commit is attributable
-    // to delegate-wave rather than to the worker that produced the tree.
+    // commit-tree reads identity from the environment. Supplied explicitly so the candidate does not
+    // inherit whatever the worker configured, and is attributable to delegate-wave.
     env: {
       GIT_AUTHOR_NAME: "delegate-wave", GIT_AUTHOR_EMAIL: "delegate-wave@local",
       GIT_COMMITTER_NAME: "delegate-wave", GIT_COMMITTER_EMAIL: "delegate-wave@local",
     },
   });
 
-  // Point the worktree at the candidate. Validation runs here afterwards, and it must see exactly
-  // the tree that was captured -- not the worker's HEAD, which may carry a different history and,
-  // if the worker committed only part of its work, a different tree.
+  // Point the worktree at the candidate. Validation runs here afterwards and must see exactly the
+  // tree that was captured -- not the worker's HEAD, and not a later filesystem state.
+  //
+  // The worker's index is discarded first rather than reset through. `assume-unchanged` and
+  // `skip-worktree` entries make `git reset --hard` refuse with "Entry 'x' not uptodate. Cannot
+  // merge.", so a worker could otherwise block delegate-wave from establishing the canonical tree
+  // simply by having marked a file. That index is not authoritative for anything, and Git rebuilds
+  // it from the commit being reset to, which also clears the stale bits.
+  const indexPath = await git(worktreePath, ["rev-parse", "--git-path", "index"]);
+  fs.rmSync(path.resolve(worktreePath, indexPath), { force: true });
   await git(worktreePath, ["reset", "--hard", commit]);
   return commit;
 }

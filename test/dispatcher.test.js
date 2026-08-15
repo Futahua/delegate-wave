@@ -1442,3 +1442,126 @@ test("an ordinary empty attempt still reports plainly that nothing changed", asy
     await cleanup();
   }
 });
+
+// The worker's Git index is not authoritative.
+//
+// A trusted worker may use Git freely, and that includes index flags:
+//
+//   git update-index --assume-unchanged <path>
+//   git update-index --skip-worktree    <path>
+//
+// Under either, `git add --all` in the worker's OWN index reports a modified file as nothing at all.
+// Capture that trusted the worker's index therefore both hid protected-path changes from policy and
+// silently dropped real work from the candidate. The snapshot is taken through a delegate-wave-owned
+// temporary index seeded from the recorded base, so no worker index state can shape it.
+const indexWorker = (flag, plan) => policyWorker(async ({ worktreePath, run }) => {
+  await plan({ worktreePath, run, mark: (...paths) => run("update-index", flag, ...paths) });
+});
+
+test("an assume-unchanged allowed file still reaches the candidate", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      await run("update-index", "--assume-unchanged", "allowed-a.txt");
+      fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "really changed\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED", "the change is real and must be captured");
+    const body = await gitIn(repo, "show", `${attempt.result_commit}:allowed-a.txt`);
+    assert.equal(body.trim(), "really changed", "the candidate carries what the filesystem holds");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("an assume-unchanged protected file is still caught by policy", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    await run("update-index", "--assume-unchanged", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "protected", "locked.txt"), "stolen\n");
+    fs.writeFileSync(path.join(worktreePath, "cover.md"), "an ordinary change\n");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "hiding a protected change in the worker's index must not bypass FS-004");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("a skip-worktree protected file is still caught by policy", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    await run("update-index", "--skip-worktree", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "protected", "locked.txt"), "stolen\n");
+    fs.writeFileSync(path.join(worktreePath, "cover.md"), "an ordinary change\n");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("a skip-worktree allowed file still reaches the candidate", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      await run("update-index", "--skip-worktree", "allowed-a.txt");
+      fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "skip-worktree change\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const body = await gitIn(repo, "show", `${attempt.result_commit}:allowed-a.txt`);
+    assert.equal(body.trim(), "skip-worktree change");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Arbitrary index and history state must be irrelevant: the candidate is the resulting filesystem.
+test("arbitrary staged, unstaged, untracked and committed state yields the filesystem tree", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      fs.writeFileSync(path.join(worktreePath, "staged.md"), "staged\n");
+      await run("add", "staged.md");
+      fs.writeFileSync(path.join(worktreePath, "committed.md"), "committed\n");
+      await run("add", "committed.md");
+      await run("commit", "-m", "worker commit");
+      await run("checkout", "-b", "worker-branch");
+      await run("tag", "worker-tag");
+      fs.writeFileSync(path.join(worktreePath, "untracked.md"), "untracked\n");
+      fs.writeFileSync(path.join(worktreePath, "staged.md"), "staged then modified\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const names = (await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit))
+      .split("\n").map((line) => line.trim());
+    for (const name of ["staged.md", "committed.md", "untracked.md"]) {
+      assert.ok(names.includes(name), `${name} is in the candidate`);
+    }
+    assert.equal((await gitIn(repo, "show", `${attempt.result_commit}:staged.md`)).trim(),
+      "staged then modified", "the filesystem wins over what was staged earlier");
+    const parents = (await gitIn(repo, "rev-list", "--parents", "-n", "1", attempt.result_commit)).split(" ");
+    assert.equal(parents.length, 2, "still exactly one parent despite the worker's branch and tag");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The temporary index must not become part of what it captures.
+test("the capture index is not itself captured", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t, async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "ordinary.md"), "work\n");
+  });
+  try {
+    const names = await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit);
+    assert.ok(!/candidate-index/.test(names), "the delegate-wave index must live outside the worktree");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});

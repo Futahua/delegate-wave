@@ -5,10 +5,10 @@ import { openDatabase, recordEvent, transaction } from "./db.js";
 import { managedPaths } from "./paths.js";
 import {
   assertRepository,
-  changedFilesSince,
+  snapshotCandidate,
   ignoredWorkerOutput,
   cherryPick,
-  captureCandidate,
+  commitCandidateTree,
   createDetachedWorktree,
   git,
   isAncestor,
@@ -616,23 +616,27 @@ export class Dispatcher {
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
 
-      // Candidate capture is base-relative, not status-relative.
+      // ONE snapshot of what the attempt actually produced, taken through a delegate-wave-owned
+      // temporary index rather than the worker's.
       //
-      // A trusted worker may use Git normally, including local commits. Its history is workspace
-      // activity and evidence, never the integration object: what delegate-wave accepts is the net
-      // tree the attempt produced, compared to the base it was given. Reading `git status` instead
-      // would see nothing at all from a worker that committed its work, and would see only the
-      // uncommitted remainder from one that committed part of it -- which would also hide the
-      // committed part from the protected-path check.
-      const files = await changedFilesSince(worktreePath, job.base_sha);
+      // A trusted worker may use Git freely, and that includes `update-index --assume-unchanged` and
+      // `--skip-worktree`, under which `git add --all` in the worker's own index reports a modified
+      // file as nothing at all -- hiding it from the protected-path check and dropping it from the
+      // candidate. Neither the worker's index nor its HEAD is authoritative; the resulting
+      // non-ignored filesystem tree is.
+      //
+      // Policy, the candidate commit, and the tree validation runs against all come from this single
+      // immutable tree. Nothing is re-staged in between, so content the policy check never saw
+      // cannot slip into what gets integrated.
+      const snapshot = await snapshotCandidate(worktreePath, job.base_sha, artifactDir);
+      const files = snapshot.files;
       this.assertAllowedDiff(files, parseJson(project.protected_json));
       let resultCommit = null;
       if (job.mode === "write") {
         if (files.length === 0) {
           // Distinguish "did nothing" from "everything it produced is excluded by this project's own
-          // ignore rules". Both fail the attempt, but only one of them is honestly described as
-          // changing nothing, and the other is confusing precisely because the output is visible on
-          // disk in the worktree.
+          // ignore rules". Both fail the attempt, but only one is honestly described as changing
+          // nothing, and the other is confusing because the output is visible in the worktree.
           const ignored = await ignoredWorkerOutput(worktreePath);
           if (ignored.length) {
             throw new Error(
@@ -642,8 +646,9 @@ export class Dispatcher {
           }
           throw new Error("worker completed without changing files");
         }
-        resultCommit = await captureCandidate(
-          worktreePath, job.base_sha, `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`,
+        resultCommit = await commitCandidateTree(
+          worktreePath, snapshot.tree, job.base_sha,
+          `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`,
         );
       }
 
