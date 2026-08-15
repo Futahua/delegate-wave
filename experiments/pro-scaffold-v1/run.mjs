@@ -17,9 +17,24 @@ import { runProcess } from "../../src/process.js";
 import { TASKS } from "./tasks.mjs";
 import { HARD_TASKS } from "./tasks-hard.mjs";
 
+// C is the only config that varies the thing this study is named after. A and B differ only in
+// reasoning effort, and both saturate every corpus, so the scaffold is what is left to test.
+//
+// What C can honestly change is the wording of the opening request: a bare persona and the task,
+// with none of delegate-wave's framing about worktrees, capabilities, Git, or acceptance. What it
+// deliberately does NOT do is stage the tool catalog across requests -- that would mean building a
+// fake Minimal, which would measure the imitation rather than the harness.
+const MINIMAL_PROMPT = ({ goal }) =>
+  `You are a helpful software engineer assistant.\n\n${goal}`;
+
 const CONFIGS = {
   A: { reasoningEffort: "high", label: "Pro / headless / high" },
   B: { reasoningEffort: "max", label: "Pro / headless / max" },
+  C: {
+    reasoningEffort: "max",
+    label: "Pro / headless / max / bare opening request",
+    promptBuilder: MINIMAL_PROMPT,
+  },
 };
 
 const CORPORA = { base: TASKS, hard: HARD_TASKS };
@@ -69,6 +84,7 @@ for (let round = 1; round <= repeat; round += 1) {
       harnessHome: "D:/AssistantSystem/delegate-wave/harness",
       apiKey,
       reasoningEffort: config.reasoningEffort,
+      ...(config.promptBuilder ? { promptBuilder: config.promptBuilder } : {}),
     });
     const service = new Dispatcher({ root, backend });
     const repo = await buildRepo(root, task, `${round}`);

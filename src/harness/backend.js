@@ -245,6 +245,10 @@ export class HarnessBackend {
     reasoningEffort = "high",
     profile = DEFAULT_CAPABILITY_PROFILE,
     timeoutMs = 30 * 60_000,
+    // How the worker's opening request is phrased. Defaults to workerPrompt and production never
+    // passes anything else; it exists so a measurement can vary the scaffold without a fork of the
+    // backend drifting away from the code it is supposed to be measuring.
+    promptBuilder = workerPrompt,
   } = {}) {
     if (!harnessHome) throw new Error("HarnessBackend requires the directory where dsh is installed");
     this.harnessHome = harnessHome;
@@ -258,6 +262,7 @@ export class HarnessBackend {
     // exists instead of partway through one.
     this.profile = capabilityProfile(profile) && profile;
     this.timeoutMs = timeoutMs;
+    this.promptBuilder = promptBuilder;
   }
 
   sessionLogPath(artifactDir) {
@@ -353,7 +358,7 @@ export class HarnessBackend {
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
 
-    const prompt = workerPrompt({ goal, mode, profile: this.profile });
+    const prompt = this.promptBuilder({ goal, mode, profile: this.profile });
 
     const result = await runProcess(process.execPath, [
       this.entry, "--profile", "headless", "--patch", patchPath, prompt,

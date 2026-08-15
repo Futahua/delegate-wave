@@ -1,0 +1,66 @@
+{
+  "config": "Pro / headless / max / bare opening request",
+  "corpus": "base",
+  "results": [
+    {
+      "config": "C",
+      "round": 1,
+      "task": "range-index",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 325,
+      "cost_usd": 0.011927,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "C",
+      "round": 1,
+      "task": "template-render",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 56,
+      "cost_usd": 0.003253,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "C",
+      "round": 1,
+      "task": "compensated-sum",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 44,
+      "cost_usd": 0.002671,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "C",
+      "round": 1,
+      "task": "grapheme-text",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 37,
+      "cost_usd": 0.002268,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "C",
+      "round": 1,
+      "task": "calendar-duration",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 103,
+      "cost_usd": 0.005595,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "config": "Pro / headless / max",
+  "corpus": "hard",
+  "results": [
+    {
+      "config": "B",
+      "round": 1,
+      "task": "log-pipeline",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 40,
+      "cost_usd": 0.002782,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "roundtrip-codec",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 146,
+      "cost_usd": 0.006714,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    },
+    {
+      "config": "B",
+      "round": 1,
+      "task": "async-cache",
+      "validated": true,
+      "attempts": 1,
+      "seconds": 44,
+      "cost_usd": 0.002923,
+      "cost_complete": true,
+      "outcome": "ready_for_integration",
+      "why": null
+    }
+  ]
+}
