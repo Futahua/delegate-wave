@@ -259,5 +259,66 @@ that comparison remains untouched at digest `b34387db`.
 ## Coverage
 
 ```text
-299 tests, 298 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
+308 tests, 307 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
 ```
+
+## Final V1 closure pass
+
+An adversarial pass over the assembled product, looking for concrete ways it lies about authority,
+candidate contents, validation, cost, integration, or recovery. Three defects found and fixed.
+
+**Rename detection reached a policy decision.** `git diff --find-renames --name-only` reports
+`protected/locked.txt -> allowed.txt` as one entry naming only the destination, so the protected
+source never reached the check. A single `git mv` bypassed FS-004. Reproduced before fixing:
+
+```text
+--find-renames   allowed.txt
+--no-renames     allowed.txt, protected/locked.txt
+```
+
+Five regressions, three of which fail against the old implementation.
+
+**Ignored worker output was reported as absence of change.** A worker whose entire output matched the
+project's ignore rules was told it "completed without changing files" -- false, and confusing
+precisely because the files sit visible in the worktree. Excluding them stays correct; describing the
+exclusion as absence does not.
+
+**A still-running request was called uncertain.** `request_id` exists so retries are safe, and the CLI
+says to retry with the same id. On any mutation slower than the 5s wait window -- and a `job advance`
+runs a worker -- that produced `REQUEST_UNCERTAIN`. The outcome was not unknown, merely unfinished,
+and "uncertain" is the word that sends an operator toward manual recovery. The service now tracks
+in-flight request ids and reports `REQUEST_IN_PROGRESS`; genuine uncertainty is unchanged.
+
+### Live gauntlet
+
+```text
+1   trusted Harness ordinary job integrates          02e11c8 -> ccf93f8
+1b  Hermes reports Done with honest cost             $0.001285, complete=true
+2   trusted worker uses the shell                    (Get-ChildItem -Force -File | Measure-Object).Count
+3   worker git commits do not truncate the candidate one parent, G3A + G3B both present
+4   restricted worker cannot read outside verifier   wrote DENIED
+5   Luna routes to OpenCode on the same server       OpenCodeBackend SUCCEEDED
+6   cancel kills the live Harness worker             killed 8796, quarantined
+7   backup -> integrate -> restore                   ccf93f8 -> 69038cb -> ccf93f8; jobs 76 -> 76
+8   integrate -> rollback                            ccf93f8 -> ce68505 -> ccf93f8; still_done=false
+9   restore that cannot return a repository          refused before touching the database
+```
+
+### Observations, not defects
+
+- **`.gitignore` and validation.** Ignored files stay in the worktree during validation but are
+  absent from the candidate, so validation can in principle pass because of a file that will not be
+  integrated. This is inherent to validating in a working directory with build artifacts, and
+  force-adding would sweep `node_modules` into candidates. Ignore rules are trusted project
+  configuration, like protected paths and validation commands.
+- **Budget after a pre-spawn failure.** An attempt that fails before spawning still records an
+  UNKNOWN receipt, so a job with a ceiling cannot establish spend and refuses to retry. That is
+  fail-closed and consistent with ATT-012, which treats intent-without-PID as uncertain rather than
+  as proof nothing ran. Sharp edge, not a lie.
+- **Protected-path prefix matching.** A rule without a trailing slash (`secrets`) also blocks
+  `secretsimilar.txt`. Over-blocking, so it fails safe.
+- **Transient transport blips.** During long jobs the client occasionally saw
+  `CONTROL_API_UNAVAILABLE`. Measured directly: the listener PID never changed and health polling
+  never failed across 80 seconds of continuous probing while a job ran. The API is stable; this was
+  environmental. It is what exposed the false-uncertainty defect above, and the product now handles
+  it correctly.
