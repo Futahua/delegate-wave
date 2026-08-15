@@ -11,7 +11,7 @@ import { managedPaths } from "./paths.js";
 // 13: durable cancellation intents and results.
 // 14: jobs carry an enforced cost ceiling.
 // 15: integration rollbacks are a first-class recorded outcome.
-export const SCHEMA_VERSION = "16";
+export const SCHEMA_VERSION = "17";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS attempts (
   finished_at TEXT,
   exit_code INTEGER,
   result_commit TEXT,
+  -- What this attempt actually changed, relative to the recorded base. Captured because it is the
+  -- attempt's own evidence and it is already computed during candidate capture; keeping it lets the
+  -- everyday surface say "3 files changed" without recomputing a diff, and lets a person ask which.
+  changed_files_json TEXT,
   failure_signature TEXT,
   UNIQUE(job_id, ordinal)
 );
@@ -434,6 +438,11 @@ function migrate(db) {
     db.exec("ALTER TABLE jobs ADD COLUMN capability_profile TEXT");
   }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
+  if (!attemptColumns.includes("changed_files_json")) {
+    // Null for attempts that predate the column: they genuinely have no record, and inventing an
+    // empty list would claim they changed nothing.
+    db.exec("ALTER TABLE attempts ADD COLUMN changed_files_json TEXT");
+  }
   if (!attemptColumns.includes("capability_profile")) {
     // Left null for attempts that predate capability profiles: they ran under the single fixed
     // contract, and inventing a label for them would misreport history.

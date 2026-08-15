@@ -658,7 +658,9 @@ export class Dispatcher {
         }
         this.db.prepare(`UPDATE attempts SET terminal_state = 'SUCCEEDED', validation_state = 'PENDING',
           executor_intent_id = NULL, executor_pid = NULL, finished_at = ?, exit_code = 0,
-          result_commit = ? WHERE id = ?`).run(now(), resultCommit, attemptId);
+          result_commit = ?, changed_files_json = ? WHERE id = ?`).run(
+          now(), resultCommit, JSON.stringify(files), attemptId,
+        );
         recordEvent(this.db, { kind: "EXECUTOR_SUCCEEDED", entityType: "attempt", entityId: attemptId, epoch, payload: { executorIntentId, files, resultCommit } });
       }, { terminalState: null, validationState: "NOT_RUN" });
 
@@ -902,7 +904,9 @@ export class Dispatcher {
       .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
 
     const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
-      decision: "authorize or reject this work",
+      // Written as the question a person is actually being asked. The identifier stays in the
+      // payload because acting on it needs one, but it does not belong in the sentence.
+      decision: "Approve this work?",
       proposal: row.id,
       project: this.getProject(row.project_id)?.name ?? row.project_id,
       goal: short(row.goal),
@@ -913,7 +917,7 @@ export class Dispatcher {
     // A proposal still awaits approval only if nothing has successfully integrated it. The stored
     // state column lags the integration records -- integrationStatus already derives around that --
     // so filtering on the column alone would ask the operator to approve work that already landed.
-    const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, j.goal, p.name AS project
+    const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, ip.attempt_id, j.goal, p.name AS project
       FROM integration_proposals ip
       JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
       WHERE ip.state = 'OPEN'
@@ -922,16 +926,28 @@ export class Dispatcher {
           WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
         )
       ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
-      .map((row) => ({
-        decision: "approve to integrate, or roll back later",
-        proposal: row.id,
-        // Carried like every other bucket. Without it a pending approval cannot be correlated back
-        // to the work that produced it, so Hermes cannot answer "what happened to what I proposed".
-        job: row.job_id,
-        project: row.project,
-        goal: short(row.goal),
-        cost: jobCost(row.job_id),
-      }));
+      .map((row) => {
+        // The facts a person needs to answer "should this land": did the checks pass, how much
+        // changed, and what did it cost. Not the digest, the branch, or the executor.
+        const attempt = this.db.prepare(
+          "SELECT validation_state, changed_files_json FROM attempts WHERE id = ?",
+        ).get(row.attempt_id);
+        const changed = parseJson(attempt?.changed_files_json ?? null);
+        return {
+          decision: "Integrate this?",
+          validation: attempt?.validation_state === "PASSED" ? "passed" : (attempt?.validation_state ?? "unknown"),
+          // Null rather than 0 when the attempt predates the record: claiming nothing changed would
+          // be worse than admitting the count is unknown.
+          files_changed: Array.isArray(changed) ? changed.length : null,
+          proposal: row.id,
+          // Carried like every other bucket. Without it a pending approval cannot be correlated back
+          // to the work that produced it, so Hermes cannot answer "what happened to what I proposed".
+          job: row.job_id,
+          project: row.project,
+          goal: short(row.goal),
+          cost: jobCost(row.job_id),
+        };
+      });
 
     const attention = this.db.prepare(`SELECT j.id, j.goal, j.status, p.name AS project,
         (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id

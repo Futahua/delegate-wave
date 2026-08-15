@@ -146,9 +146,31 @@ export function summarizeStatus(status) {
   if (status.working.length) {
     parts.push(`Working: ${status.working.length} job${status.working.length === 1 ? "" : "s"}`);
   }
+  // The two decisions are the only moments a person is actually needed, so they are asked as
+  // questions rather than announced as queue depth. Identifiers, digests, branches and executor
+  // names are deliberately absent: they are available from the detailed tools, and putting them
+  // here turns a decision into an administrative form.
   if (status.needs_your_decision.length) {
     const first = status.needs_your_decision[0];
-    parts.push(`Needs your decision: ${status.needs_your_decision.length} (${first.goal})`);
+    const rest = status.needs_your_decision.length - 1;
+    const also = rest > 0 ? ` (${rest} more waiting)` : "";
+    const goal = String(first.goal ?? "").replace(/[.!?\s]+$/, "");
+
+    if (first.validation !== undefined) {
+      // A finished candidate: say what the checks found, how much it touched, and what it cost.
+      const checks = first.validation === "passed" ? "Validation passed" : `Validation ${first.validation}`;
+      const files = typeof first.files_changed === "number"
+        ? `, ${first.files_changed} file${first.files_changed === 1 ? "" : "s"} changed` : "";
+      const spent = first.cost?.reference_cost_usd;
+      const money = typeof spent === "number" && spent > 0
+        ? `, about $${spent.toFixed(4)}${first.cost.complete === false ? " so far" : ""}` : "";
+      parts.push(`"${goal}" is ready: ${checks}${files}${money}. Integrate it?${also}`);
+    } else {
+      // Proposed work that has not run yet: the cost is a ceiling, not a bill.
+      const ceiling = typeof first.ceiling_usd === "number"
+        ? ` under $${first.ceiling_usd.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}` : "";
+      parts.push(`I can do "${goal}" with a cheap worker${ceiling}. Approve?${also}`);
+    }
   }
   if (status.ready_to_check.length) {
     parts.push(`Ready to check: ${status.ready_to_check.length}`);
@@ -175,7 +197,9 @@ export function summarizeStatus(status) {
   }
   if (!parts.length) parts.push("Nothing running, nothing waiting on you");
   if (!status.healthy) parts.push("delegate-wave reports a health problem; run doctor");
-  return `${parts.join(". ")}.`;
+  // A part that already ends in punctuation keeps it. The decisions are questions, and "Approve?."
+  // is the kind of small wrongness that makes a sentence read as generated rather than written.
+  return parts.map((part) => (/[.!?]$/.test(part) ? part : `${part}.`)).join(" ");
 }
 
 function send(output, message) { output.write(`${JSON.stringify(message)}\n`); }

@@ -76,10 +76,11 @@ test("a pending proposal appears as a decision with its bound and goal", async (
   const status = service.briefing();
   assert.equal(status.needs_your_decision.length, 1);
   const decision = status.needs_your_decision[0];
-  assert.match(decision.decision, /authorize or reject/);
+  // Asked as a question rather than described in operator vocabulary.
+  assert.equal(decision.decision, "Approve this work?");
   assert.equal(decision.project, "Surface");
   assert.equal(decision.ceiling_usd, 0.25);
-  assert.match(summarizeStatus(status), /Needs your decision: 1/);
+  assert.match(summarizeStatus(status), /with a cheap worker under \$0\.25\. Approve\?/);
 });
 
 test("a finished job reports what changed and what it cost", async (t) => {
@@ -252,4 +253,76 @@ test("Hermes says a reverted change is no longer present", async (t) => {
   assert.match(sentence, /Reverted/, "the state is named");
   assert.match(sentence, /no longer present/, "and its consequence stated plainly");
   assert.match(sentence, /had succeeded/, "without implying the work itself failed");
+});
+
+// The two decisions are the only moments a person is needed. They should read as questions, not as
+// queue depth with identifiers attached.
+test("a proposal asks to approve work, without operator vocabulary", async () => {
+  const { summarizeStatus } = await import("../src/mcp/server.js");
+  const sentence = summarizeStatus({
+    healthy: true, working: [], ready_to_check: [], done: [], reverted: [],
+    needs_your_decision: [{ goal: "add a totals file to the report project.", ceiling_usd: 0.05 }],
+  });
+  assert.match(sentence, /I can do "add a totals file to the report project" with a cheap worker/);
+  assert.match(sentence, /under \$0\.05\b/, "a ceiling reads as money, without trailing zeros");
+  assert.match(sentence, /Approve\?/);
+  assert.ok(!/\?\./.test(sentence), "a question is not also a statement");
+});
+
+test("a ready candidate reports what the checks found, not how to operate it", async () => {
+  const { summarizeStatus } = await import("../src/mcp/server.js");
+  const sentence = summarizeStatus({
+    healthy: true, working: [], ready_to_check: [], done: [], reverted: [],
+    needs_your_decision: [{
+      goal: "add a totals file.", validation: "passed", files_changed: 3,
+      cost: { reference_cost_usd: 0.0014, complete: true },
+      proposal: "proposal_deadbeef", job: "job_deadbeef",
+    }],
+  });
+  assert.match(sentence, /Validation passed, 3 files changed, about \$0\.0014/);
+  assert.match(sentence, /Integrate it\?/);
+  for (const leak of ["proposal_", "job_", "digest", "HarnessBackend", "OpenCodeBackend", "cherry-pick"]) {
+    assert.ok(!sentence.includes(leak), `${leak} does not belong in the question`);
+  }
+});
+
+test("one file is not 1 files", async () => {
+  const { summarizeStatus } = await import("../src/mcp/server.js");
+  const sentence = summarizeStatus({
+    healthy: true, working: [], ready_to_check: [], done: [], reverted: [],
+    needs_your_decision: [{ goal: "x", validation: "passed", files_changed: 1, cost: { reference_cost_usd: 0.001, complete: true } }],
+  });
+  assert.match(sentence, /1 file changed/);
+});
+
+// Cost that is not fully measured must not be stated as though it were final.
+test("an incomplete cost is qualified rather than presented as the total", async () => {
+  const { summarizeStatus } = await import("../src/mcp/server.js");
+  const sentence = summarizeStatus({
+    healthy: true, working: [], ready_to_check: [], done: [], reverted: [],
+    needs_your_decision: [{
+      goal: "x", validation: "passed", files_changed: 2,
+      cost: { reference_cost_usd: 0.002, complete: false, unmeasured_attempts: 1 },
+    }],
+  });
+  assert.match(sentence, /so far/, "an unmeasured attempt means this is not the whole bill");
+});
+
+// The identifiers must remain in the payload, because acting on a decision needs them.
+test("the decision payload still carries what is needed to act", async (t) => {
+  const { service, repo } = await fixture(t);
+  const project = await service.addProject({
+    name: "decision-payload", repoPath: repo, branch: "integration", validation: [],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "produce a candidate" });
+  await service.runJob(job.id);
+  await service.proposeIntegration({ jobId: job.id });
+
+  const candidate = service.briefing().needs_your_decision
+    .find((entry) => String(entry.proposal).startsWith("proposal_"));
+  assert.ok(candidate.proposal, "the id an operator acts on is still present");
+  assert.equal(candidate.job, job.id);
+  assert.equal(candidate.decision, "Integrate this?");
+  assert.equal(candidate.validation, "passed");
+  assert.equal(candidate.files_changed, 1, "and the fact the sentence is built from");
 });
