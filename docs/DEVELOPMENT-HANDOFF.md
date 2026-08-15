@@ -86,6 +86,21 @@ may be integrated, attempt identity and fencing, worktree quarantine, or the two
 Worktrees stay mandatory for mutating jobs -- for recoverability and clean candidate capture, the
 same reason a developer uses a branch despite trusting themselves.
 
+## Final closure state
+
+```text
+head                 (see PR #15)
+tests                308, 307 passing, 1 skipped (file symlinks need Windows elevation;
+                     the directory-junction case covers the same property)
+frozen corpus        experiments/executor-ab-v1, digest b34387db..., recomputed and unchanged
+live gauntlet        10/10 (execution 7, recovery 3)
+doctor               healthy
+```
+
+Remaining non-blocking UX work: a `Reverted` bucket in the briefing. After a rollback the job
+correctly leaves `done` -- the truth is right -- but it disappears from every bucket rather than
+saying what happened. That is information design, not a truth bug.
+
 ## Still deferred, deliberately
 
 ```text
