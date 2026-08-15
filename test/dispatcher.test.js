@@ -1139,3 +1139,140 @@ test("each attempt records the executor that actually ran it and gets its own wo
     await cleanup();
   }
 });
+
+// Candidate capture must be base-relative, because a trusted worker may use Git normally.
+//
+// Reading `git status` would see nothing from a worker that committed its work, and only the
+// uncommitted remainder from one that committed part of it -- which would also hide the committed
+// part from the protected-path check. Worker history is workspace activity; the candidate is the
+// net tree the attempt produced.
+const gitIn = async (cwd, ...args) => {
+  const result = await runProcess("git", ["-C", cwd, ...args]);
+  assert.equal(result.exitCode, 0, result.stderr);
+  return result.stdout.trim();
+};
+
+// A worker that behaves exactly as the trusted prompt now invites: it uses local Git.
+const committingWorker = (plan) => new FakeBackend(async ({ worktreePath, artifactDir }) => {
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+    type: "step_finish",
+    part: { tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 },
+  }));
+  await gitIn(worktreePath, "config", "user.name", "Worker");
+  await gitIn(worktreePath, "config", "user.email", "worker@example.invalid");
+  await plan({ worktreePath, write: (name, body) => fs.writeFileSync(path.join(worktreePath, name), body) });
+  return { exitCode: 0, stdout: "ok", stderr: "" };
+});
+
+test("a worker that commits all of its work still produces a candidate", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    write("ADDED.md", "committed by the worker\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker's own commit");
+  }) });
+  try {
+    const project = await service.addProject({ name: "committed", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "add a file", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "SUCCEEDED",
+      "a clean worktree after a worker commit is not 'changed nothing'");
+    assert.ok(attempt.result_commit, "and a candidate commit exists");
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    assert.match(listed, /ADDED\.md/);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The mixed case, and the dangerous one: status would show only B, so A would be invisible to both
+// the protected-path check and the candidate.
+test("a worker that commits A and leaves B uncommitted yields a candidate containing both", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    write("A.md", "committed\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker committed A");
+    write("B.md", "left uncommitted\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "mixed", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "add two files", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    assert.match(listed, /A\.md/, "the worker's committed change is in the candidate");
+    assert.match(listed, /B\.md/, "and so is the uncommitted one");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The security-relevant half of the same bug: a protected path hidden inside a worker commit.
+test("a protected-path change inside a worker commit is still rejected", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    fs.mkdirSync(path.join(worktreePath, "secrets"), { recursive: true });
+    write("secrets/keys.txt", "should never be accepted\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker committed a protected change");
+    write("ALLOWED.md", "an ordinary change\n");
+  }) });
+  try {
+    const project = await service.addProject({
+      name: "protected", repoPath: repo, validation: [], protectedPaths: ["secrets/"],
+    });
+    const job = await service.createJob({ projectId: project.id, goal: "touch a protected path", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "FAILED",
+      "the check must see the committed change, not only the uncommitted remainder");
+    assert.equal(attempt.result_commit, null, "and no candidate is produced");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The candidate must be a single commit on the recorded base, whatever history the worker built,
+// because integration cherry-picks exactly that one commit.
+test("the candidate is one commit parented on the recorded base", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    // Three commits and a branch: none of it may shape the candidate.
+    await gitIn(worktreePath, "checkout", "-b", "worker-scratch");
+    for (const name of ["one.md", "two.md"]) {
+      write(name, `${name}\n`);
+      await gitIn(worktreePath, "add", "--all");
+      await gitIn(worktreePath, "commit", "-m", `worker commit for ${name}`);
+    }
+    write("three.md", "three\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "canonical", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "several changes", maxAttempts: 1 });
+    const before = service.getJob(job.id).base_sha;
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    const parents = (await gitIn(repo, "rev-list", "--parents", "-n", "1", attempt.result_commit)).split(" ");
+    assert.equal(parents.length, 2, "exactly one parent");
+    assert.equal(parents[1], before, "and it is the recorded base, not the worker's HEAD");
+
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    for (const name of ["one.md", "two.md", "three.md"]) {
+      assert.match(listed, new RegExp(name.replace(".", "\.")), `${name} is in the candidate`);
+    }
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});

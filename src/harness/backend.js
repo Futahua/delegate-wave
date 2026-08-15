@@ -147,8 +147,10 @@ export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE 
 
   return "Implement this task, working from the current attempt worktree. Use the machine and "
     + "developer tools available to you: shell, code execution, package and build tools, network, "
-    + "tests, and other local project resources, whenever they help you get it right. Do not commit "
-    + `or push -- delegate-wave captures the candidate from your worktree itself. ${acceptance}`
+    + "tests, and other local project resources, whenever they help you get it right. Local Git is "
+    + "yours to use as well -- status, diff, log, blame, bisect, temporary branches, local commits. "
+    + "Do not push. Your Git history is workspace activity, not integration: delegate-wave captures "
+    + `the resulting tree relative to the base commit and builds its own candidate. ${acceptance}`
     + `\n\nTask: ${goal}`;
 }
 

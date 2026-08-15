@@ -282,9 +282,18 @@ test("both write prompts tell the worker its claims are not acceptance", async (
   for (const profile of Object.keys(CAPABILITY_PROFILES)) {
     const prompt = workerPrompt({ goal: "x", mode: "write", profile });
     assert.match(prompt, /not treat your own claims as acceptance/i, `${profile} states the invariant`);
-    assert.ok(!/\bgit (commit|push)\b/i.test(prompt.replace(/Do not commit[^.]*\./i, "")),
-      `${profile} does not invite the worker to commit`);
   }
+});
+
+// Local Git is a capability, and capture no longer depends on the worker avoiding it. Telling a
+// trusted worker not to commit would be the same mistake as telling it the shell was disabled --
+// and here it would also deny a genuinely useful tool for no remaining reason.
+test("the trusted prompt permits local Git and says why history is not integration", async () => {
+  const { workerPrompt } = await import("../src/harness/backend.js");
+  const prompt = workerPrompt({ goal: "x", mode: "write", profile: "trusted" });
+  assert.match(prompt, /local commits/i, "local Git is explicitly available");
+  assert.match(prompt, /not integration/i, "and explicitly not the integration object");
+  assert.match(prompt, /Do not push/i, "pushing is still discouraged");
 });
 
 // Read mode changes nothing about capability; it changes what the worker is asked to produce.

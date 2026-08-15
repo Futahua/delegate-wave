@@ -29,28 +29,62 @@ export async function lockWorktree(repoPath, targetPath, reason) {
   await git(repoPath, ["worktree", "lock", "--reason", reason, targetPath]);
 }
 
-export async function changedFiles(worktreePath) {
-  const output = await git(worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { raw: true });
+// The authoritative changed-file set: the worker's resulting tree compared to the recorded base.
+//
+// NOT `git status`. A trusted worker may use Git normally, and one that commits its work leaves a
+// clean status -- which would read as "changed nothing" and discard real work. Worse, a worker that
+// commits A and leaves B uncommitted would show only B, so the protected-path check would inspect
+// only B while A rode along invisibly.
+//
+// Staging the whole tree first is what makes untracked files part of the comparison; the diff is
+// then taken against the base commit rather than against HEAD, so whatever history the worker built
+// on top of the base is irrelevant to what we believe changed.
+export async function changedFilesSince(worktreePath, baseSha) {
+  await git(worktreePath, ["add", "--all"]);
+  const output = await git(
+    worktreePath,
+    ["diff", "--cached", "--name-only", "-z", "--find-renames", baseSha],
+    { raw: true },
+  );
   if (!output) return [];
-  const records = output.split("\0").filter(Boolean);
-  const files = [];
-  for (let index = 0; index < records.length; index += 1) {
-    const record = records[index];
-    const status = record.slice(0, 2);
-    files.push(record.slice(3).replaceAll("\\", "/"));
-    if (/[RC]/.test(status) && records[index + 1]) {
-      files.push(records[++index].replaceAll("\\", "/"));
-    }
-  }
-  return [...new Set(files)];
+  return [...new Set(output.split("\0").filter(Boolean).map((file) => file.replaceAll("\\", "/")))];
 }
 
-export async function commitAll(worktreePath, message) {
+// Builds delegate-wave's own candidate commit: the worker's resulting tree, parented exactly on the
+// recorded base.
+//
+// `commit-tree` rather than `commit`, because `commit` would parent on whatever HEAD the worker left
+// behind. The candidate must be one commit containing the complete net change, so integration can
+// cherry-pick it and get everything the attempt produced -- not just the part the worker happened to
+// leave uncommitted.
+//
+// The worker's own commits and branches remain in the worktree as evidence of how it worked. They
+// are never the integration object.
+export async function captureCandidate(worktreePath, baseSha, message) {
   await git(worktreePath, ["add", "--all"]);
-  const staged = await git(worktreePath, ["diff", "--cached", "--name-only"]);
-  if (!staged) return null;
-  await git(worktreePath, ["-c", "user.name=delegate-wave", "-c", "user.email=delegate-wave@local", "commit", "-m", message]);
-  return resolveRevision(worktreePath, "HEAD");
+  const tree = await git(worktreePath, ["write-tree"]);
+  const baseTree = await git(worktreePath, ["rev-parse", `${baseSha}^{tree}`]);
+  // Comparing trees, not statuses: identical trees mean the attempt produced nothing, however much
+  // Git history the worker created along the way.
+  if (tree === baseTree) return null;
+  const commit = await git(worktreePath, [
+    "-c", "user.name=delegate-wave", "-c", "user.email=delegate-wave@local",
+    "commit-tree", tree, "-p", baseSha, "-m", message,
+  ], {
+    // commit-tree reads identity and timestamps from the environment. Supplied explicitly so the
+    // candidate does not inherit whatever the worker configured, and so the commit is attributable
+    // to delegate-wave rather than to the worker that produced the tree.
+    env: {
+      GIT_AUTHOR_NAME: "delegate-wave", GIT_AUTHOR_EMAIL: "delegate-wave@local",
+      GIT_COMMITTER_NAME: "delegate-wave", GIT_COMMITTER_EMAIL: "delegate-wave@local",
+    },
+  });
+
+  // Point the worktree at the candidate. Validation runs here afterwards, and it must see exactly
+  // the tree that was captured -- not the worker's HEAD, which may carry a different history and,
+  // if the worker committed only part of its work, a different tree.
+  await git(worktreePath, ["reset", "--hard", commit]);
+  return commit;
 }
 
 export async function listWorktrees(repoPath) {

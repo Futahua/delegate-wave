@@ -5,9 +5,9 @@ import { openDatabase, recordEvent, transaction } from "./db.js";
 import { managedPaths } from "./paths.js";
 import {
   assertRepository,
-  changedFiles,
+  changedFilesSince,
   cherryPick,
-  commitAll,
+  captureCandidate,
   createDetachedWorktree,
   git,
   isAncestor,
@@ -615,12 +615,22 @@ export class Dispatcher {
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
 
-      const files = await changedFiles(worktreePath);
+      // Candidate capture is base-relative, not status-relative.
+      //
+      // A trusted worker may use Git normally, including local commits. Its history is workspace
+      // activity and evidence, never the integration object: what delegate-wave accepts is the net
+      // tree the attempt produced, compared to the base it was given. Reading `git status` instead
+      // would see nothing at all from a worker that committed its work, and would see only the
+      // uncommitted remainder from one that committed part of it -- which would also hide the
+      // committed part from the protected-path check.
+      const files = await changedFilesSince(worktreePath, job.base_sha);
       this.assertAllowedDiff(files, parseJson(project.protected_json));
       let resultCommit = null;
       if (job.mode === "write") {
         if (files.length === 0) throw new Error("worker completed without changing files");
-        resultCommit = await commitAll(worktreePath, `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`);
+        resultCommit = await captureCandidate(
+          worktreePath, job.base_sha, `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`,
+        );
       }
 
       this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
