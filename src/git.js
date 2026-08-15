@@ -56,6 +56,26 @@ export async function changedFilesSince(worktreePath, baseSha) {
   return [...new Set(output.split("\0").filter(Boolean).map((file) => file.replaceAll("\\", "/")))];
 }
 
+// Files the worker created that the project's own ignore rules exclude from the candidate.
+//
+// An attempt worktree is created fresh from the base commit, so anything ignored-and-present was
+// produced by this worker. Excluding them is correct -- `.gitignore` is trusted project
+// configuration declaring what is not source, and force-adding would sweep `node_modules` into
+// candidates. But the exclusion must not be SILENT when it is the whole story: telling someone
+// "the worker changed nothing" while its output sits in the worktree is false.
+//
+// Only called on the empty-candidate path, so the listing cost does not matter.
+export async function ignoredWorkerOutput(worktreePath, limit = 10) {
+  const output = await git(
+    worktreePath,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    { raw: true },
+  );
+  if (!output) return [];
+  const files = output.split("\0").filter(Boolean).map((file) => file.replaceAll("\\", "/"));
+  return files.slice(0, limit);
+}
+
 // Builds delegate-wave's own candidate commit: the worker's resulting tree, parented exactly on the
 // recorded base.
 //

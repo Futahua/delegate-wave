@@ -6,6 +6,7 @@ import { managedPaths } from "./paths.js";
 import {
   assertRepository,
   changedFilesSince,
+  ignoredWorkerOutput,
   cherryPick,
   captureCandidate,
   createDetachedWorktree,
@@ -627,7 +628,20 @@ export class Dispatcher {
       this.assertAllowedDiff(files, parseJson(project.protected_json));
       let resultCommit = null;
       if (job.mode === "write") {
-        if (files.length === 0) throw new Error("worker completed without changing files");
+        if (files.length === 0) {
+          // Distinguish "did nothing" from "everything it produced is excluded by this project's own
+          // ignore rules". Both fail the attempt, but only one of them is honestly described as
+          // changing nothing, and the other is confusing precisely because the output is visible on
+          // disk in the worktree.
+          const ignored = await ignoredWorkerOutput(worktreePath);
+          if (ignored.length) {
+            throw new Error(
+              "worker produced only files this project ignores, so there is nothing to integrate: "
+              + `${ignored.join(", ")}`,
+            );
+          }
+          throw new Error("worker completed without changing files");
+        }
         resultCommit = await captureCandidate(
           worktreePath, job.base_sha, `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`,
         );

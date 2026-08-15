@@ -1394,3 +1394,51 @@ test("replacing a protected file with an identical allowed file is caught", asyn
     await cleanup();
   }
 });
+
+// "Changed nothing" must mean changed nothing.
+//
+// `.gitignore` is trusted project configuration and excluding its matches from the candidate is
+// correct -- force-adding would sweep node_modules into candidates. But a worker whose entire output
+// is ignored has not "changed nothing": its files are sitting in the worktree, visible, while the
+// system says otherwise. An attempt worktree is fresh from the base, so anything ignored-and-present
+// was produced by this worker.
+test("a worker whose output is entirely ignored is told so, not that it changed nothing", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  fs.writeFileSync(path.join(repo, ".gitignore"), "*.log\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "add ignore rules"], repo);
+
+  const service = new Dispatcher({ root, backend: policyWorker(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "answer.log"), "the real output\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "ignored", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "write answer.log", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "FAILED", "there is genuinely nothing to integrate");
+    const reason = service.lastFailureReason(job.id);
+    assert.match(reason, /ignores/, "and the reason names the real cause");
+    assert.match(reason, /answer\.log/, "including which file was excluded");
+    assert.ok(!/completed without changing files/.test(reason),
+      "the worker did change a file; saying otherwise is false");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("an ordinary empty attempt still reports plainly that nothing changed", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: policyWorker(async () => { /* touches nothing */ }) });
+  try {
+    const project = await service.addProject({ name: "empty", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "do nothing", maxAttempts: 1 });
+    await service.runJob(job.id);
+    assert.match(service.lastFailureReason(job.id), /without changing files/);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
