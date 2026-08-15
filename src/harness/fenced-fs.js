@@ -20,11 +20,7 @@
 // rather than implied.
 import { AttemptFence, FenceViolation } from "../fence.js";
 
-// Resolved lazily so this module can be imported without the Harness package installed: only an
-// actual Harness run needs the base classes.
-async function loadBase(requireFrom) {
-  const { createRequire } = await import("node:module");
-  const require = createRequire(requireFrom);
+function loadBase(require) {
   const localModule = require("@deepseek-ai/dsh-fs-local");
   const fsModule = require("@deepseek-ai/dsh-fs");
   const LocalFileSystem = localModule.LocalFileSystem ?? localModule.default;
@@ -39,14 +35,20 @@ async function loadBase(requireFrom) {
 }
 
 // Builds the fenced provider class against the installed Harness base classes.
-export async function createFencedFileSystemClass({ requireFrom }) {
-  const { LocalFileSystem, FsError } = await loadBase(requireFrom);
+//
+// Synchronous because the Cordis loader instantiates a plugin module's default export as the
+// service class, so the class must exist when the module finishes evaluating.
+export function createFencedFileSystemClassSync({ require }) {
+  const { LocalFileSystem, FsError } = loadBase(require);
 
   return class FencedFileSystem extends LocalFileSystem {
     constructor(ctx, config) {
       super(ctx, config);
       const root = config?.attemptRoot ?? config?.cwd;
-      if (!root) throw new Error("FencedFileSystem requires an attemptRoot");
+      // Failing closed is essential. A fence that quietly fell back to the unfenced provider would
+      // leave reads escaping at exactly the moment it appeared to be preventing them, so a missing
+      // root refuses to boot rather than running unconfined.
+      if (!root) throw new Error("FencedFileSystem requires an attemptRoot; refusing to run unfenced");
       this.fence = new AttemptFence(root);
     }
 
@@ -79,13 +81,9 @@ export async function createFencedFileSystemClass({ requireFrom }) {
   };
 }
 
-// The Cordis plugin: replaces ctx.fs for the lifetime of one attempt.
-export async function createFencedFsPlugin({ requireFrom, attemptRoot }) {
-  const FencedFileSystem = await createFencedFileSystemClass({ requireFrom });
-  return {
-    name: "delegate-wave-fenced-fs",
-    apply(ctx, config = {}) {
-      ctx.plugin(FencedFileSystem, { ...config, attemptRoot, cwd: attemptRoot });
-    },
-  };
+// Convenience wrapper for callers that hold a path rather than a require function -- notably the
+// tests, which build the class against the Harness installation from outside the Harness process.
+export async function createFencedFileSystemClass({ requireFrom }) {
+  const { createRequire } = await import("node:module");
+  return createFencedFileSystemClassSync({ require: createRequire(requireFrom) });
 }

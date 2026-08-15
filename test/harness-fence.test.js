@@ -141,3 +141,68 @@ test("the unfenced Harness provider does escape the workspace", { skip: !harness
   assert.equal(await bare.readText(escaped), "SECRET\n",
     "stock Harness reads outside the workspace, which is why the fence is required");
 });
+
+// The per-attempt profile patch must actually take effect.
+//
+// This is the bug that nearly shipped: pointing the existing `fs-sandbox` entry at a different
+// module looks like a substitution, but the loader treats `name` on an existing id as an assertion,
+// logs "name mismatch ... skipping", and carries on with the stock provider. Every visible signal
+// said the worker was fenced; a live worker then read a file outside its worktree and reported the
+// contents. So the shape of the patch is pinned here.
+test("the profile patch replaces the filesystem provider rather than renaming the stock one", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/wt",
+    artifactDir: "D:/art",
+    model: "deepseek-v4-flash",
+    baseUrl: "https://example.invalid/v1",
+    apiKeyEnv: "SOME_KEY",
+    reasoningEffort: "high",
+  });
+
+  assert.match(patch, /- id: fs-sandbox\n\s+name: '@deepseek-ai\/dsh-fs-sandbox'\n\s+disabled: true/,
+    "the stock sandbox is disabled under its own real name, so the loader accepts the entry");
+  assert.match(patch, /- insert:\n\s+- id: delegate-wave-fenced-fs/,
+    "and the fence is inserted as a new entry rather than renaming an existing one");
+  assert.ok(!/- id: fs-sandbox\n\s+name: (?!'@deepseek-ai)/.test(patch),
+    "the fs-sandbox entry must never be pointed at another module: that is silently skipped");
+  assert.match(patch, /name: "file:\/\/\//,
+    "the plugin is named by file:// URL; a bare Windows path is rejected as an unknown URL scheme");
+});
+
+test("the attempt patch disables every capability the worker contract forbids", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
+    baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high",
+  });
+  // code-runtime is included deliberately: it IS present in stock headless, and Harness documents
+  // it as containment rather than a security boundary, with authority comparable to a shell.
+  for (const id of ["tool-bash", "tool-pwsh", "bash-sandbox", "pwsh-sandbox", "shell-env",
+    "permission", "tool-skill", "skill", "skill-filesystem", "skill-badge", "user-questions",
+    "code-runtime"]) {
+    assert.match(patch, new RegExp(`- id: ${id}\\n\\s*disabled: true`), `${id} must be disabled`);
+  }
+});
+
+test("reasoning effort is pinned rather than left to the route default", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
+    baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high",
+  });
+  assert.match(patch, /thinking: enabled/);
+  assert.match(patch, /reasoningEffort: high/);
+});
+
+// Evidence must be durable, or a run that exits promptly discards the events proving what it cost.
+test("session persistence is configured to flush into the attempt's own artifact directory", async () => {
+  const { buildAttemptPatch } = await import("../src/harness/backend.js");
+  const patch = buildAttemptPatch({
+    worktreePath: "D:/wt", artifactDir: "D:/art", model: "m",
+    baseUrl: "https://example.invalid/v1", apiKeyEnv: "K", reasoningEffort: "high",
+  });
+  assert.match(patch, /root: "D:\/art\/sessions"/, "one attempt's log must not land in another's evidence");
+  assert.match(patch, /compression: none/);
+  assert.match(patch, /writeBatchMaxDelayMs: 1/, "headless exits before a batched write drains");
+});
