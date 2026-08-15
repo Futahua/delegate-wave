@@ -195,6 +195,29 @@ All three produced COMPLETE receipts, and in every case validation, the candidat
 second decision were delegate-wave's. The profile is chosen before the attempt row is written and
 recorded on it, so an attempt's evidence never requires guessing what authority it ran under.
 
+### The prompt has to agree with the profile
+
+Enabling the capability was not sufficient. The prompt still told every worker "shell access is
+intentionally disabled", so a trusted worker held a shell and was instructed not to use one. The
+canary above proves a worker *can* ignore that; ordinary behaviour is to obey it, which would have
+left the new default behaving like the old one with nothing to notice.
+
+Prompts are now profile-specific, and both write prompts carry the sentence that is the real
+invariant: a worker's own claims are not acceptance. WRK-002 makes the mismatch a spec violation
+rather than an oversight.
+
+The effect is visible immediately. Given a task that never mentions tooling -- count the `.md` files
+and say how you counted -- a trusted worker answered:
+
+```text
+1. Glob search        **/*.md                                       -> 2 files
+2. PowerShell         Get-ChildItem -Recurse -Force -Filter *.md    -> 2 files
+3. Git index          git ls-files filtered to *.md                 -> 2 files
+All three independent methods agree on 2.
+```
+
+Three cross-checked methods, unprompted, two of which the previous instructions forbade.
+
 ## Limits, stated
 
 Under `restricted`, the fence is a trusted in-process path check, not a kernel boundary. It is
@@ -212,5 +235,5 @@ that comparison remains untouched at digest `b34387db`.
 ## Coverage
 
 ```text
-290 tests, 289 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
+294 tests, 293 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
 ```

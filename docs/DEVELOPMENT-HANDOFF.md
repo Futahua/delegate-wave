@@ -77,6 +77,10 @@ first and refuses to run if the fence is not really in it.
 The fence remains a trusted in-process path check, not a kernel boundary. Under `restricted` that
 holds because the worker has no shell, subprocess, or code runtime.
 
+The worker's prompt is profile-specific, and must be: a worker told it lacks a capability its profile
+grants will usually obey the instruction, so the capability is discarded silently. Both write prompts
+state the actual invariant -- a worker's own claims are not acceptance.
+
 No profile changes who computes the Git diff, who runs validation, what counts as cost evidence, what
 may be integrated, attempt identity and fencing, worktree quarantine, or the two-decision flow.
 Worktrees stay mandatory for mutating jobs -- for recoverability and clean candidate capture, the
