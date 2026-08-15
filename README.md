@@ -1,98 +1,209 @@
 # delegate-wave
 
-`delegate-wave` is a small deterministic dispatcher for bounded coding jobs. SQLite owns operational state, Git owns candidate code, and OpenCode sessions are disposable executors.
+A personal dispatcher that turns "change this" into reviewed, validated, integrated work done by
+inexpensive coding models, on one Windows machine, for one person.
 
-A successful write job stops at `READY_FOR_INTEGRATION` so a human or Codex can inspect it first. The approved-integration slice then lets an operator propose the candidate, grant an exact-digest approval, and run an integration that cherry-picks the candidate onto the integration branch in a disposable worktree. Integration is never automatic: a human must grant the approval.
+You talk to Hermes. Hermes proposes bounded work. You authorize once. Cheap workers do it,
+deterministic validation checks it, and one approval integrates it. Hermes tells you what changed and
+what it cost.
 
-## Requirements
+## The loop
 
-- Node.js 24 or newer
-- Git
-- OpenCode configured with the desired provider/model
-
-No npm dependencies are required.
-
-## Quick start
-
-```powershell
-cd 'D:\Letters\MatTroiSeConMoc\delegate-wave'
-npm link
-$env:DELEGATE_WAVE_CONTROL_TOKEN = '<generate-a-local-secret>'
-$env:DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = '<generate-a-different-read-only-secret>'
-$env:DELEGATE_WAVE_CONTROL_PRINCIPAL = '<your-local-principal>'
-delegate-wave serve
+```text
+you              "add a totals file to the report project"
+Hermes           proposes bounded work, with a cost ceiling and an expiry
+you              authorize once            <- decision 1
+delegate-wave    runs a worker in an isolated worktree
+                 runs your validation commands
+                 proposes an integration
+you              approve once              <- decision 2
+delegate-wave    integrates, compare-and-swap
+Hermes           "Done. TOTAL.md added, commit fbd66a3, about $0.0008."
 ```
 
-For reboot survival, set the credentials transiently for the first installation, then install and
-start the least-privilege logon task. Installation encrypts the Control credentials with Windows
-DPAPI for the current user and removes their persistent Windows user-environment values. A
-duplicate-safe one-minute trigger recovers forced termination even when Windows does not classify it
-for restart-on-failure. The task definition contains paths and execution policy, never token names or
-values:
+Two decisions. Everything between them is mechanical, and nothing consequential happens without one
+of them.
 
-```powershell
+## The idea
+
+**Agents are trusted operators, not trusted authorities.**
+
+Workers are extensions of you, so they get broad machine capability: shell, code execution, package
+managers, developer tooling, the filesystem. Denying a coding agent a shell just makes it worse at
+the job, and this system's value never rested on the worker being unable to reach a file.
+
+What is governed is not what a worker may *do* but what becomes *true*.
+
+```text
+worker says "tests passed"        != validation passed
+worker writes a file              != delegate-wave state changed
+worker commits something          != integrated
+worker moves a ref                != authoritative integration
+worker says "$0"                  != cost evidence
+worker edits delegate-wave itself != a new version is installed
+```
+
+Capability is broad by default. Permanence is governed.
+
+## What holds
+
+- **SQLite and Git are the truth.** A worker's claim of success is an observation, never authority.
+- **The candidate is captured, not claimed.** Workers may use Git freely, including local commits;
+  delegate-wave compares the resulting tree to the recorded base and builds its own single candidate
+  commit. Worker history never becomes the integration object.
+- **Validation decides.** An executor exiting zero proves nothing; your commands do.
+- **One attempt, one identity, one epoch.** A late callback from a killed worker cannot mutate state.
+- **Integration is compare-and-swap.** It refuses when the branch moved underneath it.
+- **Cost is honest.** Unmeasured usage is `UNKNOWN`, never zero, and unmeasured spend blocks a budget
+  rather than passing it.
+- **Hermes can propose, never approve.** Its credential holds `read + propose` and nothing else.
+- **Every attempt gets a disposable worktree.** Not to contain a hostile worker -- for recoverability
+  and clean candidate capture, the same reason you use a branch despite trusting yourself.
+
+## Executors
+
+```text
+opencode-go/deepseek-v4-flash   ordinary work        -> Harness
+opencode-go/deepseek-v4-pro     escalation           -> Harness
+opencode-go/gpt-5.6-luna        review and debugging -> OpenCode
+```
+
+Harness is preferred for the models its DeepSeek adapter can run; the review lane belongs to OpenCode
+by design, and OpenCode is also the fallback whenever Harness is unavailable. The executor is chosen
+per attempt, before it starts, and recorded on the attempt.
+
+### Capability profiles
+
+```text
+trusted     default. Shell, PowerShell, code execution, subprocesses, developer tooling,
+            skills, and filesystem access beyond the worktree.
+restricted  attempt-root filesystem fence; no shell, code runtime, or skills. For work against
+            something you do not trust, and for experiments with hidden verifiers.
+```
+
+Request the narrow one per job with `--capability-profile restricted`. Neither profile changes who
+computes the Git diff, who runs validation, what counts as cost evidence, or what may be integrated.
+
+## Install
+
+Requires Node 24+, Git, and an OpenCode installation with a configured provider.
+
+```bash
+npm install -g .
+```
+
+Install the pinned Harness build into the managed data root:
+
+```bash
+npm --prefix D:\AssistantSystem\delegate-wave\harness install @deepseek-ai/dsh@0.1.0-rc.6
+```
+
+The version is pinned deliberately: the profile patch names specific plugin ids and the usage reader
+depends on a specific event shape. A different build may honour neither, so a mismatch falls back to
+OpenCode rather than running on assumptions.
+
+Set up the managed data root and the Control API credentials once:
+
+```bash
+$env:DELEGATE_WAVE_CONTROL_TOKEN = '<generate a long random secret>'
+$env:DELEGATE_WAVE_CONTROL_OBSERVER_TOKEN = '<a different secret>'
 delegate-wave supervisor install
-delegate-wave supervisor start
-delegate-wave supervisor status
 ```
 
-`supervisor stop` first disables future triggers and then ends the running instance. `supervisor
-start` re-enables the task before starting it.
+That seals both credentials into a current-user DPAPI store, removes them from your persistent
+environment, and installs a least-privilege Windows logon task that keeps the Control API running.
 
-`delegate-wave serve` remains the foreground development path. With either form running, set the
-same operator token in the client terminal and use the CLI:
+To let Hermes propose work, add the third credential:
 
-```powershell
-$env:DELEGATE_WAVE_CONTROL_TOKEN = '<same-local-secret>'
-delegate-wave init
-
-delegate-wave project add `
-  --name Backpack `
-  --path 'D:\Projects\Backpack' `
-  --validate 'npm test' `
-  --protect '.github/**' `
-  --protect 'production/**'
-
-delegate-wave project list
-delegate-wave job create --project <project-id> --goal 'Fix the export bug'
-delegate-wave job run --job <job-id> --model <provider/model>
-delegate-wave job status --job <job-id>
-
-delegate-wave integration propose --job <job-id>
-delegate-wave approval grant --proposal <proposal-id> [--maximum-cost <amount>]
-delegate-wave integration run --proposal <proposal-id>
-
-delegate-wave doctor
-delegate-wave reconcile          # preview only
-delegate-wave reconcile --apply  # fence and orphan dead executors
+```bash
+$env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN = '<a third secret>'
+delegate-wave supervisor add-role --role proposer
+delegate-wave supervisor stop; delegate-wave supervisor start
 ```
 
-Mutating commands accept `--request-id <id>` for exact transport retries; otherwise the CLI generates and prints one before sending. If transport or receipt state is uncertain, reuse the printed identity with the exact same command. The server—not CLI arguments—binds approval identity and the `local-cli` origin. The managed data root defaults to `D:\AssistantSystem\delegate-wave` on Windows. Override it on the server for testing with `DELEGATE_WAVE_DATA_ROOT`.
+Until that record exists, Hermes is read-only.
 
-## Current safety boundary
+Finally, seal the model-provider key the workers use:
 
-The OpenCode worker receives runtime permissions that allow reading and editing only inside its attempt worktree. Shell commands, external directories, web access, skills, questions, and subagents are denied. Validation commands are registered by the human when adding the project and are run by the dispatcher after the worker exits.
+```bash
+$env:DELEGATE_WAVE_EXECUTOR_API_KEY = '<your provider key>'
+delegate-wave supervisor add-role --role executor
+delegate-wave supervisor stop; delegate-wave supervisor start
+```
 
-Attempts are isolated as locked, detached Git worktrees. Failed attempts are marked quarantined in SQLite and retained for inspection. Two failures stop the job at `NEEDS_ATTENTION` by default.
+It is stored as its own scoped record, and scrubbed from inherited child environments: a worker
+receives it only because a backend passed it deliberately for that one attempt. Without it, Harness
+cannot run and every job falls back to OpenCode.
 
-The CLI is now strictly a Control API client. It does not open SQLite, instantiate the dispatcher, or execute a worker itself. If the local server is unavailable it fails closed. Mutating requests have durable immutable intent/result receipts, so duplicate, concurrent, disconnected, and post-restart retries cannot silently repeat a side effect.
+## Everyday use
 
-The server's Control API bearer token is removed from the inherited environment of OpenCode, validation commands, Git hooks, and other child processes. This is the minimum credential boundary for the bootstrap; validation should eventually use a tighter allowlisted environment for all unrelated provider and user secrets.
+```bash
+delegate-wave status                      # working / needs a decision / ready to check / done
+delegate-wave proposal list               # what Hermes has proposed
+delegate-wave proposal authorize --proposal ID   # decision 1: runs the work
+delegate-wave integration approve --proposal ID  # decision 2: integrates it
+```
 
-DPAPI removes plaintext operator credentials from `HKCU\Environment` and task metadata, but it is not
-a hostile-code sandbox: code running as the same Windows user can potentially exercise that user's
-credential facilities. Untrusted validation still requires a separate OS identity, container, or VM.
+Through Hermes, the same thing is one tool call: `get_status`, then `propose_work`.
 
-`doctor` checks SQLite integrity, missing repositories, lifecycle-active attempts, and integration operations without immutable terminal records. An unresolved integration makes health false. `reconcile` is read-only unless `--apply` is supplied. Applied reconciliation starts a new fencing epoch only after proving that recorded scheduler, executor, and validator processes are dead; an uncertain executor or validator start fails closed for operator attention.
+## When something goes wrong
 
-## Not implemented yet
+```bash
+delegate-wave doctor                      # is the installation healthy
+delegate-wave reconcile --apply           # resolve abandoned attempts after a crash
+delegate-wave job cancel --job ID         # stop a running job
+delegate-wave backup create --label before-upgrade
+delegate-wave backup list
+delegate-wave backup restore --backup DIR         # database AND every repository head
+delegate-wave backup restore --backup DIR --database-only
+delegate-wave integration rollback --proposal ID  # put an integrated branch back
+delegate-wave restore resolve             # clear an unresolved restore once repos are reconciled
+```
 
-- automatic integration (approved integration is intentionally explicit)
-- semantic escalation across jobs
-- persistent OpenCode server lifecycle
-- Hermes proposal/mutation tools and T3 adapters
-- policy receipts and capability management
+None of these require touching SQLite or Git by hand. Rollback is compare-and-swap and refuses if
+something else moved the branch.
 
-Those remain outside the trusted bootstrap rather than being represented as finished.
+A default restore is all-or-nothing: it checks every recorded repository head first and refuses
+before touching the database if any cannot be returned, so you keep an untouched system and a clear
+reason instead of a half-applied recovery. `--database-only` restores operational truth alone and is
+explicitly incoherent, because you asked for that. In the rare case a repository fails *during* a
+restore, the system stays unhealthy until `restore resolve` -- it will not quietly decide the two
+truths agree again.
 
-The implemented normative rules and traceability tables are in [docs/BOOTSTRAP-SPEC.md](docs/BOOTSTRAP-SPEC.md), [docs/APPROVED-INTEGRATION-SPEC.md](docs/APPROVED-INTEGRATION-SPEC.md), [docs/CONTROL-API-SPEC.md](docs/CONTROL-API-SPEC.md), [docs/HERMES-MCP-SPEC.md](docs/HERMES-MCP-SPEC.md), and [docs/SUPERVISOR-SPEC.md](docs/SUPERVISOR-SPEC.md). Live Windows recovery evidence is in [docs/SUPERVISOR-DOGFOOD.md](docs/SUPERVISOR-DOGFOOD.md), and the current project continuation context is in [docs/DEVELOPMENT-HANDOFF.md](docs/DEVELOPMENT-HANDOFF.md). Hermes setup is in [docs/HERMES-MCP.md](docs/HERMES-MCP.md), with local-SDK evidence in [docs/HERMES-MCP-DOGFOOD.md](docs/HERMES-MCP-DOGFOOD.md), initial live measurements in [docs/HERMES-LIVE-DOGFOOD.md](docs/HERMES-LIVE-DOGFOOD.md), and compact-overview economics in [docs/HERMES-OVERVIEW-DOGFOOD.md](docs/HERMES-OVERVIEW-DOGFOOD.md). PR #4 worker costs and review evidence are recorded in [docs/CONTROL-API-DOGFOOD.md](docs/CONTROL-API-DOGFOOD.md).
+## Registering a project
+
+```bash
+delegate-wave project add --name my-project --path D:\code\my-project \
+  --branch integration \
+  --validate "npm test" \
+  --protect .github --protect package-lock.json
+```
+
+`--validate` commands are what actually decide whether a candidate is acceptable. `--protect` paths
+reject any candidate that touches them.
+
+## Models
+
+Routing is explicit, not automatic:
+
+```text
+opencode-go/deepseek-v4-flash   ordinary work, the default
+opencode-go/gpt-5.6-luna        focused review and debugging
+opencode-go/deepseek-v4-pro     hard implementation escalation
+```
+
+Pass `--model` to `job run` to choose. A job that names no model resolves to Flash before the attempt
+is created, so an executor's ambient default is never used.
+
+## Limits worth knowing
+
+- One machine, one user, one integration branch, serial integration.
+- Under the default `trusted` profile, workers have broad machine access and **no containment is
+  claimed**. That is deliberate: they are extensions of you, and the threat model is mistakes, not
+  malice. The disposable worktree is what makes a mistake cheap to undo.
+- Under `restricted`, the fence is a trusted in-process boundary, not a kernel one. It is sufficient
+  only because that profile has no shell, subprocess, or code runtime. Real isolation would need a
+  separate OS identity, a container, or a VM.
+- DPAPI protects credentials at rest. It is not a sandbox against code running as the same Windows
+  user.
+- Integration never runs through your working checkout.

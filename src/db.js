@@ -8,7 +8,10 @@ import { managedPaths } from "./paths.js";
 // 10: work_proposals and work_proposal_decisions, with their immutability triggers and indexes.
 // 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
 // 12: usage receipts record cost provenance and enforce their value invariants.
-export const SCHEMA_VERSION = "12";
+// 13: durable cancellation intents and results.
+// 14: jobs carry an enforced cost ceiling.
+// 15: integration rollbacks are a first-class recorded outcome.
+export const SCHEMA_VERSION = "16";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -37,6 +40,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   )),
   base_sha TEXT NOT NULL,
   max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
+  -- A recorded ceiling in reference dollars. NULL means no ceiling; a value is enforced before each
+  -- attempt starts, and unaccounted spend blocks rather than passes.
+  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
+  -- An explicit request for a narrower worker: a task run against something untrusted, or an
+  -- experiment with hidden verifiers. Null means the system default, which is broad.
+  capability_profile TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -53,6 +62,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     'NOT_RUN', 'PENDING', 'PASSED', 'FAILED'
   )),
   backend TEXT NOT NULL,
+  -- Under what authority this worker ran. Recorded because "what the worker could do" is a
+  -- selectable policy: reading an attempt's evidence later must not require guessing which one
+  -- was in force.
+  capability_profile TEXT,
   model TEXT,
   scheduler_pid INTEGER,
   executor_intent_id TEXT,
@@ -193,6 +206,45 @@ CREATE TABLE IF NOT EXISTS work_proposal_decisions (
   created_at TEXT NOT NULL
 );
 
+-- A durable cancellation intent. Recorded before anything is killed, so a crash between the request
+-- and its effect leaves evidence that cancellation was asked for rather than losing it.
+--
+-- Cancellation is a request, not an outcome: the job's terminal state still comes from the normal
+-- lifecycle, and a worker that finished before the kill landed is not retroactively unfinished.
+CREATE TABLE IF NOT EXISTS cancellation_intents (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  attempt_id TEXT REFERENCES attempts(id),
+  scheduler_epoch INTEGER NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_origin TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+-- The terminal record of what a cancellation actually achieved. Separate from the intent because the
+-- intent is immutable evidence of the request, while the outcome is discovered afterwards.
+CREATE TABLE IF NOT EXISTS cancellation_results (
+  intent_id TEXT PRIMARY KEY REFERENCES cancellation_intents(id),
+  outcome TEXT NOT NULL CHECK (outcome IN ('CANCELLED', 'ALREADY_TERMINAL', 'NOTHING_RUNNING')),
+  killed_pid INTEGER,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_cancel_intents_immutable_update
+BEFORE UPDATE ON cancellation_intents
+BEGIN SELECT RAISE(ABORT, 'cancellation_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_intents_immutable_delete
+BEFORE DELETE ON cancellation_intents
+BEGIN SELECT RAISE(ABORT, 'cancellation_intents is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_results_immutable_update
+BEFORE UPDATE ON cancellation_results
+BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_cancel_results_immutable_delete
+BEFORE DELETE ON cancellation_results
+BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
+
 -- One immutable receipt per executor run, describing what was observed of its provider usage.
 -- Deliberately separate from the attempts table: an attempt's lifecycle changes over time, while a
 -- receipt records one observation and never changes. Evidence only; MUST NOT influence acceptance.
@@ -203,6 +255,29 @@ CREATE TABLE IF NOT EXISTS work_proposal_decisions (
 --   UNKNOWN   no usage receipt was observed at all
 -- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
 -- failed work appears free in cost per validated candidate.
+-- A rollback is a first-class terminal outcome, not an event footnote. Current integration state is
+-- derived from these rows, so the product cannot keep reporting a removed change as Done.
+--
+-- Recorded AFTER the branch actually moved. A crash between the compare-and-swap and this row leaves
+-- the branch moved with no receipt, which reconciliation detects and resolves.
+CREATE TABLE IF NOT EXISTS integration_rollbacks (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL REFERENCES integration_proposals(id),
+  integration_branch TEXT NOT NULL,
+  from_sha TEXT NOT NULL,
+  to_sha TEXT NOT NULL,
+  rolled_back_by TEXT NOT NULL,
+  rolled_back_origin TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_update
+BEFORE UPDATE ON integration_rollbacks
+BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_delete
+BEFORE DELETE ON integration_rollbacks
+BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
+
 CREATE TABLE IF NOT EXISTS attempt_usage_receipts (
   attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
   status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
@@ -310,6 +385,8 @@ CREATE INDEX IF NOT EXISTS idx_records_operation ON integration_records(operatio
 CREATE INDEX IF NOT EXISTS idx_control_intents_created ON control_request_intents(created_at);
 CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
+CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rollbacks_proposal ON integration_rollbacks(proposal_id, created_at);
 `;
 
 export function initializeDataRoot(root) {
@@ -349,7 +426,19 @@ export function openDatabase(filename) {
 }
 
 function migrate(db) {
+  const jobColumns = db.prepare("PRAGMA table_info(jobs)").all().map((column) => column.name);
+  if (!jobColumns.includes("maximum_cost")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN maximum_cost REAL");
+  }
+  if (!jobColumns.includes("capability_profile")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN capability_profile TEXT");
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
+  if (!attemptColumns.includes("capability_profile")) {
+    // Left null for attempts that predate capability profiles: they ran under the single fixed
+    // contract, and inventing a label for them would misreport history.
+    db.exec("ALTER TABLE attempts ADD COLUMN capability_profile TEXT");
+  }
   if (!attemptColumns.includes("validation_state")) {
     db.exec("ALTER TABLE attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT 'NOT_RUN'");
   }

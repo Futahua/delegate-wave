@@ -3,6 +3,11 @@ import { spawn } from "node:child_process";
 // CTL-AUTH-005: executors, validation commands, Git hooks, and any other child process must never
 // inherit Control-plane authority.
 //
+// The list also carries model-provider keys. Those grant no authority over this system, so they are
+// a weaker class of secret, but nothing should hold one by accident: a backend passes its key
+// explicitly for one attempt, and every other child gets none. Scrubbing them here is what makes
+// "passed deliberately" different from "happened to be in the environment".
+//
 // Declared here rather than in supervisor.js because this is the lowest-level module and must not
 // depend on it. supervisor.js asserts that every name it declares for a credential role appears in
 // this list, so adding a role cannot silently leave its credential inheritable -- which is exactly
@@ -15,6 +20,13 @@ export const CONTROL_AUTHORITY_NAMES = Object.freeze([
   "DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN",
   "DELEGATE_WAVE_CONTROL_PROPOSER_PRINCIPAL",
   "DELEGATE_WAVE_HERMES_CONTROL_TOKEN",
+  // A model-provider key. It grants no authority over this system, but it is still a secret and it
+  // is still scrubbed from the ambient environment: a worker receives it only when a backend passes
+  // it explicitly for that one attempt, never by inheritance. Scrubbing it here is what makes that
+  // difference real rather than conventional -- an unrelated child process, a validation command, or
+  // a Git hook has no reason to hold it.
+  "DELEGATE_WAVE_EXECUTOR_API_KEY",
+  "OPENCODE_GO_API_KEY",
 ]);
 
 export function childEnvironment(extra = {}) {

@@ -14,6 +14,7 @@ test("Hermes adapter exposes only bounded read tools", async () => {
   const client = { get: async (path) => { paths.push(path); return path === "/v1/projects" ? [{ id: "p1" }] : jobs; } };
   const adapter = new HermesMcpAdapter({ client });
   assert.deepEqual(adapter.listTools().map((tool) => tool.name), [
+    "get_status",
     "get_overview", "list_projects", "get_project_summary", "get_job", "get_attention_needed", "get_integration",
     "propose_work", "list_work_proposals", "get_work_proposal",
   ]);
@@ -100,7 +101,7 @@ test("stdio MCP lifecycle and tool calls use newline-delimited JSON-RPC", async 
   assert.equal(responses.length, 4);
   assert.equal(responses[0].result.protocolVersion, "2025-06-18");
   assert.equal(responses[0].result.capabilities.tools.listChanged, false);
-  assert.equal(responses[1].result.tools.length, 9);
+  assert.equal(responses[1].result.tools.length, 10);
   assert.deepEqual(responses[2].result.structuredContent, { result: [{ id: "project-one" }] });
   assert.equal(
     responses[3].result.content[0].text,

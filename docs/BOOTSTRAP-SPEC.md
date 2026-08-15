@@ -50,11 +50,62 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **FS-004** Protected-path changes and Git-metadata changes MUST reject the candidate.
 
+**FS-005** The changed-file set MUST be computed as the worker's resulting non-ignored filesystem
+tree compared to the recorded `base_sha`. It MUST NOT be derived from working-tree status, from the
+worker's HEAD, or from the worker's index. A worker may use Git normally: one that commits its work
+leaves a clean status; one that commits part of it leaves only the remainder visible; and one that
+sets `assume-unchanged` or `skip-worktree` makes a modified file invisible to its own index
+entirely. Each would understate the change, and each would hide a protected-path change from FS-004.
+
+**FS-005a** The snapshot MUST be taken through a delegate-wave-owned index, seeded from `base_sha`
+and stored outside the worktree, so that no worker index state can shape what is captured and the
+index file cannot capture itself. Exactly one snapshot MUST serve the policy check, the candidate
+commit, and the tree validation runs against; content MUST NOT be re-staged between them, because a
+second snapshot could admit content the policy check never saw.
+
+**FS-005b** Establishing the canonical candidate in the worktree MUST NOT be blockable by worker
+index state. `assume-unchanged` entries cause `git reset --hard` to refuse, so the worker's index is
+discarded rather than reset through; it is authoritative for nothing.
+
+**FS-006** The candidate MUST be one delegate-wave-owned commit whose parent is exactly the recorded
+`base_sha` and whose tree is the worker's resulting tree. Worker-created commits and branches are
+workspace activity; they MUST NOT determine the integration object. The worktree MUST be pointed at
+the candidate before validation, so validation sees exactly the tree that was captured.
+
+**FS-007** The changed-file set MUST be computed without rename detection. Rename detection reports a
+move as a single entry naming only the destination, which would hide a protected SOURCE path from
+FS-004 -- a protected file could be moved out of its protected directory and accepted. Policy needs
+every path the tree touched, not Git's semantic interpretation of what the change meant.
+
+**FS-008** Paths excluded from the candidate by the project's own ignore rules MUST NOT be reported
+as absence of change. Excluding them is correct, since ignore rules are trusted project configuration
+declaring what is not source; describing a worker whose entire output was excluded as having changed
+nothing is not.
+
 ## Worker permissions
 
-**WRK-001** Bootstrap workers MAY read and edit only inside their attempt worktree.
+Worker capability is a policy choice, not an invariant of this system. What a worker may DO is
+selected per attempt by a capability profile; what delegate-wave ACCEPTS AS TRUE is fixed and appears
+in the rules below it. A worker may be powerful without being believed.
 
-**WRK-002** Bootstrap workers MUST NOT receive shell, external-directory, web, skill, question, or subagent permission.
+**WRK-001** Every attempt MUST run in its own disposable worktree, and a failed or interrupted
+attempt's worktree MUST be quarantined rather than reused. This is a recoverability and
+candidate-capture requirement, not a containment one: it holds under every capability profile.
+
+**WRK-002** The capability profile in force MUST be chosen before the attempt row is written and
+recorded on it. A worker MUST NOT be granted a capability its profile withholds, and MUST NOT be
+instructed that it lacks a capability its profile grants -- a prompt that contradicts the profile
+silently discards the capability, because a worker generally obeys the instruction.
+
+**WRK-002a** Under the `restricted` profile, workers MAY read and edit only inside their attempt
+worktree, and MUST NOT receive shell, external-directory, web, skill, question, or subagent
+permission. The confinement of reads is required wherever a task's oracle lives outside the worker's
+repository, since a worker that reads it can pass without doing the work.
+
+**WRK-002b** Under the `trusted` profile, workers MAY use shell, code execution, subprocesses,
+package and build tooling, network, and filesystem access beyond the worktree. No containment is
+claimed. This grants no authority: WRK-003 and WRK-006 through WRK-011 apply unchanged, and a
+worker's claim of success remains an observation.
 
 **WRK-003** Validation commands MUST run under dispatcher control after executor completion.
 
@@ -129,7 +180,7 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 
 **VAL-004** Automatic integration MUST NOT occur in the bootstrap release.
 
-**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'FAILED'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event.
+**VAL-005** An interrupted pending validation recovered during reconciliation MUST be classified as `validation_state = 'NOT_RUN'`, quarantined, and reported via the `VALIDATION_INTERRUPTED` event. `FAILED` is reserved for a validation that actually ran and returned a failing verdict.
 
 **VAL-006** A validation MUST record fenced durable intent on its attempt row before spawning its command, and the spawned validator PID MUST be published through a fenced callback before its result can become authoritative.
 
@@ -149,7 +200,11 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 
 **REC-006** `doctor` and `reconcile` MUST detect both the executor-running (`terminal_state IS NULL`) and validation-pending (`SUCCEEDED` with `PENDING`) lifecycle phases.
 
-**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as `validation_state = 'FAILED'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to `PENDING` or `NEEDS_ATTENTION` by attempt limit.
+**REC-007** Applied reconciliation MUST classify an interrupted validation-pending attempt as
+`validation_state = 'NOT_RUN'`, quarantine it, emit `VALIDATION_INTERRUPTED`, and return the job to
+`PENDING` or `NEEDS_ATTENTION` by attempt limit. It MUST NOT record `FAILED`: an interrupted
+validation reached no verdict, and `FAILED` asserts that the candidate was tested and rejected. The
+executor's own `SUCCEEDED` state is unaffected, because the executor really did succeed.
 
 **REC-008** Process-liveness probing MUST treat only definite process nonexistence as dead; access denial or an unknown probe failure MUST be treated as alive.
 
@@ -160,12 +215,22 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | Normative rules | Enforced by | Tested by |
 |---|---|---|
 | AUTH-001, TRUTH-001 | `Dispatcher`, SQLite transactions | all dispatcher tests |
-| AUTH-002, WRK-001, WRK-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
+| AUTH-002 | runtime `OPENCODE_CONFIG_CONTENT` policy | disposable live OpenCode Go canary; `CANARY-REPORT.md` |
+| WRK-001 | worktree per attempt; quarantine on failure | `dispatcher.test.js` (fresh worktree on fallback), `gauntlet.test.js` |
+| WRK-002 | profile recorded on the attempt; prompt matches the profile | `harness-fence.test.js` (trusted/restricted prompt), `dispatcher.test.js` |
+| WRK-002a | restricted fences reads, removes shell/code/skills | `harness-fence.test.js`; live restricted worker wrote DENIED (`HARNESS-DOGFOOD.md`) |
+| WRK-002b | trusted grants shell and broad access without authority | `harness-fence.test.js`; live trusted worker ran PowerShell and read outside (`HARNESS-DOGFOOD.md`) |
 | ATT-001–ATT-003 | SQLite constraints and attempt creation transaction | successful and failed worker tests |
 | ATT-004 | fenced executor, validation, failure, and PID callbacks | stale epoch and stale callback tests |
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
 | ATT-007–ATT-012 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID and executor intent/PID receipts | invalid invocation, live executor, uncertain executor start, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
+| FS-005 | base-relative changed-file set | `dispatcher.test.js` (worker commits all; commits A leaves B; protected path inside a commit) |
+| FS-005a | delegate-wave-owned snapshot index | `dispatcher.test.js` (assume-unchanged and skip-worktree, allowed and protected; arbitrary index/history state; index not self-captured) |
+| FS-005b | worker index cannot block the canonical reset | `dispatcher.test.js` (assume-unchanged allowed file still reaches the candidate) |
+| FS-006 | canonical candidate on `base_sha` | `dispatcher.test.js` (single parent, complete tree); live trusted worker in `HARNESS-DOGFOOD.md` |
+| FS-007 | no rename detection in the policy path | `dispatcher.test.js` (protected rename/move/replace rejected; allowed rename still succeeds) |
+| FS-008 | ignored output reported honestly | `dispatcher.test.js` (ignored-only output names the excluded files) |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | WRK-004 | `Dispatcher.resolveModel` persists the resolved model; `OpenCodeBackend` refuses an absent model | default-model resolution test; unrouted-backend refusal test; distinct-lane test; live no-model run recorded in the proposal dogfood |

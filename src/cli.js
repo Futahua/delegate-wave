@@ -50,6 +50,15 @@ Commands:
   supervisor uninstall        stop the supervised API, then remove the task (keeps credentials)
   supervisor migrate-secrets  upgrade a legacy combined credential bundle to scoped records
   supervisor add-role --role proposer   seal one new credential role into the existing store
+  job cancel --job ID [--reason TEXT] stop a running job; records durable intent and outcome
+  job advance --job ID                run, validate, and propose integration in one step
+  integration approve --proposal ID   approve this exact candidate and integrate it
+  backup create [--label TEXT]        snapshot the operational database with a checksummed manifest
+  backup list
+  backup restore --backup DIR         restore the database and every repository head together
+  backup restore --backup DIR --database-only   restore operational truth alone, explicitly
+  restore resolve                     clear an unresolved restore once repositories are reconciled
+  integration rollback --proposal ID  move an integration branch back, compare-and-swap
   proposal list [--project ID]        list Hermes work proposals awaiting a decision
   proposal show --proposal ID
   proposal authorize --proposal ID    authorize one proposal into a job (operator only)
@@ -59,6 +68,7 @@ Commands:
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
   project list
   job create --project ID --goal TEXT [--mode read|write] [--max-attempts 2]
+                              [--capability-profile restricted] narrow the worker for this job
   job run --job ID [--model provider/model]
   job status --job ID
   job list [--project ID]
@@ -67,6 +77,7 @@ Commands:
   integration show --proposal ID
   approval grant --proposal ID [--expires-at ISO] [--maximum-cost AMOUNT] [--idempotency-key KEY]
   approval list [--proposal ID]
+  status                              what is working, needs a decision, is ready, or finished
   attention
   doctor
   reconcile [--apply]
@@ -84,7 +95,7 @@ Environment:
 async function serve() {
   const { startControlServer } = await import("./control/server.js");
   const running = await startControlServer();
-  print({ serving: true, url: running.url });
+  print({ serving: true, url: running.url, executor: running.executor });
   const stop = async () => { await running.close(); process.exit(0); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
@@ -153,10 +164,41 @@ async function main() {
   const [resource, action] = positional;
   if (resource === "init" || resource === "doctor") {
     print(await client.get("/v1/health"));
+  } else if (resource === "status") {
+    print(await client.get("/v1/briefing"));
   } else if (resource === "attention") {
     print(await client.get("/v1/attention"));
   } else if (resource === "reconcile") {
     print(await client.post("/v1/reconcile", { apply: options.apply === true }, requestId(options)));
+  } else if (resource === "job" && action === "cancel") {
+    print(await client.post(
+      `/v1/jobs/${encodeURIComponent(required(options, "job"))}/cancel`,
+      { reason: options.reason || "" }, requestId(options),
+    ));
+  } else if (resource === "job" && action === "advance") {
+    print(await client.post(
+      `/v1/jobs/${encodeURIComponent(required(options, "job"))}/advance`,
+      { model: options.model || null }, requestId(options),
+    ));
+  } else if (resource === "integration" && action === "approve") {
+    print(await client.post(
+      `/v1/proposals/${encodeURIComponent(required(options, "proposal"))}/approve`, {}, requestId(options),
+    ));
+  } else if (resource === "backup" && action === "create") {
+    print(await client.post("/v1/backups", { label: options.label || "manual" }, requestId(options)));
+  } else if (resource === "backup" && action === "restore") {
+    print(await client.post("/v1/backups/restore", {
+      backup: required(options, "backup"),
+      restoreRepositories: options["database-only"] !== true,
+    }, requestId(options)));
+  } else if (resource === "restore" && action === "resolve") {
+    print(await client.post("/v1/restore/resolve", {}, requestId(options)));
+  } else if (resource === "backup" && action === "list") {
+    print(await client.get("/v1/backups"));
+  } else if (resource === "integration" && action === "rollback") {
+    print(await client.post(
+      `/v1/proposals/${encodeURIComponent(required(options, "proposal"))}/rollback`, {}, requestId(options),
+    ));
   } else if (resource === "proposal" && action === "list") {
     const query = options.project ? `?projectId=${encodeURIComponent(options.project)}` : "";
     print(await client.get(`/v1/work/proposals${query}`));
@@ -181,6 +223,8 @@ async function main() {
     print(await client.post("/v1/jobs", {
       projectId: required(options, "project"), goal: required(options, "goal"), mode: options.mode || "write",
       maxAttempts: Number(options["max-attempts"] || 2),
+      // Omitted means the system default, which is broad. Naming one asks for a narrower worker.
+      ...(options["capability-profile"] ? { capabilityProfile: options["capability-profile"] } : {}),
     }, requestId(options)));
   } else if (resource === "job" && action === "run") {
     const jobId = required(options, "job");
@@ -214,7 +258,10 @@ async function main() {
 
 main().catch((error) => {
   console.error(`delegate-wave: ${error.code ? `${error.code}: ` : ""}${error.message}`);
-  if (activeRequestId && ["CONTROL_API_UNAVAILABLE", "INVALID_CONTROL_RESPONSE", "REQUEST_UNCERTAIN"].includes(error.code)) {
+  if (error.code === "REQUEST_IN_PROGRESS") {
+    // Not uncertain: the server is still running it. Retrying only asks the same question again.
+    console.error("The request is still running. Check `delegate-wave status` rather than retrying.");
+  } else if (activeRequestId && ["CONTROL_API_UNAVAILABLE", "INVALID_CONTROL_RESPONSE", "REQUEST_UNCERTAIN"].includes(error.code)) {
     console.error(`Request outcome may be uncertain. Retry the exact command with: --request-id ${activeRequestId}`);
   }
   process.exitCode = 1;

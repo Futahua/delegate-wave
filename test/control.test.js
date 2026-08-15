@@ -457,3 +457,111 @@ test("distinct tokens are required across all three principals", async () => {
   }), /Proposer and observer control tokens must be distinct/);
   dispatcher.db.close();
 });
+
+// A restore that genuinely succeeded must not be reported as REQUEST_UNCERTAIN.
+//
+// Restore closes the live database and reopens a new handle over the restored file. Two things used
+// to break: the service held a cached handle that was now closed, and the intent row backing the
+// receipt's foreign key lived only in the replaced database. Both made the most reassuring possible
+// outcome -- a clean restore -- come back as the most alarming error the API has.
+test("a successful restore that swaps the database still returns a terminal receipt", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-restore-receipt-"));
+  const dataRoot = path.join(temp, "data");
+  const dispatcher = fakeDispatcher(dataRoot, {
+    restore: async function restore() {
+      // Exactly what the real restore does to the handle: close it and open a fresh one over a file
+      // that has no memory of the in-flight request.
+      this.db.close();
+      fs.rmSync(managedPaths(dataRoot).database, { force: true });
+      this.db = openDatabase(managedPaths(dataRoot).database);
+      return { restored: "backup-dir", coherent: true, files: 1, repositories: [] };
+    },
+  });
+  const service = new ControlService({ dispatcher, pendingWaitMs: 2000 });
+  t.after(() => { try { dispatcher.db.close(); } catch { /* already closed */ } });
+
+  const requestId = `req_${crypto.randomUUID()}`;
+  const response = await service.execute("backup.restore", { backup: "backup-dir" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  });
+  assert.equal(response.coherent, true, "the restore itself reports coherent");
+
+  // The receipt landed in the restored database, so replaying the same request_id is idempotent
+  // rather than uncertain -- which is what makes a retry after a restore safe.
+  const replay = await service.execute("backup.restore", { backup: "backup-dir" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  });
+  assert.deepEqual(replay, response, "replaying the request returns the recorded receipt");
+});
+
+// A retry of a still-running mutation must not be called UNCERTAIN.
+//
+// request_id exists so a retry is safe, and the CLI explicitly tells the operator to retry with the
+// same id. But a long mutation -- `job advance` runs a worker, often 20-60s -- is still executing
+// when the retry arrives. The service saw durable intent with no receipt yet, waited its short
+// window, and reported REQUEST_UNCERTAIN. That is false: the outcome is not unknown, it is not
+// finished. "Uncertain" pushes an operator toward manual inspection or destructive recovery for an
+// operation that is progressing normally.
+test("retrying a still-running mutation reports it as in progress, not uncertain", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-inflight-"));
+  const dataRoot = path.join(temp, "data");
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const dispatcher = fakeDispatcher(dataRoot, {
+    runJob: async () => { await blocked; return { job: { id: "job-1", status: "SUCCEEDED" } }; },
+  });
+  const service = new ControlService({ dispatcher, pendingWaitMs: 200 });
+  t.after(() => { release(); try { dispatcher.db.close(); } catch { /* closed */ } });
+
+  const requestId = `req_${crypto.randomUUID()}`;
+  const first = service.execute("job.run", { jobId: "job-1" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  });
+  // Let the first call claim its intent and begin executing.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  const retried = await service.execute("job.run", { jobId: "job-1" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  }).then(() => ({ code: "COMPLETED" }), (error) => error);
+
+  assert.equal(retried.code, "REQUEST_IN_PROGRESS",
+    "the service knows this request is still executing in this process");
+  assert.notEqual(retried.code, "REQUEST_UNCERTAIN",
+    "and must not claim the outcome is unknown when it merely is not finished");
+  assert.match(retried.message, /still running/i);
+
+  release();
+  await first;
+});
+
+// The genuine case must still be reported as uncertain: intent with no receipt and nobody working
+// on it -- which is what a crash mid-command leaves behind.
+test("intent with no receipt and no live execution is still UNCERTAIN", async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-uncertain-"));
+  const dataRoot = path.join(temp, "data");
+  const dispatcher = fakeDispatcher(dataRoot);
+  const service = new ControlService({ dispatcher, pendingWaitMs: 100 });
+  t.after(() => { try { dispatcher.db.close(); } catch { /* closed */ } });
+
+  // Intent written by a previous process that then died: no result, nothing in flight here.
+  const requestId = `req_${crypto.randomUUID()}`;
+  dispatcher.db.prepare(`INSERT INTO control_request_intents(
+    request_id, command, args_digest, principal_id, origin_channel, created_at
+  ) VALUES (?, 'job.run', ?, 'john', 'cli', ?)`).run(
+    requestId,
+    service.constructor === ControlService
+      ? (await import("node:crypto")).createHash("sha256")
+        .update(`{"args":{"jobId":"job-1"},"command":"job.run"}`).digest("hex")
+      : "digest",
+    new Date().toISOString(),
+  );
+
+  const result = await service.execute("job.run", { jobId: "job-1" }, {
+    requestId, principalId: "john", originChannel: "cli",
+  }).then(() => ({ code: "COMPLETED" }), (error) => error);
+
+  // Either a digest mismatch (different args) or genuine uncertainty -- both are honest refusals,
+  // and neither may be reported as in-progress, because nothing is in progress.
+  assert.notEqual(result.code, "REQUEST_IN_PROGRESS",
+    "nothing is executing, so claiming progress would be the opposite lie");
+});

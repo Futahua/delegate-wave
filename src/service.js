@@ -5,9 +5,10 @@ import { openDatabase, recordEvent, transaction } from "./db.js";
 import { managedPaths } from "./paths.js";
 import {
   assertRepository,
-  changedFiles,
+  snapshotCandidate,
+  ignoredWorkerOutput,
   cherryPick,
-  commitAll,
+  commitCandidateTree,
   createDetachedWorktree,
   git,
   isAncestor,
@@ -18,7 +19,12 @@ import {
   updateRefCas,
 } from "./git.js";
 import { runShell } from "./process.js";
+import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
+import {
+  createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
+  readRestoreMarker, clearRestoreMarker,
+} from "./recovery.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -80,11 +86,24 @@ function compactOverviewText(value) {
 }
 
 export class Dispatcher {
-  constructor({ root, backend, updateRef = updateRefCas }) {
+  constructor({ root, backend, router = null, updateRef = updateRefCas }) {
+    this.root = root;
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
-    this.backend = backend;
+    // A fixed backend still works and is what the tests use. A router selects per attempt from the
+    // resolved model, which is what production needs: not every model runs on every executor.
+    this.backend = backend ?? null;
+    this.router = router;
     this.updateRef = updateRef;
+  }
+
+  // The executor for one attempt, chosen from the model that attempt will run.
+  //
+  // Chosen once, before the attempt row exists, and then used for the whole attempt. There is no
+  // mid-attempt reselection: one attempt has one identity, one epoch, one worktree, one executor.
+  selectBackend(model, profile = undefined) {
+    if (!this.router) return { backend: this.backend, selected: this.backend?.constructor?.name ?? "UnknownBackend" };
+    return this.router.select(model, profile ? { profile } : {});
   }
 
   close() { this.db.close(); }
@@ -120,24 +139,33 @@ export class Dispatcher {
 
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
-  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }) {
+  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null }) {
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
-      id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`).run(
-      jobId, projectId, goal, mode, baseSha, maxAttempts, timestamp, timestamp,
+      id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+      capability_profile, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`).run(
+      jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost,
+      capabilityProfile, timestamp, timestamp,
     );
     recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
     return this.getJob(jobId);
   }
 
-  async createJob({ projectId, goal, mode = "write", maxAttempts = 2 }) {
+  async createJob({
+    projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null, capabilityProfile = null,
+  }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
-    return transaction(this.db, () => this.insertJobRow({ projectId, goal, mode, maxAttempts, baseSha }));
+    // Validated at creation, so an unusable profile is refused when the job is described rather
+    // than discovered when a worker is about to run.
+    if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
+    return transaction(this.db, () => this.insertJobRow({
+      projectId, goal, mode, maxAttempts, baseSha, maximumCost, capabilityProfile,
+    }));
   }
 
   // --- Proposal-only work authority -------------------------------------------------------------
@@ -283,8 +311,11 @@ export class Dispatcher {
       }
       this.assertAuthorizable(proposal);
 
+      // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
+      // bound the scheduler keeps, not a note.
       const job = this.insertJobRow({
         projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
+        maximumCost: proposal.maximum_cost,
       });
       this.db.prepare(`INSERT INTO work_proposal_decisions(
         proposal_id, decision, job_id, decided_by, decided_origin, action_digest, created_at
@@ -490,6 +521,12 @@ export class Dispatcher {
 
   async runJob(jobId, { model = null } = {}) {
     model = this.resolveModel(model);
+    // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
+    // A job may ask for a narrower worker; otherwise the system default applies.
+    const requestedProfile = this.getJob(jobId)?.capability_profile ?? undefined;
+    const selection = this.selectBackend(model, requestedProfile);
+    const backend = selection.backend;
+    if (!backend) throw new Error("No executor backend is available for this attempt");
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
@@ -506,6 +543,8 @@ export class Dispatcher {
       if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
+      // Checked inside the claim transaction, so a ceiling cannot be raced by two starts.
+      this.assertWithinBudget(jobId, current.maximum_cost);
       const ordinal = previousAttempts + 1;
       const attemptId = `${job.id}.${ordinal}`;
       const worktreePath = path.join(this.paths.worktrees, project.id, `attempt-${ordinal}-${job.id.slice(-8)}`);
@@ -513,9 +552,14 @@ export class Dispatcher {
       const epoch = currentEpoch + 1;
       this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
       this.db.prepare(`INSERT INTO attempts(
-        id, job_id, ordinal, scheduler_epoch, backend, model, scheduler_pid, worktree_path, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        attemptId, jobId, ordinal, epoch, this.backend.constructor.name, model, process.pid, worktreePath, now(),
+        id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
+        scheduler_pid, worktree_path, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        attemptId, jobId, ordinal, epoch, backend.constructor.name,
+        // Recorded before the worker starts: the authority a worker ran under is evidence, not a
+        // detail to be reconstructed afterwards from which artifacts happen to exist.
+        backend.profile ?? null,
+        model, process.pid, worktreePath, now(),
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
@@ -539,7 +583,7 @@ export class Dispatcher {
       let backendResult = null;
       let backendError = null;
       try {
-        backendResult = await this.backend.run({
+        backendResult = await backend.run({
           attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
           onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
         });
@@ -550,18 +594,62 @@ export class Dispatcher {
       // Record usage before any failure becomes a lifecycle outcome. A throw, timeout, nonzero exit,
       // protected-path rejection, empty diff, or failed validation still consumed tokens, and those
       // attempts belong in the denominator of cost per validated candidate.
-      this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult });
-      if (backendError) throw backendError;
+      // The attempt's OWN backend reads its usage: each executor writes a different artifact in a
+      // different format, so the default would misread another executor's evidence as absent.
+      this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult, backend });
+      if (backendError) {
+        // A Harness configuration failure -- a profile that will not compose, a fence the loader
+        // refuses -- will recur on every attempt, so the router stops choosing it. This attempt
+        // still fails honestly: the failure is recorded after the fact, never as a mid-attempt
+        // switch, and the next attempt gets a fresh worktree under whatever the router then picks.
+        if (selection.selected === "harness" && this.router) {
+          this.router.disableHarness(backendError.message);
+        }
+        throw backendError;
+      }
+
+      // A cancellation that arrived while the worker ran stops here, at a boundary, rather than
+      // leaving a killed process to be interpreted as an ordinary failure. Usage is already
+      // recorded above, so cancelled work still counts toward cost.
+      if (this.isCancellationRequested(jobId, epoch)) throw new Error("cancelled by operator");
 
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
 
-      const files = await changedFiles(worktreePath);
+      // ONE snapshot of what the attempt actually produced, taken through a delegate-wave-owned
+      // temporary index rather than the worker's.
+      //
+      // A trusted worker may use Git freely, and that includes `update-index --assume-unchanged` and
+      // `--skip-worktree`, under which `git add --all` in the worker's own index reports a modified
+      // file as nothing at all -- hiding it from the protected-path check and dropping it from the
+      // candidate. Neither the worker's index nor its HEAD is authoritative; the resulting
+      // non-ignored filesystem tree is.
+      //
+      // Policy, the candidate commit, and the tree validation runs against all come from this single
+      // immutable tree. Nothing is re-staged in between, so content the policy check never saw
+      // cannot slip into what gets integrated.
+      const snapshot = await snapshotCandidate(worktreePath, job.base_sha, artifactDir);
+      const files = snapshot.files;
       this.assertAllowedDiff(files, parseJson(project.protected_json));
       let resultCommit = null;
       if (job.mode === "write") {
-        if (files.length === 0) throw new Error("worker completed without changing files");
-        resultCommit = await commitAll(worktreePath, `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`);
+        if (files.length === 0) {
+          // Distinguish "did nothing" from "everything it produced is excluded by this project's own
+          // ignore rules". Both fail the attempt, but only one is honestly described as changing
+          // nothing, and the other is confusing because the output is visible in the worktree.
+          const ignored = await ignoredWorkerOutput(worktreePath);
+          if (ignored.length) {
+            throw new Error(
+              "worker produced only files this project ignores, so there is nothing to integrate: "
+              + `${ignored.join(", ")}`,
+            );
+          }
+          throw new Error("worker completed without changing files");
+        }
+        resultCommit = await commitCandidateTree(
+          worktreePath, snapshot.tree, job.base_sha,
+          `delegate-wave: ${job.goal.slice(0, 72)} (${attemptId})`,
+        );
       }
 
       this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
@@ -775,6 +863,520 @@ export class Dispatcher {
       recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
+  }
+
+  // --- Everyday status --------------------------------------------------------------------------
+  //
+  // One bounded answer to "what is happening", written for a person rather than for a machine.
+  //
+  // Four states, because those are the four things worth knowing: something is running, something
+  // needs a decision, something is ready to check, or something finished. Raw transcripts, worktree
+  // paths, and internal identifiers are deliberately absent -- they are available on request through
+  // the detailed endpoints, and putting them here would bury the answer.
+  briefing({ limit = 8 } = {}) {
+    const doctor = this.doctor();
+    const short = (text, max = 90) => {
+      const clean = String(text ?? "").replace(/\s+/g, " ").trim();
+      return clean.length > max ? `${clean.slice(0, max - 1)}...` : clean;
+    };
+    const money = (value) => (value === null || value === undefined ? null : Number(value.toFixed(6)));
+
+    // Cost is reported with its completeness, never as a bare number that might be silently partial.
+    const jobCost = (jobId) => {
+      const spend = this.jobSpend(jobId);
+      return {
+        reference_cost_usd: money(spend.spent),
+        complete: spend.complete,
+        ...(spend.complete ? {} : { unmeasured_attempts: spend.unpriced_attempts }),
+      };
+    };
+
+    const working = this.db.prepare(`SELECT j.id, j.goal, p.name AS project, j.updated_at
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'RUNNING' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
+
+    const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
+      decision: "authorize or reject this work",
+      proposal: row.id,
+      project: this.getProject(row.project_id)?.name ?? row.project_id,
+      goal: short(row.goal),
+      ceiling_usd: money(row.maximum_cost),
+      expires_at: row.expires_at,
+    }));
+
+    // A proposal still awaits approval only if nothing has successfully integrated it. The stored
+    // state column lags the integration records -- integrationStatus already derives around that --
+    // so filtering on the column alone would ask the operator to approve work that already landed.
+    const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, j.goal, p.name AS project
+      FROM integration_proposals ip
+      JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
+      WHERE ip.state = 'OPEN'
+        AND NOT EXISTS (
+          SELECT 1 FROM integration_records r
+          WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
+        )
+      ORDER BY ip.created_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        decision: "approve to integrate, or roll back later",
+        proposal: row.id,
+        // Carried like every other bucket. Without it a pending approval cannot be correlated back
+        // to the work that produced it, so Hermes cannot answer "what happened to what I proposed".
+        job: row.job_id,
+        project: row.project,
+        goal: short(row.goal),
+        cost: jobCost(row.job_id),
+      }));
+
+    const attention = this.db.prepare(`SELECT j.id, j.goal, j.status, p.name AS project,
+        (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id
+         ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'NEEDS_ATTENTION' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        job: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        why: this.lastFailureReason(row.id),
+        cost: jobCost(row.id),
+      }));
+
+    // A job whose integration was rolled back is not Done: the change it describes is gone.
+    const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
+      FROM jobs j JOIN projects p ON p.id = j.project_id
+      WHERE j.status = 'SUCCEEDED'
+        AND NOT EXISTS (
+          SELECT 1 FROM integration_rollbacks rb
+          JOIN integration_proposals ip ON ip.id = rb.proposal_id
+          WHERE ip.job_id = j.id
+        )
+      ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      .map((row) => ({
+        job: row.id,
+        project: row.project,
+        goal: short(row.goal),
+        finished: row.updated_at,
+        changed: this.integratedFiles(row.id),
+        cost: jobCost(row.id),
+      }));
+
+    return {
+      schema_version: 1,
+      healthy: doctor.healthy,
+      working,
+      needs_your_decision: [...proposals, ...candidates],
+      ready_to_check: attention,
+      done,
+      ...(doctor.healthy ? {} : { health_detail: {
+        missing_repositories: doctor.missing_repositories.length,
+        unresolved_integrations: doctor.unresolved_integrations.length,
+      } }),
+    };
+  }
+
+  // The most recent failure in plain language, taken from the recorded event rather than a
+  // transcript. A person needs to know what went wrong, not what the model said while it happened.
+  lastFailureReason(jobId) {
+    const row = this.db.prepare(`SELECT e.payload_json FROM events e
+      JOIN attempts a ON a.id = e.entity_id
+      WHERE a.job_id = ? AND e.kind = 'ATTEMPT_FAILED'
+      ORDER BY e.sequence DESC LIMIT 1`).get(jobId);
+    if (!row) return "stopped without a recorded reason";
+    try {
+      const message = JSON.parse(row.payload_json).message ?? "";
+      return String(message).replace(/\s+/g, " ").trim().slice(0, 200) || "stopped without a recorded reason";
+    } catch {
+      return "stopped without a recorded reason";
+    }
+  }
+
+  // What actually landed, so "Done" can say what changed rather than only that something did.
+  integratedFiles(jobId) {
+    const record = this.db.prepare(`SELECT r.detail, r.proposal_id FROM integration_records r
+      JOIN integration_proposals ip ON ip.id = r.proposal_id
+      WHERE ip.job_id = ? AND r.kind = 'INTEGRATION_SUCCEEDED'
+      ORDER BY r.sequence DESC LIMIT 1`).get(jobId);
+    if (!record) return null;
+    const rolledBack = this.latestRollback(record.proposal_id);
+    if (rolledBack) return { rolled_back_from: record.detail, branch_now_at: rolledBack.to_sha };
+    return { integrated_commit: record.detail };
+  }
+
+  // --- Auto-advance -----------------------------------------------------------------------------
+  //
+  // Human authority is preserved exactly where it matters and removed everywhere it was ceremony.
+  // Two decisions remain: authorize the work, and approve the integration. Everything between them
+  // -- running the worker, validating, and proposing the integration -- is mechanical, and requiring
+  // a human keystroke for each step bought no safety while guaranteeing the loop stalls whenever the
+  // operator is away.
+  //
+  // What is deliberately NOT automated: integration itself still consumes an explicit approval, and
+  // the approval still binds to one exact candidate digest.
+  async advanceJob(jobId, { model = null } = {}) {
+    const job = this.getJob(jobId);
+    if (!job) throw new Error(`Unknown job: ${jobId}`);
+
+    // Run the worker unless the job already produced a candidate.
+    let status = this.status(jobId);
+    if (["PENDING", "NEEDS_ATTENTION"].includes(status.job.status)) {
+      status = await this.runJob(jobId, { model });
+    }
+
+    if (status.job.status !== "READY_FOR_INTEGRATION") {
+      return { job: status.job, attempts: status.attempts, stage: "worker", proposal: null };
+    }
+    if (job.mode !== "write") {
+      return { job: status.job, attempts: status.attempts, stage: "complete", proposal: null };
+    }
+
+    // Proposing an integration is mechanical: it records what would be integrated and still requires
+    // a separate approval before anything moves.
+    const existing = this.db.prepare(
+      "SELECT * FROM integration_proposals WHERE job_id = ? AND state = 'OPEN' ORDER BY created_at DESC LIMIT 1",
+    ).get(jobId);
+    const proposal = existing ?? await this.proposeIntegration({ jobId });
+
+    return {
+      job: this.getJob(jobId),
+      attempts: this.status(jobId).attempts,
+      stage: "awaiting_approval",
+      proposal,
+    };
+  }
+
+  // Approving and integrating in one operator action. The approval is still explicit, still bound to
+  // the exact candidate, and still recorded separately; this only removes the second keystroke that
+  // followed it unconditionally.
+  async approveAndIntegrate({ proposalId, principal, origin, idempotencyKey = null }) {
+    this.grantApproval({ proposalId, principal, origin, idempotencyKey });
+    return this.runIntegration(proposalId);
+  }
+
+  // --- Recovery ---------------------------------------------------------------------------------
+
+  backup(label = "manual") {
+    return createBackup({ root: this.root, database: this.db, label });
+  }
+
+  // Restore closes this dispatcher's database first: the live handle would keep the file open and a
+  // restored database beside a live WAL is not the database that was backed up.
+  async restore(backupDirectory, { restoreRepositories = true } = {}) {
+    const root = this.root;
+    const snapshot = verifyBackup(backupDirectory);
+    if (!snapshot.intact) {
+      throw new Error(`Refusing to restore a damaged backup: ${JSON.stringify(snapshot.damaged)}`);
+    }
+    const safety = await createBackup({ root, database: this.db, label: "pre-restore" });
+    this.db.close();
+    try {
+      const result = await restoreBackup({ root, backupDirectory, database: null, restoreRepositories });
+      return { ...result, safety_backup: safety.backup };
+    } finally {
+      // Reopen whatever is now on disk, restored or not, so the dispatcher stays usable.
+      this.db = openDatabase(this.paths.database);
+    }
+  }
+
+  listBackups() {
+    return listBackups(this.root);
+  }
+
+  // Clears the unresolved-restore condition once repository heads have been dealt with.
+  //
+  // Deliberately explicit. The system cannot decide on its own that a disagreement between
+  // operational truth and code truth has been settled -- only a person who looked can, and until
+  // they do, `doctor` stays unhealthy rather than quietly recovering.
+  resolveRestore() {
+    const marker = readRestoreMarker(this.root);
+    if (!marker) return { resolved: false, reason: "no unresolved restore was recorded" };
+    const cleared = clearRestoreMarker(this.root);
+    recordEvent(this.db, {
+      kind: "RESTORE_RECONCILED", entityType: "system", entityId: "restore",
+      payload: { cleared_marker: cleared.marker ?? null, was: marker },
+    });
+    return { resolved: true, was: marker };
+  }
+
+  verifyBackup(backupDirectory) {
+    return verifyBackup(backupDirectory);
+  }
+
+  // Rolls an integration branch back to the state before a recorded integration.
+  //
+  // The target comes from the recorded operation, not from the caller: asking an operator to supply
+  // a SHA under stress is how the wrong commit gets typed. The operation's expected head is what the
+  // branch pointed at before that integration, so that is where it returns to.
+  async rollbackIntegration({ proposalId, principal, origin }) {
+    if (!principal || !origin) throw new Error("Rolling back requires an authorizing identity");
+    const proposal = this.getProposal(proposalId);
+    if (!proposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
+    const project = this.getProject(proposal.project_id);
+    if (!project) throw new Error(`Unknown project: ${proposal.project_id}`);
+
+    const succeeded = this.db.prepare(`SELECT r.*, o.expected_integration_head, o.integration_branch
+      FROM integration_records r JOIN integration_operations o ON o.id = r.operation_id
+      WHERE r.proposal_id = ? AND r.kind = 'INTEGRATION_SUCCEEDED'
+      ORDER BY r.sequence DESC LIMIT 1`).get(proposalId);
+    if (!succeeded) throw new Error(`Proposal ${proposalId} has no succeeded integration to roll back`);
+
+    const result = await rollbackIntegration({
+      repoPath: project.repo_path,
+      branch: succeeded.integration_branch,
+      toSha: succeeded.expected_integration_head,
+      expectedCurrentSha: succeeded.detail,
+    });
+
+    // Recorded after the branch actually moved. A crash between the two leaves the branch moved with
+    // no receipt; reconcile() detects that and completes the record rather than leaving the product
+    // reporting a removed change as current.
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO integration_rollbacks(
+        id, proposal_id, integration_branch, from_sha, to_sha, rolled_back_by, rolled_back_origin, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        id("rollback"), proposalId, succeeded.integration_branch,
+        result.from, result.to, principal, origin, now(),
+      );
+      recordEvent(this.db, {
+        kind: "INTEGRATION_ROLLED_BACK", entityType: "proposal", entityId: proposalId,
+        payload: { ...result, principal, origin },
+      });
+    });
+    return result;
+  }
+
+  // The most recent rollback of a proposal, if any. Current integration state derives from this.
+  latestRollback(proposalId) {
+    return this.db.prepare(
+      "SELECT * FROM integration_rollbacks WHERE proposal_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).get(proposalId) ?? null;
+  }
+
+  // Detects a rollback whose branch move landed but whose receipt did not, by comparing the recorded
+  // integration head against where the branch actually points. Returns what it repaired.
+  async reconcileRollbacks({ apply = false } = {}) {
+    const repaired = [];
+    const succeeded = this.db.prepare(`SELECT r.proposal_id, r.detail AS integrated_sha,
+        o.expected_integration_head, o.integration_branch, ip.project_id
+      FROM integration_records r
+      JOIN integration_operations o ON o.id = r.operation_id
+      JOIN integration_proposals ip ON ip.id = r.proposal_id
+      WHERE r.kind = 'INTEGRATION_SUCCEEDED'`).all();
+
+    for (const row of succeeded) {
+      if (this.latestRollback(row.proposal_id)) continue;
+      const project = this.getProject(row.project_id);
+      if (!project || !fs.existsSync(project.repo_path)) continue;
+      let head;
+      try {
+        head = await resolveRevision(project.repo_path, row.integration_branch);
+      } catch {
+        continue;
+      }
+      // The branch sits exactly where a rollback of this integration would have left it, and no
+      // rollback was recorded: the receipt was lost between the CAS and the write.
+      if (head === row.expected_integration_head && head !== row.integrated_sha) {
+        repaired.push({ proposal_id: row.proposal_id, branch: row.integration_branch, head });
+        if (apply) {
+          transaction(this.db, () => {
+            this.db.prepare(`INSERT INTO integration_rollbacks(
+              id, proposal_id, integration_branch, from_sha, to_sha, rolled_back_by, rolled_back_origin, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'reconciliation', 'reconcile', ?)`).run(
+              id("rollback"), row.proposal_id, row.integration_branch,
+              row.integrated_sha, head, now(),
+            );
+            recordEvent(this.db, {
+              kind: "ROLLBACK_RECONCILED", entityType: "proposal", entityId: row.proposal_id,
+              payload: { branch: row.integration_branch, head, reason: "branch was rolled back without a receipt" },
+            });
+          });
+        }
+      }
+    }
+    return repaired;
+  }
+
+  // --- Budget -----------------------------------------------------------------------------------
+  //
+  // A cost ceiling that is recorded but never checked is not a ceiling. Spend is summed from the
+  // usage receipts, which means it inherits their honesty: an UNKNOWN receipt has no cost, and
+  // treating that as zero would let unmeasured work slip under a budget indefinitely.
+
+  // Total reference cost already spent on a job, plus what could not be priced.
+  //
+  // `unpriced` is not a rounding detail. Attempts whose usage is UNKNOWN or unpriceable consumed
+  // real tokens that this figure cannot account for, so a caller comparing `spent` against a ceiling
+  // must know the comparison is incomplete.
+  jobSpend(jobId) {
+    const rows = this.db.prepare(`SELECT r.status, r.reference_cost_usd
+      FROM attempt_usage_receipts r JOIN attempts a ON a.id = r.attempt_id
+      WHERE a.job_id = ?`).all(jobId);
+    const attempts = this.db.prepare(`SELECT COUNT(*) AS count FROM attempts a
+      JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'
+      WHERE a.job_id = ?`).get(jobId).count;
+
+    let spent = 0;
+    let priced = 0;
+    for (const row of rows) {
+      // Only COMPLETE + priced counts as fully measured. The finalizer does compute a reference
+      // price for PARTIAL observations, and admitting those here would let a truncated receipt pass
+      // as complete spend -- the same "incomplete evidence treated as complete" hole that UNKNOWN
+      // already closes, one status along. Whatever was observed is still added to `spent`, because
+      // it was really consumed; it just cannot make the accounting complete.
+      if (row.reference_cost_usd !== null) spent += row.reference_cost_usd;
+      if (row.status === "COMPLETE" && row.reference_cost_usd !== null) priced += 1;
+    }
+    // Every attempt that ran without producing a complete priced receipt is unaccounted spend.
+    const unpriced = Math.max(0, attempts - priced);
+    return { spent, priced_attempts: priced, unpriced_attempts: unpriced, complete: unpriced === 0 };
+  }
+
+  // Refuses to start work that a recorded ceiling cannot cover.
+  //
+  // Unaccounted spend blocks rather than passes: if an earlier attempt's cost is unknown, the honest
+  // answer is that the budget cannot be shown to be intact, not that it is.
+  assertWithinBudget(jobId, ceiling) {
+    if (ceiling === null || ceiling === undefined) return null;
+    const spend = this.jobSpend(jobId);
+    if (!spend.complete) {
+      throw new Error(
+        `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
+        + `the ${ceiling} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
+      );
+    }
+    if (spend.spent >= ceiling) {
+      throw new Error(
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling; refusing to start more work`,
+      );
+    }
+    return spend;
+  }
+
+  // --- Cancellation -----------------------------------------------------------------------------
+  //
+  // Cancellation is a request against a running attempt, not a state a caller can assert. The intent
+  // is recorded durably first, so a crash between the request and the kill leaves evidence rather
+  // than losing it, and the outcome is discovered afterwards.
+
+  cancellationIntents(jobId) {
+    return this.db.prepare(`SELECT i.*, r.outcome, r.killed_pid, r.detail
+      FROM cancellation_intents i LEFT JOIN cancellation_results r ON r.intent_id = i.id
+      WHERE i.job_id = ? ORDER BY i.created_at`).all(jobId);
+  }
+
+  // True when an unresolved cancellation exists for this attempt's epoch. The running loop checks
+  // this between stages so a cancel lands at a safe boundary rather than mid-write.
+  isCancellationRequested(jobId, epoch) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM cancellation_intents i
+      LEFT JOIN cancellation_results r ON r.intent_id = i.id
+      WHERE i.job_id = ? AND i.scheduler_epoch = ? AND r.intent_id IS NULL`).get(jobId, epoch));
+  }
+
+  async cancelJob({ jobId, principal, origin, reason = "" }) {
+    const job = this.getJob(jobId);
+    if (!job) throw new Error(`Unknown job: ${jobId}`);
+    if (!principal || !origin) throw new Error("Cancelling identity is required");
+
+    const epoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+    // The same lifecycle-active definition doctor and reconcile use. An attempt whose executor
+    // succeeded but whose validation is still pending is running work: the job is RUNNING and a
+    // validation process may be alive, so treating it as "nothing running" would make cancel useless
+    // for exactly the phase most likely to hang.
+    const active = this.db.prepare(`SELECT * FROM attempts WHERE job_id = ?
+      AND ${lifecycleActive()} ORDER BY ordinal DESC LIMIT 1`).get(jobId);
+
+    // Record the intent before touching any process.
+    const intentId = id("cancel");
+    transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO cancellation_intents(
+        id, job_id, attempt_id, scheduler_epoch, requested_by, requested_origin, reason, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        intentId, jobId, active?.id ?? null, epoch, principal, origin, String(reason).slice(0, 500), now(),
+      );
+      recordEvent(this.db, {
+        kind: "CANCELLATION_REQUESTED", entityType: "job", entityId: jobId, epoch,
+        payload: { intentId, attemptId: active?.id ?? null, requestedBy: principal },
+      });
+    });
+
+    const settle = (outcome, detail, killedPid = null) => transaction(this.db, () => {
+      this.db.prepare(`INSERT INTO cancellation_results(
+        intent_id, outcome, killed_pid, detail, created_at
+      ) VALUES (?, ?, ?, ?, ?)`).run(intentId, outcome, killedPid, detail, now());
+      recordEvent(this.db, {
+        kind: "CANCELLATION_SETTLED", entityType: "job", entityId: jobId, epoch,
+        payload: { intentId, outcome, killedPid },
+      });
+      return { intent_id: intentId, outcome, killed_pid: killedPid, detail };
+    });
+
+    if (!active) {
+      // READY_FOR_INTEGRATION counts as finished work: the attempt succeeded and produced a
+      // candidate, so cancelling must not read as "nothing happened here".
+      const finished = ["SUCCEEDED", "FAILED", "CANCELLED", "READY_FOR_INTEGRATION"].includes(job.status);
+      return settle(finished ? "ALREADY_TERMINAL" : "NOTHING_RUNNING", `job status ${job.status}`);
+    }
+
+    // Kill the executor if one is running. A missing PID is not an error: the attempt may not have
+    // spawned yet, and the loop's boundary check will still stop it.
+    // Which phase is actually running decides what to kill and what "cancelled" means afterwards.
+    const validating = active.terminal_state === "SUCCEEDED" && active.validation_state === "PENDING";
+    const targetPid = validating ? active.validation_pid : active.executor_pid;
+
+    let killedPid = null;
+    if (targetPid) {
+      // Never signal this process or its scheduler. A corrupt or misreported PID must not let a
+      // cancel take down the control plane; the attempt is still marked cancelled below.
+      const forbidden = [process.pid, active.scheduler_pid].filter(Boolean);
+      if (forbidden.includes(targetPid)) {
+        recordEvent(this.db, {
+          kind: "CANCELLATION_KILL_REFUSED", entityType: "attempt", entityId: active.id, epoch,
+          payload: { intentId, pid: targetPid, reason: "pid is the scheduler or this process" },
+        });
+      } else {
+        try {
+          process.kill(targetPid);
+          killedPid = targetPid;
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+    }
+
+    // Mark the attempt cancelled under the same fencing every other transition uses. If the attempt
+    // reached a terminal state first, the cancellation is a no-op against a finished attempt rather
+    // than a retroactive undo.
+    const applied = transaction(this.db, () => {
+      const current = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(active.id);
+      const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+      if (!current || current.scheduler_epoch !== epoch || currentEpoch !== epoch) return false;
+
+      const stillValidating = current.terminal_state === "SUCCEEDED" && current.validation_state === "PENDING";
+      if (current.terminal_state !== null && !stillValidating) return false;
+
+      if (stillValidating) {
+        // The executor really did succeed, and validation was interrupted rather than failed. Marking
+        // it FAILED would claim the candidate was tested and rejected, which is not what happened.
+        // The candidate stays quarantined because it was never validated.
+        this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN',
+          validation_intent_id = NULL, validation_pid = NULL,
+          failure_signature = 'cancelled-during-validation', quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(active.id);
+      } else {
+        this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
+          executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(now(), active.id);
+      }
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), jobId);
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: active.id, epoch,
+        payload: { intentId, killedPid, phase: stillValidating ? "validation" : "executor" },
+      });
+      return true;
+    });
+
+    return applied
+      ? settle("CANCELLED", `attempt ${active.id} cancelled`, killedPid)
+      : settle("ALREADY_TERMINAL", `attempt ${active.id} reached a terminal state first`, killedPid);
   }
 
   async failAttempt({ attemptId, jobId, epoch, project, worktreePath, executorIntentId = null, error }) {
@@ -1157,7 +1759,14 @@ export class Dispatcher {
     if (!storedProposal) throw new Error(`Unknown integration proposal: ${proposalId}`);
     const records = this.db.prepare("SELECT * FROM integration_records WHERE proposal_id = ? ORDER BY sequence").all(proposalId);
     const integrated = records.find((record) => record.kind === "PROPOSAL_INTEGRATED");
-    const proposal = { ...storedProposal, state: integrated ? "INTEGRATED" : storedProposal.state };
+    // A rollback is the later fact: an integration that was undone is no longer current, and
+    // reporting it as INTEGRATED would describe a change the repository no longer contains.
+    const rolledBack = this.latestRollback(proposalId);
+    const proposal = {
+      ...storedProposal,
+      state: rolledBack ? "ROLLED_BACK" : (integrated ? "INTEGRATED" : storedProposal.state),
+      ...(rolledBack ? { rolled_back: rolledBack } : {}),
+    };
     const storedApprovals = this.db.prepare(
       "SELECT * FROM approval_receipts WHERE proposal_id = ? ORDER BY granted_at",
     ).all(proposalId);
@@ -1214,13 +1823,20 @@ export class Dispatcher {
           AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
       )
       ORDER BY o.created_at`).all();
+    // A restore that could not complete coherently leaves a durable marker outside the database,
+    // because the database is the thing it had to outlive. While it is present the system is
+    // unhealthy: operational truth and code truth are known to disagree, and only a person can say
+    // which one is right.
+    const unresolvedRestore = readRestoreMarker(this.root);
     return {
       healthy: integrity.length === 1 && integrity[0] === "ok" && running.length === 0
-        && missingRepositories.length === 0 && unresolvedIntegrations.length === 0,
+        && missingRepositories.length === 0 && unresolvedIntegrations.length === 0
+        && !unresolvedRestore,
       database_integrity: integrity,
       running_attempts: running,
       missing_repositories: missingRepositories,
       unresolved_integrations: unresolvedIntegrations,
+      ...(unresolvedRestore ? { unresolved_restore: unresolvedRestore } : {}),
     };
   }
 
@@ -1298,7 +1914,12 @@ export class Dispatcher {
         for (const attempt of candidates) {
           const interrupted = attempt.terminal_state === "SUCCEEDED";
           if (interrupted) {
-            this.db.prepare(`UPDATE attempts SET validation_state = 'FAILED', finished_at = ?,
+            // NOT_RUN, not FAILED -- the same reasoning cancellation already applies. A validation
+            // interrupted by a crash or restart produced no verdict, so recording FAILED would claim
+            // the candidate was tested and rejected. It was not tested at all. The attempt is still
+            // quarantined and the job still returns for another attempt; only the reason is honest.
+            this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN', finished_at = ?,
+              failure_signature = 'validation-interrupted',
               quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), attempt.id);
             recordEvent(this.db, { kind: "VALIDATION_INTERRUPTED", entityType: "attempt", entityId: attempt.id, epoch: claimedEpoch });
           } else {
@@ -1330,7 +1951,10 @@ export class Dispatcher {
         action: attempt.terminal_state === "SUCCEEDED" ? "VALIDATION_INTERRUPTED" : "ORPHANED",
       });
     }
-    return { applied: true, scheduler_epoch: epoch, observations, results: applied };
+    // A rollback whose branch move landed but whose receipt did not leaves the product reporting a
+    // removed change as current, so reconciliation completes that record too.
+    const rollbacks = await this.reconcileRollbacks({ apply });
+    return { applied: true, scheduler_epoch: epoch, observations, results: applied, rollbacks };
   }
 }
 

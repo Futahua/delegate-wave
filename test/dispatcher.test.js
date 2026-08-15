@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -566,7 +567,10 @@ test("reconciliation detects and classifies an interrupted SUCCEEDED/PENDING val
   const state = service.status(job.id);
   assert.equal(state.job.status, "PENDING");
   assert.equal(state.attempts[0].terminal_state, "SUCCEEDED");
-  assert.equal(state.attempts[0].validation_state, "FAILED");
+  // NOT_RUN, not FAILED: an interrupted validation reached no verdict, so recording FAILED would
+  // assert the candidate was tested and rejected. The quarantine is what keeps it out of
+  // integration; the verdict field only has to be true.
+  assert.equal(state.attempts[0].validation_state, "NOT_RUN");
   assert.equal(state.attempts[0].quarantined, 1);
   assert.equal(state.attempts[0].worktree_locked, 1);
   const interrupted = service.db.prepare(
@@ -1081,4 +1085,486 @@ test("an UNKNOWN, PARTIAL, or unpriced receipt is accounted for but not healthy"
     service.close();
   }
   await cleanup();
+});
+
+// Per-attempt routing, end to end through the dispatcher.
+//
+// The attempt row must name the executor that actually ran, and a fallback attempt must get its own
+// fresh worktree -- never the interrupted one, which may hold a half-finished edit.
+test("each attempt records the executor that actually ran it and gets its own worktree", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+
+  // Stands in for a Harness attempt that fails on a configuration problem, and an OpenCode attempt
+  // that succeeds -- the exact fresh-attempt fallback sequence.
+  class FailingHarness extends FakeBackend {
+    async run() { throw new Error("the fenced filesystem is not in the composed Harness profile"); }
+  }
+  class WorkingOpenCode extends FakeBackend {}
+
+  const worktrees = [];
+  const router = {
+    failed: false,
+    select() {
+      const backend = this.failed ? new WorkingOpenCode(async ({ worktreePath }) => {
+        worktrees.push(worktreePath);
+        fs.writeFileSync(path.join(worktreePath, "input.txt"), "after\n");
+        return { exitCode: 0, stdout: "ok", stderr: "" };
+      }) : new FailingHarness();
+      return { backend, selected: this.failed ? "opencode" : "harness" };
+    },
+    disableHarness() { this.failed = true; },
+  };
+
+  const service = new Dispatcher({ root, router });
+  try {
+  const project = await service.addProject({ name: "routing", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "change input", mode: "write", maxAttempts: 2 });
+
+  // The Harness attempt fails honestly and terminates; it is never rescued by switching executor
+  // partway through, which would put two executors behind one attempt identity.
+  await service.runJob(job.id);
+  const first = service.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(job.id);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].backend, "FailingHarness", "the attempt names the executor that really ran");
+  assert.equal(first[0].terminal_state, "FAILED");
+  assert.equal(first[0].quarantined, 1, "and its worktree is quarantined");
+
+  await service.runJob(job.id);
+  const all = service.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(job.id);
+  assert.equal(all.length, 2);
+  assert.equal(all[1].backend, "WorkingOpenCode", "the fresh attempt used the fallback executor");
+  assert.notEqual(all[1].worktree_path, all[0].worktree_path,
+    "an interrupted attempt's worktree is never reused");
+  assert.equal(all[1].terminal_state, "SUCCEEDED");
+  } finally {
+    // Closed before the worktrees are removed: t.after runs LIFO, so a registered cleanup would
+    // otherwise fire while SQLite still holds the files open and fail with EPERM on Windows.
+    service.close();
+    await cleanup();
+  }
+});
+
+// Candidate capture must be base-relative, because a trusted worker may use Git normally.
+//
+// Reading `git status` would see nothing from a worker that committed its work, and only the
+// uncommitted remainder from one that committed part of it -- which would also hide the committed
+// part from the protected-path check. Worker history is workspace activity; the candidate is the
+// net tree the attempt produced.
+const gitIn = async (cwd, ...args) => {
+  const result = await runProcess("git", ["-C", cwd, ...args]);
+  assert.equal(result.exitCode, 0, result.stderr);
+  return result.stdout.trim();
+};
+
+// A worker that behaves exactly as the trusted prompt now invites: it uses local Git.
+const committingWorker = (plan) => new FakeBackend(async ({ worktreePath, artifactDir }) => {
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+    type: "step_finish",
+    part: { tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 },
+  }));
+  await gitIn(worktreePath, "config", "user.name", "Worker");
+  await gitIn(worktreePath, "config", "user.email", "worker@example.invalid");
+  await plan({ worktreePath, write: (name, body) => fs.writeFileSync(path.join(worktreePath, name), body) });
+  return { exitCode: 0, stdout: "ok", stderr: "" };
+});
+
+test("a worker that commits all of its work still produces a candidate", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    write("ADDED.md", "committed by the worker\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker's own commit");
+  }) });
+  try {
+    const project = await service.addProject({ name: "committed", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "add a file", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "SUCCEEDED",
+      "a clean worktree after a worker commit is not 'changed nothing'");
+    assert.ok(attempt.result_commit, "and a candidate commit exists");
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    assert.match(listed, /ADDED\.md/);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The mixed case, and the dangerous one: status would show only B, so A would be invisible to both
+// the protected-path check and the candidate.
+test("a worker that commits A and leaves B uncommitted yields a candidate containing both", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    write("A.md", "committed\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker committed A");
+    write("B.md", "left uncommitted\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "mixed", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "add two files", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    assert.match(listed, /A\.md/, "the worker's committed change is in the candidate");
+    assert.match(listed, /B\.md/, "and so is the uncommitted one");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The security-relevant half of the same bug: a protected path hidden inside a worker commit.
+test("a protected-path change inside a worker commit is still rejected", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    fs.mkdirSync(path.join(worktreePath, "secrets"), { recursive: true });
+    write("secrets/keys.txt", "should never be accepted\n");
+    await gitIn(worktreePath, "add", "--all");
+    await gitIn(worktreePath, "commit", "-m", "worker committed a protected change");
+    write("ALLOWED.md", "an ordinary change\n");
+  }) });
+  try {
+    const project = await service.addProject({
+      name: "protected", repoPath: repo, validation: [], protectedPaths: ["secrets/"],
+    });
+    const job = await service.createJob({ projectId: project.id, goal: "touch a protected path", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "FAILED",
+      "the check must see the committed change, not only the uncommitted remainder");
+    assert.equal(attempt.result_commit, null, "and no candidate is produced");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The candidate must be a single commit on the recorded base, whatever history the worker built,
+// because integration cherry-picks exactly that one commit.
+test("the candidate is one commit parented on the recorded base", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: committingWorker(async ({ worktreePath, write }) => {
+    // Three commits and a branch: none of it may shape the candidate.
+    await gitIn(worktreePath, "checkout", "-b", "worker-scratch");
+    for (const name of ["one.md", "two.md"]) {
+      write(name, `${name}\n`);
+      await gitIn(worktreePath, "add", "--all");
+      await gitIn(worktreePath, "commit", "-m", `worker commit for ${name}`);
+    }
+    write("three.md", "three\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "canonical", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "several changes", maxAttempts: 1 });
+    const before = service.getJob(job.id).base_sha;
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    const parents = (await gitIn(repo, "rev-list", "--parents", "-n", "1", attempt.result_commit)).split(" ");
+    assert.equal(parents.length, 2, "exactly one parent");
+    assert.equal(parents[1], before, "and it is the recorded base, not the worker's HEAD");
+
+    const listed = await gitIn(repo, "show", "--name-only", "--format=", attempt.result_commit);
+    for (const name of ["one.md", "two.md", "three.md"]) {
+      assert.match(listed, new RegExp(name.replace(".", "\.")), `${name} is in the candidate`);
+    }
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Rename detection must never reach a policy decision.
+//
+// `git diff --find-renames --name-only` reports `protected/locked.txt -> allowed.txt` as a single
+// entry and prints only the DESTINATION. The protected source then never reaches the check, so a
+// worker could move a protected file out of its protected directory and have it accepted. Policy
+// needs every path the tree touched, not Git's semantic interpretation of what the change meant.
+const policyWorker = (plan) => new FakeBackend(async ({ worktreePath, artifactDir }) => {
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, "opencode-events.jsonl"), JSON.stringify({
+    type: "step_finish",
+    part: { tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.00001 },
+  }));
+  await plan({ worktreePath, run: (...args) => gitIn(worktreePath, ...args) });
+  return { exitCode: 0, stdout: "ok", stderr: "" };
+});
+
+async function policyFixture(t, plan) {
+  const { root, repo, cleanup } = await fixture(t);
+  fs.mkdirSync(path.join(repo, "protected"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "protected", "locked.txt"), "must not move\n");
+  fs.writeFileSync(path.join(repo, "allowed-a.txt"), "ordinary\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "add protected and allowed files"], repo);
+
+  const service = new Dispatcher({ root, backend: policyWorker(plan) });
+  const project = await service.addProject({
+    name: `policy-${crypto.randomUUID().slice(0, 8)}`, repoPath: repo, validation: [],
+    protectedPaths: ["protected/"],
+  });
+  const job = await service.createJob({ projectId: project.id, goal: "policy probe", maxAttempts: 1 });
+  await service.runJob(job.id);
+  const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+  return { service, repo, attempt, cleanup };
+}
+
+test("renaming a protected file to an allowed path is rejected", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("mv", "protected/locked.txt", "allowed.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "rename detection must not hide the protected source from the policy check");
+    assert.equal(attempt.result_commit, null, "and no candidate is produced");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The counterpart: legitimate renames must still work, or the fix would be a blunt instrument.
+test("renaming one allowed file to another allowed path succeeds", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("mv", "allowed-a.txt", "allowed-b.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    // Asserted on the candidate's TREE, not on `git show`, which applies its own rename detection
+    // when formatting and would report one path either way.
+    const tree = await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit);
+    const names = tree.split("\n").map((line) => line.trim());
+    assert.ok(names.includes("allowed-b.txt"), "the destination exists in the candidate tree");
+    assert.ok(!names.includes("allowed-a.txt"), "and the source is gone from it");
+    assert.ok(names.includes("protected/locked.txt"), "the untouched protected file is still there");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("deleting a protected file is caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ run }) => {
+    await run("rm", "protected/locked.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED", "a deletion is a change to a protected path");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The combination that would most plausibly slip past: a protected move buried among ordinary edits,
+// where rename detection could pair the protected source with an unrelated destination.
+test("a protected move hidden among ordinary changes is still caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    fs.writeFileSync(path.join(worktreePath, "NOTES.md"), "ordinary work\n");
+    fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "edited\n");
+    await run("mv", "protected/locked.txt", "docs-copy.txt");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Replacement: the protected file is deleted and an allowed file takes a similar shape. Content
+// similarity is exactly what rename detection keys on, so this is the case most likely to be paired.
+test("replacing a protected file with an identical allowed file is caught", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    const body = fs.readFileSync(path.join(worktreePath, "protected", "locked.txt"), "utf8");
+    await run("rm", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "copied.txt"), body);
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "identical content is what rename detection pairs on, so this must not hide the deletion");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// "Changed nothing" must mean changed nothing.
+//
+// `.gitignore` is trusted project configuration and excluding its matches from the candidate is
+// correct -- force-adding would sweep node_modules into candidates. But a worker whose entire output
+// is ignored has not "changed nothing": its files are sitting in the worktree, visible, while the
+// system says otherwise. An attempt worktree is fresh from the base, so anything ignored-and-present
+// was produced by this worker.
+test("a worker whose output is entirely ignored is told so, not that it changed nothing", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  fs.writeFileSync(path.join(repo, ".gitignore"), "*.log\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "add ignore rules"], repo);
+
+  const service = new Dispatcher({ root, backend: policyWorker(async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "answer.log"), "the real output\n");
+  }) });
+  try {
+    const project = await service.addProject({ name: "ignored", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "write answer.log", maxAttempts: 1 });
+    await service.runJob(job.id);
+
+    const attempt = service.db.prepare("SELECT * FROM attempts WHERE job_id = ?").get(job.id);
+    assert.equal(attempt.terminal_state, "FAILED", "there is genuinely nothing to integrate");
+    const reason = service.lastFailureReason(job.id);
+    assert.match(reason, /ignores/, "and the reason names the real cause");
+    assert.match(reason, /answer\.log/, "including which file was excluded");
+    assert.ok(!/completed without changing files/.test(reason),
+      "the worker did change a file; saying otherwise is false");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("an ordinary empty attempt still reports plainly that nothing changed", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: policyWorker(async () => { /* touches nothing */ }) });
+  try {
+    const project = await service.addProject({ name: "empty", repoPath: repo, validation: [] });
+    const job = await service.createJob({ projectId: project.id, goal: "do nothing", maxAttempts: 1 });
+    await service.runJob(job.id);
+    assert.match(service.lastFailureReason(job.id), /without changing files/);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The worker's Git index is not authoritative.
+//
+// A trusted worker may use Git freely, and that includes index flags:
+//
+//   git update-index --assume-unchanged <path>
+//   git update-index --skip-worktree    <path>
+//
+// Under either, `git add --all` in the worker's OWN index reports a modified file as nothing at all.
+// Capture that trusted the worker's index therefore both hid protected-path changes from policy and
+// silently dropped real work from the candidate. The snapshot is taken through a delegate-wave-owned
+// temporary index seeded from the recorded base, so no worker index state can shape it.
+const indexWorker = (flag, plan) => policyWorker(async ({ worktreePath, run }) => {
+  await plan({ worktreePath, run, mark: (...paths) => run("update-index", flag, ...paths) });
+});
+
+test("an assume-unchanged allowed file still reaches the candidate", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      await run("update-index", "--assume-unchanged", "allowed-a.txt");
+      fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "really changed\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED", "the change is real and must be captured");
+    const body = await gitIn(repo, "show", `${attempt.result_commit}:allowed-a.txt`);
+    assert.equal(body.trim(), "really changed", "the candidate carries what the filesystem holds");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("an assume-unchanged protected file is still caught by policy", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    await run("update-index", "--assume-unchanged", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "protected", "locked.txt"), "stolen\n");
+    fs.writeFileSync(path.join(worktreePath, "cover.md"), "an ordinary change\n");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED",
+      "hiding a protected change in the worker's index must not bypass FS-004");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("a skip-worktree protected file is still caught by policy", async (t) => {
+  const { service, attempt, cleanup } = await policyFixture(t, async ({ worktreePath, run }) => {
+    await run("update-index", "--skip-worktree", "protected/locked.txt");
+    fs.writeFileSync(path.join(worktreePath, "protected", "locked.txt"), "stolen\n");
+    fs.writeFileSync(path.join(worktreePath, "cover.md"), "an ordinary change\n");
+  });
+  try {
+    assert.equal(attempt.terminal_state, "FAILED");
+    assert.equal(attempt.result_commit, null);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("a skip-worktree allowed file still reaches the candidate", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      await run("update-index", "--skip-worktree", "allowed-a.txt");
+      fs.writeFileSync(path.join(worktreePath, "allowed-a.txt"), "skip-worktree change\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const body = await gitIn(repo, "show", `${attempt.result_commit}:allowed-a.txt`);
+    assert.equal(body.trim(), "skip-worktree change");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Arbitrary index and history state must be irrelevant: the candidate is the resulting filesystem.
+test("arbitrary staged, unstaged, untracked and committed state yields the filesystem tree", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t,
+    async ({ worktreePath, run }) => {
+      fs.writeFileSync(path.join(worktreePath, "staged.md"), "staged\n");
+      await run("add", "staged.md");
+      fs.writeFileSync(path.join(worktreePath, "committed.md"), "committed\n");
+      await run("add", "committed.md");
+      await run("commit", "-m", "worker commit");
+      await run("checkout", "-b", "worker-branch");
+      await run("tag", "worker-tag");
+      fs.writeFileSync(path.join(worktreePath, "untracked.md"), "untracked\n");
+      fs.writeFileSync(path.join(worktreePath, "staged.md"), "staged then modified\n");
+    });
+  try {
+    assert.equal(attempt.terminal_state, "SUCCEEDED");
+    const names = (await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit))
+      .split("\n").map((line) => line.trim());
+    for (const name of ["staged.md", "committed.md", "untracked.md"]) {
+      assert.ok(names.includes(name), `${name} is in the candidate`);
+    }
+    assert.equal((await gitIn(repo, "show", `${attempt.result_commit}:staged.md`)).trim(),
+      "staged then modified", "the filesystem wins over what was staged earlier");
+    const parents = (await gitIn(repo, "rev-list", "--parents", "-n", "1", attempt.result_commit)).split(" ");
+    assert.equal(parents.length, 2, "still exactly one parent despite the worker's branch and tag");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The temporary index must not become part of what it captures.
+test("the capture index is not itself captured", async (t) => {
+  const { service, repo, attempt, cleanup } = await policyFixture(t, async ({ worktreePath }) => {
+    fs.writeFileSync(path.join(worktreePath, "ordinary.md"), "work\n");
+  });
+  try {
+    const names = await gitIn(repo, "ls-tree", "-r", "--name-only", attempt.result_commit);
+    assert.ok(!/candidate-index/.test(names), "the delegate-wave index must live outside the worktree");
+  } finally {
+    service.close();
+    await cleanup();
+  }
 });

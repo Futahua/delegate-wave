@@ -7,7 +7,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
-  "work.propose", "work.proposal.authorize", "work.proposal.reject",
+  "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
+  "backup.create", "backup.restore", "restore.resolve", "integration.rollback", "job.advance", "integration.approve",
 ]);
 
 function canonical(value) {
@@ -31,8 +32,27 @@ function rejectIdentity(args) {
 export class ControlService {
   constructor({ dispatcher, pendingWaitMs = 5000 }) {
     this.dispatcher = dispatcher;
-    this.db = dispatcher.db;
     this.pendingWaitMs = pendingWaitMs;
+    // request_ids this process is executing right now.
+    //
+    // "Intent with no receipt" has two very different meanings, and conflating them is a lie. If
+    // nobody is working on it, the outcome is genuinely unknown -- that is what a crash mid-command
+    // leaves behind. If this process is still running the command, the outcome is not unknown, it is
+    // merely not finished. Reporting the second as UNCERTAIN pushes an operator toward manual
+    // inspection or destructive recovery for an operation that is progressing normally, and it is
+    // exactly what the CLI's own "retry with the same --request-id" advice produces on any mutation
+    // slower than the short wait window. A `job advance` runs a worker; 20-60 seconds is ordinary.
+    this.inFlight = new Set();
+  }
+
+  // Read through to the dispatcher's current handle rather than caching one.
+  //
+  // Restore closes the live database and reopens a new handle over the restored file. A cached
+  // reference would still point at the closed handle, so writing the terminal receipt would fail and
+  // a fully successful restore would be reported to the caller as REQUEST_UNCERTAIN -- the single
+  // most alarming answer the API can give, on the one operation an operator runs under stress.
+  get db() {
+    return this.dispatcher.db;
   }
 
   async execute(command, args = {}, context = {}) {
@@ -49,9 +69,11 @@ export class ControlService {
       "job.get": () => this.dispatcher.status(args.jobId),
       "proposal.get": () => this.dispatcher.integrationStatus(args.proposalId),
       "work.proposal.list": () => this.dispatcher.listWorkProposals(args.projectId || null),
+      "backup.list": () => this.dispatcher.listBackups(),
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       attention: () => this.dispatcher.attention(),
+      briefing: () => this.dispatcher.briefing(),
     };
     const handler = handlers[command];
     if (!handler) throw new ControlError("UNKNOWN_COMMAND", `Unknown query command: ${command}`, 404);
@@ -86,6 +108,19 @@ export class ControlService {
     if (claim.kind === "result") return this.decodeResult(claim.result);
     if (claim.kind === "pending") return this.waitForResult(requestId);
 
+    this.inFlight.add(requestId);
+    try {
+      return await this.executeClaimed(command, args, { principalId, originChannel, requestId, argsDigest });
+    } finally {
+      this.inFlight.delete(requestId);
+    }
+  }
+
+  // The claimed path: intent is durable, this process owns the execution.
+  async executeClaimed(command, args, { principalId, originChannel, requestId, argsDigest }) {
+    // Kept so the receipt can be written even if the command replaced the database underneath us.
+    const intent = { command, argsDigest, principalId, originChannel, createdAt: now() };
+
     let response;
     try {
       response = await this.executeMutation(command, args, { principalId, originChannel });
@@ -93,7 +128,7 @@ export class ControlService {
       const normalized = asControlError(error);
       if (String(normalized.code).includes("UNCERTAIN")) throw this.uncertain(requestId, normalized);
       try {
-        this.recordFailedResult(requestId, normalized);
+        this.recordFailedResult(requestId, normalized, intent);
       } catch (receiptError) {
         throw this.uncertain(requestId, receiptError);
       }
@@ -101,23 +136,39 @@ export class ControlService {
     }
 
     try {
-      this.recordSucceededResult(requestId, response);
+      this.recordSucceededResult(requestId, response, intent);
     } catch (receiptError) {
       throw this.uncertain(requestId, receiptError);
     }
     return response;
   }
 
-  recordSucceededResult(requestId, response) {
+  // Restore replaces the whole database, including the intent row this request wrote a moment ago.
+  // The receipt has a foreign key to that intent, so without re-establishing it the receipt cannot
+  // land and a fully successful restore reports as uncertain. Re-inserting the intent this request
+  // genuinely made is not fabrication: it carries this request's own durable record across the swap.
+  reinstateIntent(requestId, intent) {
+    const present = this.db.prepare("SELECT 1 FROM control_request_intents WHERE request_id = ?").get(requestId);
+    if (present) return;
+    this.db.prepare(`INSERT INTO control_request_intents(
+      request_id, command, args_digest, principal_id, origin_channel, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      requestId, intent.command, intent.argsDigest, intent.principalId, intent.originChannel, intent.createdAt,
+    );
+  }
+
+  recordSucceededResult(requestId, response, intent = null) {
     transaction(this.db, () => {
+      if (intent) this.reinstateIntent(requestId, intent);
       this.db.prepare(`INSERT INTO control_request_results(
         request_id, outcome, response_json, created_at
       ) VALUES (?, 'SUCCEEDED', ?, ?)`).run(requestId, JSON.stringify(response), now());
     });
   }
 
-  recordFailedResult(requestId, error) {
+  recordFailedResult(requestId, error, intent = null) {
     transaction(this.db, () => {
+      if (intent) this.reinstateIntent(requestId, intent);
       this.db.prepare(`INSERT INTO control_request_results(
         request_id, outcome, error_code, error_message, created_at
       ) VALUES (?, 'FAILED', ?, ?, ?)`).run(requestId, error.code, error.message, now());
@@ -140,6 +191,14 @@ export class ControlService {
       if (result) return this.decodeResult(result);
       await sleep(25);
     }
+    // Still executing here: not finished is not the same as not known.
+    if (this.inFlight.has(requestId)) {
+      throw new ControlError(
+        "REQUEST_IN_PROGRESS",
+        `request_id ${requestId} is still running; poll its job or proposal rather than retrying`,
+        409,
+      );
+    }
     throw new ControlError("REQUEST_UNCERTAIN", `request_id ${requestId} has durable intent but no terminal receipt`, 409);
   }
 
@@ -153,6 +212,32 @@ export class ControlService {
       "project.create": () => this.dispatcher.addProject(args),
       "job.create": () => this.dispatcher.createJob(args),
       "job.run": () => this.dispatcher.runJob(args.jobId, { model: args.model || null }),
+      // One authorization carries the work as far as it can go without another human decision.
+      "job.advance": () => this.dispatcher.advanceJob(args.jobId, { model: args.model || null }),
+      // The second and final decision: approve this exact candidate and integrate it.
+      "integration.approve": () => this.dispatcher.approveAndIntegrate({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        idempotencyKey: args.idempotencyKey || null,
+      }),
+      "backup.create": () => this.dispatcher.backup(args.label || "manual"),
+      // Clears the unresolved-restore condition; only a person can say the truths agree again.
+      "restore.resolve": () => this.dispatcher.resolveRestore(),
+      "backup.restore": () => this.dispatcher.restore(args.backup, {
+        restoreRepositories: args.restoreRepositories !== false,
+      }),
+      "integration.rollback": () => this.dispatcher.rollbackIntegration({
+        proposalId: args.proposalId,
+        principal: context.principalId,
+        origin: context.originChannel,
+      }),
+      "job.cancel": () => this.dispatcher.cancelJob({
+        jobId: args.jobId,
+        principal: context.principalId,
+        origin: context.originChannel,
+        reason: args.reason || "",
+      }),
       "integration.propose": () => this.dispatcher.proposeIntegration({ jobId: args.jobId }),
       "approval.grant": () => this.dispatcher.grantApproval({
         proposalId: args.proposalId,
@@ -176,12 +261,27 @@ export class ControlService {
         principal: context.principalId,
         origin: context.originChannel,
       }),
-      "work.proposal.authorize": () => this.dispatcher.authorizeWorkProposal({
-        proposalId: args.proposalId,
-        principal: context.principalId,
-        origin: context.originChannel,
-        maxAttempts: args.maxAttempts ?? 2,
-      }),
+      // Authorizing runs the work: the operator's single decision is "do this", not "do this, then
+      // tell me to start it, then tell me to validate it". Auto-advance is opt-out for callers that
+      // want the decision recorded without immediately spending money.
+      "work.proposal.authorize": async () => {
+        const decided = await this.dispatcher.authorizeWorkProposal({
+          proposalId: args.proposalId,
+          principal: context.principalId,
+          origin: context.originChannel,
+          maxAttempts: args.maxAttempts ?? 2,
+        });
+        if (args.advance === false) return decided;
+        const jobId = decided.decision?.job_id;
+        if (!jobId) return decided;
+        // A worker or validation failure is a normal outcome of advancing, not a failure of the
+        // authorization itself, so it is reported rather than thrown.
+        try {
+          return { ...decided, advanced: await this.dispatcher.advanceJob(jobId, { model: args.model || null }) };
+        } catch (error) {
+          return { ...decided, advanced: null, advance_error: String(error?.message ?? error) };
+        }
+      },
       "work.proposal.reject": () => this.dispatcher.rejectWorkProposal({
         proposalId: args.proposalId,
         principal: context.principalId,

@@ -28,7 +28,7 @@ async function command(name, args, cwd) {
   return result.stdout.trim();
 }
 
-async function fixture(t) {
+async function fixture(t, { failWorker = false } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-acceptance-"));
   const root = path.join(temp, "data");
   const repo = path.join(temp, "repo");
@@ -44,6 +44,7 @@ async function fixture(t) {
 
   // A cheap worker that produces the requested file, then deterministic validation checks it.
   const backend = new FakeBackend(async ({ worktreePath }) => {
+    if (failWorker) return { exitCode: 1, stdout: "", stderr: "worker gave up" };
     fs.writeFileSync(path.join(worktreePath, "output.txt"), "worker-result\n");
     return { exitCode: 0, stdout: "ok", stderr: "" };
   });
@@ -119,20 +120,23 @@ test("full product path: Hermes proposal, human authorization, worker, validatio
     (error) => error.code === "INSUFFICIENT_SCOPE",
   );
 
-  // 3. The human authorizes the exact proposal, which is what creates the job.
+  // 3. The human authorizes the exact proposal. That single decision creates the job, runs the
+  // worker, validates the result, and proposes the integration -- everything up to the next point
+  // where human judgement is actually required.
   const authorized = await f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId());
   assert.equal(authorized.state, "AUTHORIZED");
   assert.equal(authorized.decision.decided_by, "john");
   const jobId = authorized.decision.job_id;
   assert.ok(jobId);
 
-  // 4. The cheap worker runs and deterministic validation gates the result.
-  const ready = await f.operator.post(`/v1/jobs/${jobId}/run`, {}, requestId());
-  assert.equal(ready.job.status, "READY_FOR_INTEGRATION");
-  assert.equal(ready.attempts.at(-1).validation_state, "PASSED");
+  // 4. The cheap worker ran and deterministic validation gated the result, without another keystroke.
+  assert.ok(authorized.advanced, "authorization advances the work");
+  assert.equal(authorized.advanced.stage, "awaiting_approval");
+  assert.equal(authorized.advanced.job.status, "READY_FOR_INTEGRATION");
+  assert.equal(authorized.advanced.attempts.at(-1).validation_state, "PASSED");
 
-  // 5. Integration proposal and explicit human approval.
-  const integration = await f.operator.post("/v1/integration/proposals", { jobId }, requestId());
+  // 5. The integration proposal already exists; approval is the second and final decision.
+  const integration = authorized.advanced.proposal;
   assert.equal(integration.state, "OPEN");
   await assert.rejects(
     f.proposer.post("/v1/approvals", { proposalId: integration.id }, requestId()),
@@ -334,4 +338,80 @@ test("an expired proposal stops competing for operator attention", async (t) => 
   // It can no longer be authorized, so surfacing it would be permanent noise.
   assert.equal((await f.operator.get("/v1/overview")).totals.proposals_awaiting_decision, 0);
   assert.equal((await f.operator.get("/v1/attention")).work_proposals_awaiting_decision.length, 0);
+});
+
+test("the whole loop takes exactly two human decisions", async (t) => {
+  // The V1 promise: authorize once, approve once. Every mechanical step between them happens
+  // without another keystroke, and neither decision is removed.
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "TwoDecisions", repoPath: f.repo, branch: "integration",
+    validation: ["git ls-files --error-unmatch output.txt"],
+  }, requestId());
+
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "create output.txt", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  // Decision one.
+  const authorized = await f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId());
+  assert.equal(authorized.advanced.stage, "awaiting_approval");
+  assert.equal(authorized.advanced.job.status, "READY_FOR_INTEGRATION");
+  const integration = authorized.advanced.proposal;
+
+  // Decision two.
+  const integrated = await f.operator.post(`/v1/proposals/${integration.id}/approve`, {}, requestId());
+  assert.equal(integrated.proposal.state, "INTEGRATED");
+
+  const branch = await command("git", ["-C", f.repo, "show", "integration:output.txt"], f.repo);
+  assert.equal(branch.trim(), "worker-result");
+
+  // The proposer still cannot make either decision.
+  const second = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "another", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+  await assert.rejects(
+    f.proposer.post(`/v1/work/proposals/${second.id}/authorize`, {}, requestId()),
+    (error) => error.code === "INSUFFICIENT_SCOPE",
+  );
+  await assert.rejects(
+    f.proposer.post(`/v1/proposals/${integration.id}/approve`, {}, requestId()),
+    (error) => error.code === "INSUFFICIENT_SCOPE",
+  );
+});
+
+test("authorization can record the decision without spending money", async (t) => {
+  // Auto-advance is opt-out: a caller that wants the decision recorded but not acted on immediately
+  // can still get that, which matters when a ceiling or a review needs checking first.
+  const f = await fixture(t);
+  const project = await f.operator.post("/v1/projects", {
+    name: "NoAdvance", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "later", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  const authorized = await f.operator.post(
+    `/v1/work/proposals/${proposal.id}/authorize`, { advance: false }, requestId(),
+  );
+  assert.equal(authorized.state, "AUTHORIZED");
+  assert.equal(authorized.advanced, undefined, "nothing ran");
+  assert.equal((await f.operator.get(`/v1/jobs/${authorized.decision.job_id}`)).job.status, "PENDING");
+});
+
+test("a worker failure during advance is reported, not thrown as an authorization failure", async (t) => {
+  // Authorizing succeeded even though the work did not: those are different facts, and collapsing
+  // them would make a failed worker look like a rejected decision.
+  const f = await fixture(t, { failWorker: true });
+  const project = await f.operator.post("/v1/projects", {
+    name: "AdvanceFails", repoPath: f.repo, branch: "integration", validation: [],
+  }, requestId());
+  const proposal = await f.proposer.post("/v1/work/proposals", {
+    projectId: project.id, goal: "will fail", idempotencyKey: `k-${crypto.randomUUID()}`,
+  }, requestId());
+
+  const authorized = await f.operator.post(`/v1/work/proposals/${proposal.id}/authorize`, {}, requestId());
+  assert.equal(authorized.state, "AUTHORIZED", "the decision itself succeeded");
+  assert.equal(authorized.advanced.stage, "worker");
+  assert.notEqual(authorized.advanced.job.status, "READY_FOR_INTEGRATION");
 });
