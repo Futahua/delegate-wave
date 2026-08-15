@@ -258,7 +258,10 @@ async function main() {
 
 main().catch((error) => {
   console.error(`delegate-wave: ${error.code ? `${error.code}: ` : ""}${error.message}`);
-  if (activeRequestId && ["CONTROL_API_UNAVAILABLE", "INVALID_CONTROL_RESPONSE", "REQUEST_UNCERTAIN"].includes(error.code)) {
+  if (error.code === "REQUEST_IN_PROGRESS") {
+    // Not uncertain: the server is still running it. Retrying only asks the same question again.
+    console.error("The request is still running. Check `delegate-wave status` rather than retrying.");
+  } else if (activeRequestId && ["CONTROL_API_UNAVAILABLE", "INVALID_CONTROL_RESPONSE", "REQUEST_UNCERTAIN"].includes(error.code)) {
     console.error(`Request outcome may be uncertain. Retry the exact command with: --request-id ${activeRequestId}`);
   }
   process.exitCode = 1;

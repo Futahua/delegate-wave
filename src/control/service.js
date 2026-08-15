@@ -33,6 +33,16 @@ export class ControlService {
   constructor({ dispatcher, pendingWaitMs = 5000 }) {
     this.dispatcher = dispatcher;
     this.pendingWaitMs = pendingWaitMs;
+    // request_ids this process is executing right now.
+    //
+    // "Intent with no receipt" has two very different meanings, and conflating them is a lie. If
+    // nobody is working on it, the outcome is genuinely unknown -- that is what a crash mid-command
+    // leaves behind. If this process is still running the command, the outcome is not unknown, it is
+    // merely not finished. Reporting the second as UNCERTAIN pushes an operator toward manual
+    // inspection or destructive recovery for an operation that is progressing normally, and it is
+    // exactly what the CLI's own "retry with the same --request-id" advice produces on any mutation
+    // slower than the short wait window. A `job advance` runs a worker; 20-60 seconds is ordinary.
+    this.inFlight = new Set();
   }
 
   // Read through to the dispatcher's current handle rather than caching one.
@@ -98,6 +108,16 @@ export class ControlService {
     if (claim.kind === "result") return this.decodeResult(claim.result);
     if (claim.kind === "pending") return this.waitForResult(requestId);
 
+    this.inFlight.add(requestId);
+    try {
+      return await this.executeClaimed(command, args, { principalId, originChannel, requestId, argsDigest });
+    } finally {
+      this.inFlight.delete(requestId);
+    }
+  }
+
+  // The claimed path: intent is durable, this process owns the execution.
+  async executeClaimed(command, args, { principalId, originChannel, requestId, argsDigest }) {
     // Kept so the receipt can be written even if the command replaced the database underneath us.
     const intent = { command, argsDigest, principalId, originChannel, createdAt: now() };
 
@@ -170,6 +190,14 @@ export class ControlService {
       const result = this.db.prepare("SELECT * FROM control_request_results WHERE request_id = ?").get(requestId);
       if (result) return this.decodeResult(result);
       await sleep(25);
+    }
+    // Still executing here: not finished is not the same as not known.
+    if (this.inFlight.has(requestId)) {
+      throw new ControlError(
+        "REQUEST_IN_PROGRESS",
+        `request_id ${requestId} is still running; poll its job or proposal rather than retrying`,
+        409,
+      );
     }
     throw new ControlError("REQUEST_UNCERTAIN", `request_id ${requestId} has durable intent but no terminal receipt`, 409);
   }
