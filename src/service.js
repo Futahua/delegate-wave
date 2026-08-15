@@ -19,7 +19,10 @@ import {
 } from "./git.js";
 import { runShell } from "./process.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
-import { createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration } from "./recovery.js";
+import {
+  createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
+  readRestoreMarker, clearRestoreMarker,
+} from "./recovery.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -81,12 +84,24 @@ function compactOverviewText(value) {
 }
 
 export class Dispatcher {
-  constructor({ root, backend, updateRef = updateRefCas }) {
+  constructor({ root, backend, router = null, updateRef = updateRefCas }) {
     this.root = root;
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
-    this.backend = backend;
+    // A fixed backend still works and is what the tests use. A router selects per attempt from the
+    // resolved model, which is what production needs: not every model runs on every executor.
+    this.backend = backend ?? null;
+    this.router = router;
     this.updateRef = updateRef;
+  }
+
+  // The executor for one attempt, chosen from the model that attempt will run.
+  //
+  // Chosen once, before the attempt row exists, and then used for the whole attempt. There is no
+  // mid-attempt reselection: one attempt has one identity, one epoch, one worktree, one executor.
+  selectBackend(model) {
+    if (!this.router) return { backend: this.backend, selected: this.backend?.constructor?.name ?? "UnknownBackend" };
+    return this.router.select(model);
   }
 
   close() { this.db.close(); }
@@ -495,6 +510,10 @@ export class Dispatcher {
 
   async runJob(jobId, { model = null } = {}) {
     model = this.resolveModel(model);
+    // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
+    const selection = this.selectBackend(model);
+    const backend = selection.backend;
+    if (!backend) throw new Error("No executor backend is available for this attempt");
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
@@ -522,7 +541,7 @@ export class Dispatcher {
       this.db.prepare(`INSERT INTO attempts(
         id, job_id, ordinal, scheduler_epoch, backend, model, scheduler_pid, worktree_path, started_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        attemptId, jobId, ordinal, epoch, this.backend.constructor.name, model, process.pid, worktreePath, now(),
+        attemptId, jobId, ordinal, epoch, backend.constructor.name, model, process.pid, worktreePath, now(),
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
@@ -546,7 +565,7 @@ export class Dispatcher {
       let backendResult = null;
       let backendError = null;
       try {
-        backendResult = await this.backend.run({
+        backendResult = await backend.run({
           attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
           onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
         });
@@ -557,8 +576,19 @@ export class Dispatcher {
       // Record usage before any failure becomes a lifecycle outcome. A throw, timeout, nonzero exit,
       // protected-path rejection, empty diff, or failed validation still consumed tokens, and those
       // attempts belong in the denominator of cost per validated candidate.
-      this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult });
-      if (backendError) throw backendError;
+      // The attempt's OWN backend reads its usage: each executor writes a different artifact in a
+      // different format, so the default would misread another executor's evidence as absent.
+      this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult, backend });
+      if (backendError) {
+        // A Harness configuration failure -- a profile that will not compose, a fence the loader
+        // refuses -- will recur on every attempt, so the router stops choosing it. This attempt
+        // still fails honestly: the failure is recorded after the fact, never as a mid-attempt
+        // switch, and the next attempt gets a fresh worktree under whatever the router then picks.
+        if (selection.selected === "harness" && this.router) {
+          this.router.disableHarness(backendError.message);
+        }
+        throw backendError;
+      }
 
       // A cancellation that arrived while the worker ran stops here, at a boundary, rather than
       // leaving a killed process to be interpreted as an ordinary failure. Usage is already
@@ -1000,6 +1030,22 @@ export class Dispatcher {
 
   listBackups() {
     return listBackups(this.root);
+  }
+
+  // Clears the unresolved-restore condition once repository heads have been dealt with.
+  //
+  // Deliberately explicit. The system cannot decide on its own that a disagreement between
+  // operational truth and code truth has been settled -- only a person who looked can, and until
+  // they do, `doctor` stays unhealthy rather than quietly recovering.
+  resolveRestore() {
+    const marker = readRestoreMarker(this.root);
+    if (!marker) return { resolved: false, reason: "no unresolved restore was recorded" };
+    const cleared = clearRestoreMarker(this.root);
+    recordEvent(this.db, {
+      kind: "RESTORE_RECONCILED", entityType: "system", entityId: "restore",
+      payload: { cleared_marker: cleared.marker ?? null, was: marker },
+    });
+    return { resolved: true, was: marker };
   }
 
   verifyBackup(backupDirectory) {
@@ -1728,13 +1774,20 @@ export class Dispatcher {
           AND r.kind IN ('INTEGRATION_SUCCEEDED', 'INTEGRATION_FAILED')
       )
       ORDER BY o.created_at`).all();
+    // A restore that could not complete coherently leaves a durable marker outside the database,
+    // because the database is the thing it had to outlive. While it is present the system is
+    // unhealthy: operational truth and code truth are known to disagree, and only a person can say
+    // which one is right.
+    const unresolvedRestore = readRestoreMarker(this.root);
     return {
       healthy: integrity.length === 1 && integrity[0] === "ok" && running.length === 0
-        && missingRepositories.length === 0 && unresolvedIntegrations.length === 0,
+        && missingRepositories.length === 0 && unresolvedIntegrations.length === 0
+        && !unresolvedRestore,
       database_integrity: integrity,
       running_attempts: running,
       missing_repositories: missingRepositories,
       unresolved_integrations: unresolvedIntegrations,
+      ...(unresolvedRestore ? { unresolved_restore: unresolvedRestore } : {}),
     };
   }
 

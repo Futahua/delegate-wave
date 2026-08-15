@@ -69,7 +69,10 @@ test("the reference cost matches a hand computation against the pinned basis", (
 });
 
 test("an explicitly reported zero is a measurement, not a missing figure", () => {
-  const observed = parseHarnessUsage(message({ inputTokens: 10, outputTokens: 5, reasoningTokens: 0 }));
+  const observed = parseHarnessUsage(log(
+    message({ inputTokens: 10, outputTokens: 5, reasoningTokens: 0 }),
+    JSON.stringify({ type: "turn/end" }),
+  ));
   assert.equal(observed.status, USAGE_COMPLETE, "a call that genuinely did no reasoning is fully measured");
   assert.equal(observed.reasoning_tokens, 0);
 });
@@ -95,6 +98,58 @@ test("a session with no model calls at all is UNKNOWN, not zero", () => {
   assert.equal(observed.input_tokens, null, "UNKNOWN carries no token figures at all");
   assert.equal(observed.provider_steps, 0);
   assertValidObservation(observed);
+});
+
+// The counterpart to the explicit-zero test above, and the gap that let "absence became zero" back
+// in. Every attempt runs with thinking enabled at high effort, so the adapter is expected to report
+// this dimension on every call. A missing field means the report is malformed or the wire contract
+// drifted -- not that no reasoning happened.
+test("a missing reasoningTokens field is unusable rather than assumed to be zero", () => {
+  assert.equal(readHarnessUsage({ inputTokens: 100, outputTokens: 50 }), null,
+    "with thinking enabled, an unreported reasoning figure is missing evidence");
+
+  const observed = parseHarnessUsage(log(
+    message({ inputTokens: 100, outputTokens: 50, reasoningTokens: 0 }),
+    message({ inputTokens: 100, outputTokens: 50 }),
+    JSON.stringify({ type: "turn/end" }),
+  ));
+  assert.equal(observed.status, USAGE_PARTIAL, "the unmeasured call must degrade the whole receipt");
+  assert.equal(observed.provider_steps, 1);
+  assert.equal(observed.malformed_events, 1);
+});
+
+// Cache dimensions are genuinely optional on the wire: the adapter omits them when the provider
+// reported no cache activity, so absence there means none rather than a broken report.
+test("absent cache dimensions still count as zero", () => {
+  const read = readHarnessUsage({ inputTokens: 100, outputTokens: 50, reasoningTokens: 0 });
+  assert.deepEqual(read, { input: 100, output: 50, reasoning: 0, cache_read: 0, cache_write: 0 });
+});
+
+// Truncation is the failure that made this usage path look unobtainable to begin with: session
+// writes are batched, and a process exiting before the batch drains leaves a log that is perfectly
+// well-formed and simply short. No parse error reveals it, so the terminal marker must.
+test("a cleanly truncated log is PARTIAL even though every record parses", () => {
+  const truncated = log(
+    JSON.stringify({ type: "session", id: "session-probe" }),
+    message({ inputTokens: 140, outputTokens: 77, cacheReadTokens: 6528, reasoningTokens: 14 }),
+    message({ inputTokens: 160, outputTokens: 141, cacheReadTokens: 6656, reasoningTokens: 42 }),
+    // The process exited here: no final message, no turn/end.
+  );
+  const observed = parseHarnessUsage(truncated);
+  assert.equal(observed.status, USAGE_PARTIAL,
+    "a clean prefix of a larger bill must never be reported as the whole bill");
+  assert.equal(observed.malformed_events, 0, "and nothing about the records themselves is malformed");
+  assert.equal(observed.provider_steps, 2, "the calls it did see are still counted");
+  assertValidObservation(observed);
+});
+
+test("the terminal marker alone does not rescue an otherwise damaged log", () => {
+  const observed = parseHarnessUsage(log(
+    message({ inputTokens: 10, outputTokens: 5, reasoningTokens: 0 }),
+    "{ not json",
+    JSON.stringify({ type: "turn/end" }),
+  ));
+  assert.equal(observed.status, USAGE_PARTIAL);
 });
 
 test("a missing input or output figure makes the call unusable rather than zero", () => {

@@ -57,12 +57,22 @@ export function readHarnessUsage(usage) {
   if (!usage || typeof usage !== "object") return null;
   if (!wholeNonNegative(usage.inputTokens) || !wholeNonNegative(usage.outputTokens)) return null;
 
-  const reasoning = usage.reasoningTokens === undefined ? 0 : usage.reasoningTokens;
+  // Reasoning must be REPORTED, not assumed.
+  //
+  // Every attempt runs with `thinking: enabled` and `reasoningEffort: high`, so the adapter is
+  // expected to report this dimension on every call. A missing field therefore means the report is
+  // malformed or the wire contract drifted -- it does not mean no reasoning happened. Defaulting it
+  // to 0 would let unmeasured reasoning price as free and pass as a COMPLETE measurement, which is
+  // the "absence became zero" error this project has now made twice. An explicitly reported 0 is a
+  // measurement and remains valid.
+  if (!wholeNonNegative(usage.reasoningTokens)) return null;
+  const reasoning = usage.reasoningTokens;
+
+  // Cache dimensions are different: the adapter omits them when the provider reported no cache
+  // activity at all, so absence here genuinely means none, and is not evidence of a broken report.
   const cacheRead = usage.cacheReadTokens === undefined ? 0 : usage.cacheReadTokens;
   const cacheWrite = usage.cacheWriteTokens === undefined ? 0 : usage.cacheWriteTokens;
-  if (!wholeNonNegative(reasoning) || !wholeNonNegative(cacheRead) || !wholeNonNegative(cacheWrite)) {
-    return null;
-  }
+  if (!wholeNonNegative(cacheRead) || !wholeNonNegative(cacheWrite)) return null;
 
   // The subtraction that keeps reasoning from being priced twice. Returns null when reasoning
   // exceeds output, which would mean the wire contract changed rather than that the call was free.
@@ -88,6 +98,7 @@ export function readHarnessUsage(usage) {
 export function parseHarnessUsage(text) {
   const lines = String(text ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
   let malformed = 0;
+  let terminated = false;
   const messages = [];
 
   for (const line of lines) {
@@ -98,6 +109,9 @@ export function parseHarnessUsage(text) {
       malformed += 1;
       continue;
     }
+    // The durable end-of-turn marker. Without it the log may be a clean PREFIX of a larger bill:
+    // every record parses, every usage figure is valid, and the total is still short.
+    if (record?.type === "turn/end") terminated = true;
     if (record?.type !== "assistant/message") continue;
     // A message with no usage at all is a real model call whose cost was not reported. It must
     // degrade the observation, not be skipped as though it never happened.
@@ -121,9 +135,15 @@ export function parseHarnessUsage(text) {
   if (usable === 0) return unknown({ malformed });
 
   return {
-    // Any unusable model call means the totals understate real spend, so the receipt says so
-    // rather than presenting a partial sum as the whole truth.
-    status: malformed > 0 ? USAGE_PARTIAL : USAGE_COMPLETE,
+    // COMPLETE requires two things, not one: every model call measured, AND evidence that the turn
+    // actually finished.
+    //
+    // Truncation is not hypothetical here -- it is the failure that made this usage path look
+    // unobtainable in the first place. Session writes are batched, and a process that exits before
+    // the batch drains leaves a log that is perfectly well-formed and simply short. Nothing in the
+    // records themselves reveals that, so completeness is judged on the terminal marker rather than
+    // on the absence of parse errors.
+    status: malformed > 0 || !terminated ? USAGE_PARTIAL : USAGE_COMPLETE,
     input_tokens: totals.input,
     output_tokens: totals.output,
     reasoning_tokens: totals.reasoning,

@@ -8,7 +8,7 @@ const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
-  "backup.create", "backup.restore", "integration.rollback", "job.advance", "integration.approve",
+  "backup.create", "backup.restore", "restore.resolve", "integration.rollback", "job.advance", "integration.approve",
 ]);
 
 function canonical(value) {
@@ -194,6 +194,8 @@ export class ControlService {
         idempotencyKey: args.idempotencyKey || null,
       }),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),
+      // Clears the unresolved-restore condition; only a person can say the truths agree again.
+      "restore.resolve": () => this.dispatcher.resolveRestore(),
       "backup.restore": () => this.dispatcher.restore(args.backup, {
         restoreRepositories: args.restoreRepositories !== false,
       }),

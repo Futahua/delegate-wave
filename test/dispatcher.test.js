@@ -1082,3 +1082,60 @@ test("an UNKNOWN, PARTIAL, or unpriced receipt is accounted for but not healthy"
   }
   await cleanup();
 });
+
+// Per-attempt routing, end to end through the dispatcher.
+//
+// The attempt row must name the executor that actually ran, and a fallback attempt must get its own
+// fresh worktree -- never the interrupted one, which may hold a half-finished edit.
+test("each attempt records the executor that actually ran it and gets its own worktree", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+
+  // Stands in for a Harness attempt that fails on a configuration problem, and an OpenCode attempt
+  // that succeeds -- the exact fresh-attempt fallback sequence.
+  class FailingHarness extends FakeBackend {
+    async run() { throw new Error("the fenced filesystem is not in the composed Harness profile"); }
+  }
+  class WorkingOpenCode extends FakeBackend {}
+
+  const worktrees = [];
+  const router = {
+    failed: false,
+    select() {
+      const backend = this.failed ? new WorkingOpenCode(async ({ worktreePath }) => {
+        worktrees.push(worktreePath);
+        fs.writeFileSync(path.join(worktreePath, "input.txt"), "after\n");
+        return { exitCode: 0, stdout: "ok", stderr: "" };
+      }) : new FailingHarness();
+      return { backend, selected: this.failed ? "opencode" : "harness" };
+    },
+    disableHarness() { this.failed = true; },
+  };
+
+  const service = new Dispatcher({ root, router });
+  try {
+  const project = await service.addProject({ name: "routing", repoPath: repo, validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "change input", mode: "write", maxAttempts: 2 });
+
+  // The Harness attempt fails honestly and terminates; it is never rescued by switching executor
+  // partway through, which would put two executors behind one attempt identity.
+  await service.runJob(job.id);
+  const first = service.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(job.id);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].backend, "FailingHarness", "the attempt names the executor that really ran");
+  assert.equal(first[0].terminal_state, "FAILED");
+  assert.equal(first[0].quarantined, 1, "and its worktree is quarantined");
+
+  await service.runJob(job.id);
+  const all = service.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(job.id);
+  assert.equal(all.length, 2);
+  assert.equal(all[1].backend, "WorkingOpenCode", "the fresh attempt used the fallback executor");
+  assert.notEqual(all[1].worktree_path, all[0].worktree_path,
+    "an interrupted attempt's worktree is never reused");
+  assert.equal(all[1].terminal_state, "SUCCEEDED");
+  } finally {
+    // Closed before the worktrees are removed: t.after runs LIFO, so a registered cleanup would
+    // otherwise fire while SQLite still holds the files open and fail with EPERM on Windows.
+    service.close();
+    await cleanup();
+  }
+});

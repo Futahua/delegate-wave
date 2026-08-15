@@ -3,8 +3,8 @@ import crypto from "node:crypto";
 import os from "node:os";
 import { initializeDataRoot } from "../db.js";
 import { dataRoot } from "../paths.js";
-import { Dispatcher } from "../service.js";
-import { selectBackend } from "../harness/select.js";
+import { Dispatcher, DEFAULT_WORKER_MODEL, REVIEW_MODEL } from "../service.js";
+import { BackendRouter } from "../harness/select.js";
 import { matchRoute, PRINCIPAL_SCOPES, SCOPES } from "./contract.js";
 import { ControlError, asControlError } from "./errors.js";
 import { ControlService } from "./service.js";
@@ -121,13 +121,11 @@ export async function startControlServer({
   backend = null,
 } = {}) {
   initializeDataRoot(root);
-  // Harness is the preferred executor; OpenCode is the proven fallback. The choice is made once,
-  // here, between attempts -- never inside one, which would put two executors behind a single
-  // attempt identity.
-  const selection = backend
-    ? { backend, selected: "supplied", reason: "supplied by the caller", fellBack: false }
-    : selectBackend({ apiKey: executorApiKey, prefer: preferBackend });
-  const dispatcher = new Dispatcher({ root, backend: selection.backend });
+  // Harness is preferred for the models it can run; OpenCode carries the review lane and is the
+  // proven fallback. The router decides per attempt, from the resolved model -- never inside an
+  // attempt, which would put two executors behind a single attempt identity.
+  const router = backend ? null : new BackendRouter({ apiKey: executorApiKey, prefer: preferBackend });
+  const dispatcher = new Dispatcher({ root, backend, router });
   const service = new ControlService({ dispatcher });
   const server = createControlServer({
     service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
@@ -140,9 +138,13 @@ export async function startControlServer({
   return {
     server,
     dispatcher,
-    // Reported, not inferred from which executor's artifacts turn up. A fallback to OpenCode is an
-    // operational fact the operator should be able to read directly.
-    executor: { selected: selection.selected, reason: selection.reason, fell_back: selection.fellBack },
+    // Reported, not inferred from which executor's artifacts turn up. Routing is per model, so the
+    // report names each lane rather than pretending one executor serves everything.
+    executor: router ? {
+      default: router.select(DEFAULT_WORKER_MODEL).selected,
+      review: router.select(REVIEW_MODEL).selected,
+      reason: router.select(DEFAULT_WORKER_MODEL).reason,
+    } : { default: "supplied", review: "supplied", reason: "backend supplied by the caller" },
     url: `http://${host}:${address.port}`,
     async close() {
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

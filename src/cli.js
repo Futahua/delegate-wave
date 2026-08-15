@@ -55,7 +55,9 @@ Commands:
   integration approve --proposal ID   approve this exact candidate and integrate it
   backup create [--label TEXT]        snapshot the operational database with a checksummed manifest
   backup list
-  backup restore --backup DIR [--database-only]  restore the database and repository heads
+  backup restore --backup DIR         restore the database and every repository head together
+  backup restore --backup DIR --database-only   restore operational truth alone, explicitly
+  restore resolve                     clear an unresolved restore once repositories are reconciled
   integration rollback --proposal ID  move an integration branch back, compare-and-swap
   proposal list [--project ID]        list Hermes work proposals awaiting a decision
   proposal show --proposal ID
@@ -188,6 +190,8 @@ async function main() {
       backup: required(options, "backup"),
       restoreRepositories: options["database-only"] !== true,
     }, requestId(options)));
+  } else if (resource === "restore" && action === "resolve") {
+    print(await client.post("/v1/restore/resolve", {}, requestId(options)));
   } else if (resource === "backup" && action === "list") {
     print(await client.get("/v1/backups"));
   } else if (resource === "integration" && action === "rollback") {

@@ -13,6 +13,42 @@ import { resolveRevision, updateRefCas, isAncestor } from "./git.js";
 const now = () => new Date().toISOString();
 const stamp = () => now().replace(/[:.]/g, "-");
 
+// A restore that could not be completed coherently leaves this marker behind.
+//
+// Deliberately a file rather than a row: the database is the thing being replaced, so a flag written
+// inside it would be destroyed by the very operation it needs to outlive. It is cleared only when
+// someone resolves the situation, so the system cannot drift back to reporting healthy on its own.
+export const RESTORE_MARKER = "restore-needs-reconciliation.json";
+
+export function restoreMarkerPath(root) {
+  return path.join(managedPaths(root).state, RESTORE_MARKER);
+}
+
+export function readRestoreMarker(root) {
+  const file = restoreMarkerPath(root);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    // An unreadable marker still means unresolved: refusing to parse it must not clear the warning.
+    return { unresolved: true, reason: "the restore marker exists but could not be read" };
+  }
+}
+
+export function writeRestoreMarker(root, detail) {
+  const file = restoreMarkerPath(root);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ unresolved: true, created_at: now(), ...detail }, null, 2)}\n`);
+  return file;
+}
+
+export function clearRestoreMarker(root) {
+  const file = restoreMarkerPath(root);
+  if (!fs.existsSync(file)) return { cleared: false };
+  fs.rmSync(file, { force: true });
+  return { cleared: true, marker: file };
+}
+
 // SQLite in WAL mode keeps recent commits in side files. Copying only the main database can
 // therefore lose work that was durably committed, so all three are captured together.
 const DATABASE_FILES = ["", "-wal", "-shm"];
@@ -110,11 +146,52 @@ export function verifyBackup(backupDirectory) {
 // The database being replaced is itself backed up first, unconditionally. Restoring is the operation
 // most likely to be performed under stress, and losing the pre-restore state because the restore was
 // the wrong choice would be the worst possible outcome.
-export async function restoreBackup({ root, backupDirectory, database = null, restoreRepositories = true }) {
+// Checks, before anything is replaced, that every recorded repository head can actually be restored.
+//
+// A restore that swaps the database and then discovers a repository will not move leaves operational
+// truth describing code that does not exist. Finding that out first means the operator still has an
+// untouched system and a clear reason, instead of a half-applied recovery.
+export async function preflightRepositories(manifest) {
+  const blocked = [];
+  for (const repository of manifest.repositories ?? []) {
+    if (!repository.integration_head) {
+      blocked.push({ name: repository.name, reason: "the backup recorded no head for this repository" });
+      continue;
+    }
+    try {
+      const current = await resolveRevision(repository.repo_path, repository.integration_branch);
+      if (current === repository.integration_head) continue;
+      // The target must still exist in the repository, or the branch cannot be moved back to it.
+      await resolveRevision(repository.repo_path, repository.integration_head);
+    } catch (error) {
+      blocked.push({ name: repository.name, reason: String(error?.message ?? error).slice(0, 200) });
+    }
+  }
+  return blocked;
+}
+
+export async function restoreBackup({
+  root, backupDirectory, database = null, restoreRepositories = true, updateRef = updateRefCas,
+}) {
   const verified = verifyBackup(backupDirectory);
   if (!verified.intact) {
     throw new Error(`Refusing to restore a damaged backup: ${JSON.stringify(verified.damaged)}`);
   }
+
+  // Default restore is all-or-nothing. `--database-only` is the escape hatch, and it is incoherent
+  // because the operator asked for that, not because the restore quietly gave up partway.
+  if (restoreRepositories) {
+    const blocked = await preflightRepositories(verified.manifest);
+    if (blocked.length) {
+      throw new Error(
+        "Refusing to restore: these repositories cannot be returned to their recorded heads, so the "
+        + "database would describe code that does not exist. "
+        + `${JSON.stringify(blocked)} `
+        + "Resolve them, or rerun with --database-only to restore operational truth alone.",
+      );
+    }
+  }
+
   const paths = managedPaths(root);
   const safety = fs.existsSync(paths.database)
     ? await createBackup({ root, database, label: "pre-restore" })
@@ -147,7 +224,7 @@ export async function restoreBackup({ root, backupDirectory, database = null, re
         repositories.push({ ...repository, restored: false, reason: "already at the recorded head" });
         continue;
       }
-      await updateRefCas(
+      await updateRef(
         repository.repo_path, `refs/heads/${repository.integration_branch}`,
         repository.integration_head, current,
       );
@@ -160,12 +237,32 @@ export async function restoreBackup({ root, backupDirectory, database = null, re
     }
   }
 
+  const coherent = repositories.every((entry) => entry.restored || entry.reason === "already at the recorded head");
+
+  // Preflight makes this rare, not impossible: a repository can still become unmovable between the
+  // check and the effect. The database is already replaced by this point, so the only honest outcome
+  // is a durable marker that keeps the system unhealthy until a person resolves it. Returning an
+  // ordinary success with `coherent: false` would let a system whose operational truth and code
+  // truth disagree report itself as fine.
+  if (restoreRepositories && !coherent) {
+    const failures = repositories
+      .filter((entry) => !entry.restored && entry.reason !== "already at the recorded head")
+      .map((entry) => ({ name: entry.name, repo_path: entry.repo_path, reason: entry.reason }));
+    writeRestoreMarker(root, { restored_from: backupDirectory, repositories: failures });
+    throw new Error(
+      "Restore left operational truth and code truth disagreeing: "
+      + `${JSON.stringify(failures)}. The database was restored from ${backupDirectory}, but these `
+      + "repositories were not. The system is marked unhealthy until this is reconciled; "
+      + `the pre-restore state is at ${safety?.backup ?? "(no safety backup was taken)"}.`,
+    );
+  }
+
   return {
     restored: backupDirectory,
     safety_backup: safety?.backup ?? null,
     files: verified.manifest.files.length,
     repositories,
-    coherent: repositories.every((entry) => entry.restored || entry.reason === "already at the recorded head"),
+    coherent,
   };
 }
 

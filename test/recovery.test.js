@@ -10,6 +10,7 @@ import test from "node:test";
 import { initializeDataRoot, SCHEMA_VERSION } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
+import { restoreBackup, writeRestoreMarker, restoreMarkerPath, readRestoreMarker } from "../src/recovery.js";
 import { runProcess } from "../src/process.js";
 import { managedPaths } from "../src/paths.js";
 
@@ -328,4 +329,139 @@ test("a rollback whose receipt was lost is completed by reconciliation", async (
   assert.ok(service.latestRollback(proposal.id), "the receipt is completed");
   assert.equal(service.integrationStatus(proposal.id).proposal.state, "ROLLED_BACK");
   assert.deepEqual(service.briefing().done, []);
+});
+
+// Default restore must be all-or-nothing.
+//
+// Restoring the database and then failing to move a repository leaves operational truth describing
+// code that does not exist. Reporting that as an ordinary success -- merely with `coherent: false`
+// -- lets a system whose two truths are known to disagree call itself recovered.
+test("a restore that cannot return a repository refuses before touching the database", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    const project = await service.addProject({ name: "coherent", repoPath: repo, validation: [] });
+    const backup = await service.backup("before");
+    assert.ok(backup.repositories.some((entry) => entry.name === "coherent"));
+
+    const jobsBefore = service.listJobs().length;
+    // The repository the manifest names is gone by the time restore runs.
+    fs.rmSync(repo, { recursive: true, force: true });
+
+    await assert.rejects(
+      () => service.restore(backup.backup),
+      /Refusing to restore/,
+      "the operator keeps an untouched system and a clear reason",
+    );
+    assert.equal(service.listJobs().length, jobsBefore, "the database was never replaced");
+    assert.equal(service.doctor().unresolved_restore, undefined, "and nothing needs reconciling");
+    assert.ok(project.id);
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// The escape hatch stays available, because an operator who asks for operational truth alone has
+// made an informed choice rather than been handed a silent half-recovery.
+test("--database-only restores without repositories and says so", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    await service.addProject({ name: "dbonly", repoPath: repo, validation: [] });
+    const backup = await service.backup("before");
+    fs.rmSync(repo, { recursive: true, force: true });
+
+    const restored = await service.restore(backup.backup, { restoreRepositories: false });
+    assert.equal(restored.coherent, false, "explicitly incoherent, by request");
+    assert.equal(service.doctor().unresolved_restore, undefined,
+      "an operator's deliberate choice is not an unresolved condition");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Preflight makes a mid-restore failure rare, not impossible. When it happens the database is
+// already replaced, so the only honest outcome is a durable condition that survives the swap.
+test("a repository that fails during the restore leaves the system durably unhealthy", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    await service.addProject({ name: "racy", repoPath: repo, validation: [] });
+    const backup = await service.backup("before");
+
+    assert.equal(service.doctor().healthy, true, "healthy before the failure");
+
+    // The outcome a mid-restore repository failure produces: the database is already replaced, so
+    // the marker is the only thing that can carry the disagreement forward.
+    writeRestoreMarker(root, { restored_from: backup.backup, repositories: [{ name: "racy", reason: "locked" }] });
+    const doctor = service.doctor();
+    assert.equal(doctor.healthy, false, "the system must not claim health while the truths disagree");
+    assert.equal(doctor.unresolved_restore.unresolved, true);
+
+    // And it stays unhealthy until a person says otherwise.
+    assert.equal(service.doctor().healthy, false, "it does not clear on its own");
+    const resolved = service.resolveRestore();
+    assert.equal(resolved.resolved, true);
+    assert.equal(service.doctor().healthy, true, "only an explicit reconciliation clears it");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+test("an unreadable restore marker still counts as unresolved", async (t) => {
+  const { root, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  try {
+    fs.mkdirSync(path.dirname(restoreMarkerPath(root)), { recursive: true });
+    fs.writeFileSync(restoreMarkerPath(root), "{ not json");
+    assert.equal(service.doctor().healthy, false,
+      "refusing to parse the marker must not clear the warning it carries");
+  } finally {
+    service.close();
+    await cleanup();
+  }
+});
+
+// Proves the real code path writes the marker, not merely that doctor reads one placed by hand.
+// A repository that passes preflight and then cannot be moved is the race this exists for.
+test("restoreBackup itself records the unresolved condition and refuses to report success", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writer("a.txt") });
+  let backupDir = null;
+  try {
+    await service.addProject({ name: "racy", repoPath: repo, branch: "integration", validation: [] });
+    backupDir = (await service.backup("before")).backup;
+  } finally {
+    service.close();
+  }
+
+  // The branch moves after the backup, so restoring genuinely has to move it back -- otherwise the
+  // update is skipped as "already at the recorded head" and nothing is exercised.
+  fs.writeFileSync(path.join(repo, "later.txt"), "after\n");
+  await command("git", ["-C", repo, "add", "."], repo);
+  await command("git", ["-C", repo, "commit", "-m", "moved on"], repo);
+  await command("git", ["-C", repo, "branch", "-f", "integration", "HEAD"], repo);
+
+  try {
+    // Preflight sees a healthy repository; the update fails when it is actually attempted.
+    const failingUpdate = async () => { throw new Error("ref lock held by another process"); };
+    await assert.rejects(
+      () => restoreBackup({
+        root, backupDirectory: backupDir, database: null, restoreRepositories: true,
+        updateRef: failingUpdate,
+      }),
+      /operational truth and code truth disagreeing/,
+      "a half-applied restore is an error, never an ordinary success",
+    );
+
+    const marker = readRestoreMarker(root);
+    assert.equal(marker.unresolved, true, "and it leaves a durable condition behind");
+    assert.equal(marker.repositories[0].name, "racy");
+    assert.match(marker.repositories[0].reason, /ref lock held/);
+  } finally {
+    await cleanup();
+  }
 });
