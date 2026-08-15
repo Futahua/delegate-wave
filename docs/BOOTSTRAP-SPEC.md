@@ -50,6 +50,17 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 **FS-004** Protected-path changes and Git-metadata changes MUST reject the candidate.
 
+**FS-005** The changed-file set MUST be computed as the worker's resulting tree compared to the
+recorded `base_sha`, with untracked files staged first. It MUST NOT be read from working-tree status:
+a worker may use Git normally, and one that commits its work leaves a clean status, while one that
+commits part of it leaves only the remainder visible. Both would understate the change, and the
+second would hide a committed protected-path change from FS-004.
+
+**FS-006** The candidate MUST be one delegate-wave-owned commit whose parent is exactly the recorded
+`base_sha` and whose tree is the worker's resulting tree. Worker-created commits and branches are
+workspace activity; they MUST NOT determine the integration object. The worktree MUST be pointed at
+the candidate before validation, so validation sees exactly the tree that was captured.
+
 ## Worker permissions
 
 Worker capability is a policy choice, not an invariant of this system. What a worker may DO is
@@ -189,6 +200,8 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | ATT-005, ATT-006 | immutable attempt ordinal and bounded job retry | bounded failure test |
 | ATT-007–ATT-012 | `runJob` immediate claim transaction, lifecycle-active predicate, scheduler PID and executor intent/PID receipts | invalid invocation, live executor, uncertain executor start, blocked validation, and direct predicate tests |
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
+| FS-005 | base-relative changed-file set | `dispatcher.test.js` (worker commits all; commits A leaves B; protected path inside a commit) |
+| FS-006 | canonical candidate on `base_sha` | `dispatcher.test.js` (single parent, complete tree); live trusted worker in `HARNESS-DOGFOOD.md` |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | WRK-004 | `Dispatcher.resolveModel` persists the resolved model; `OpenCodeBackend` refuses an absent model | default-model resolution test; unrouted-backend refusal test; distinct-lane test; live no-model run recorded in the proposal dogfood |

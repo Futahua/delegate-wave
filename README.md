@@ -48,6 +48,9 @@ Capability is broad by default. Permanence is governed.
 ## What holds
 
 - **SQLite and Git are the truth.** A worker's claim of success is an observation, never authority.
+- **The candidate is captured, not claimed.** Workers may use Git freely, including local commits;
+  delegate-wave compares the resulting tree to the recorded base and builds its own single candidate
+  commit. Worker history never becomes the integration object.
 - **Validation decides.** An executor exiting zero proves nothing; your commands do.
 - **One attempt, one identity, one epoch.** A late callback from a killed worker cannot mutate state.
 - **Integration is compare-and-swap.** It refuses when the branch moved underneath it.

@@ -195,6 +195,30 @@ All three produced COMPLETE receipts, and in every case validation, the candidat
 second decision were delegate-wave's. The profile is chosen before the attempt row is written and
 recorded on it, so an attempt's evidence never requires guessing what authority it ran under.
 
+### Capability at the truth boundary: worker Git
+
+Granting the shell exposed a deeper hole. Candidate capture read `git status`, so a worker that
+committed its own work left a clean status and delegate-wave concluded it had changed nothing. The
+mixed case was worse: a worker that commits A and leaves B uncommitted showed only B, so the
+protected-path check inspected only B, and the candidate contained only B while validation ran
+against a tree containing both.
+
+The fix belongs at the truth boundary, not in the prompt. Capture now stages the whole tree, diffs
+against the recorded `base_sha`, and builds one delegate-wave-owned commit with `commit-tree` whose
+parent is exactly that base. Worker history is workspace activity; it never shapes the integration
+object.
+
+Verified live with a real trusted worker asked to commit one file and leave another:
+
+```text
+worker committed  GITA.md   (its own git commit)
+worker left       GITB.md   (uncommitted)
+candidate         db9045e9, one parent, == base 836becf
+candidate files   GITA.md, GITB.md
+```
+
+Under the old code `GITA.md` would have been dropped from the integrated result.
+
 ### The prompt has to agree with the profile
 
 Enabling the capability was not sufficient. The prompt still told every worker "shell access is
@@ -235,5 +259,5 @@ that comparison remains untouched at digest `b34387db`.
 ## Coverage
 
 ```text
-294 tests, 293 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
+299 tests, 298 passing, 1 skipped (file symlinks need elevation; the junction case covers it)
 ```
