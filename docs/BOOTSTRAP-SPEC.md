@@ -61,6 +61,16 @@ second would hide a committed protected-path change from FS-004.
 workspace activity; they MUST NOT determine the integration object. The worktree MUST be pointed at
 the candidate before validation, so validation sees exactly the tree that was captured.
 
+**FS-007** The changed-file set MUST be computed without rename detection. Rename detection reports a
+move as a single entry naming only the destination, which would hide a protected SOURCE path from
+FS-004 -- a protected file could be moved out of its protected directory and accepted. Policy needs
+every path the tree touched, not Git's semantic interpretation of what the change meant.
+
+**FS-008** Paths excluded from the candidate by the project's own ignore rules MUST NOT be reported
+as absence of change. Excluding them is correct, since ignore rules are trusted project configuration
+declaring what is not source; describing a worker whose entire output was excluded as having changed
+nothing is not.
+
 ## Worker permissions
 
 Worker capability is a policy choice, not an invariant of this system. What a worker may DO is
@@ -202,6 +212,8 @@ worker, Luna the focused review and debugging lane, and DeepSeek Pro the escalat
 | FS-001–FS-003 | database state, detached locked worktrees | worker and reconciliation tests |
 | FS-005 | base-relative changed-file set | `dispatcher.test.js` (worker commits all; commits A leaves B; protected path inside a commit) |
 | FS-006 | canonical candidate on `base_sha` | `dispatcher.test.js` (single parent, complete tree); live trusted worker in `HARNESS-DOGFOOD.md` |
+| FS-007 | no rename detection in the policy path | `dispatcher.test.js` (protected rename/move/replace rejected; allowed rename still succeeds) |
+| FS-008 | ignored output reported honestly | `dispatcher.test.js` (ignored-only output names the excluded files) |
 | FS-004 | `assertAllowedDiff` | protected path test |
 | WRK-003, VAL-001–VAL-003 | `validate`, `validation_state` | validation failure test |
 | WRK-004 | `Dispatcher.resolveModel` persists the resolved model; `OpenCodeBackend` refuses an absent model | default-model resolution test; unrouted-backend refusal test; distinct-lane test; live no-model run recorded in the proposal dogfood |

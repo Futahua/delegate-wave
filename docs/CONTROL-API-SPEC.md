@@ -83,6 +83,13 @@ receipt. A command error explicitly classified as uncertain MUST receive the sam
 **CTL-REQ-008** The CLI MUST print a mutation's request identity before sending it. When transport
 or receipt state is uncertain, the CLI MUST show how to retry the exact command with that identity.
 
+**CTL-REQ-009** A duplicate request whose original is still executing in this process MUST be
+reported as in progress, not as uncertain. Intent without a receipt has two meanings: nobody working
+on it, which is genuinely unknown, and still running, which is merely unfinished. Only the first
+warrants `REQUEST_UNCERTAIN`, because that word directs an operator toward inspection or recovery.
+Mutations that outlast the bounded wait are ordinary -- running a worker takes far longer -- so the
+CLI's own retry advice would otherwise manufacture false uncertainty on every one of them.
+
 ## Local transport
 
 **CTL-HTTP-001** The bootstrap server MUST bind to loopback by default and require a bearer token.
@@ -104,6 +111,7 @@ slice.
 | CTL-AUTH-006 | observer authentication scope | observer query/mutation and equal-token tests |
 | CTL-CMD-001–003 | route and command allowlists | malformed/unknown/no-dispatch tests |
 | CTL-REQ-001–008 | immutable intent/result tables, split receipt handling, and visible CLI request IDs | duplicate, concurrent, disconnect, conflict, restart, receipt-fault, uncertain-error, and CLI retry tests |
+| CTL-REQ-009 | in-flight request tracking | `control.test.js` (running retry reports in progress; nothing in flight still reports uncertain) |
 | CTL-HTTP-001–003 | local HTTP server and bounded parser | HTTP contract tests and full integration flow |
 
 ## Deferred

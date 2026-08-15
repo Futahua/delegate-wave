@@ -17,13 +17,21 @@ const raw = new ControlClient({ token: operator.DELEGATE_WAVE_CONTROL_TOKEN });
 // must not paper over an unexplained failure. Mutations carry a request_id, so a retry is a replay
 // of the same intent rather than a second action.
 const retry = async (fn, label) => {
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 6; i += 1) {
     try { return await fn(); } catch (error) {
-      if (error?.code !== "CONTROL_API_UNAVAILABLE" || i === 3) throw error;
+      // REQUEST_IN_PROGRESS is the service telling us, correctly, that the original request is still
+      // executing. Waiting is the right response -- retrying only asks the same question again.
+      if (error?.code === "REQUEST_IN_PROGRESS") {
+        console.log(`  (${label} still running, waiting)`);
+        await new Promise((r) => setTimeout(r, 15000));
+        continue;
+      }
+      if (error?.code !== "CONTROL_API_UNAVAILABLE" || i === 5) throw error;
       console.log(`  (transient ${label}: ${error.code}, retrying)`);
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 3000));
     }
   }
+  throw new Error(`${label} never settled`);
 };
 const client = {
   get: (p) => retry(() => raw.get(p), `GET ${p}`),
@@ -49,8 +57,19 @@ async function advance(goal, options = {}) {
   const job = await client.post("/v1/jobs", {
     projectId: project.id, mode: "write", maxAttempts: 1, goal, ...options,
   }, rid());
-  const advanced = await client.post(`/v1/jobs/${job.id}/advance`,
-    options.model ? { model: options.model } : {}, rid());
+  let advanced;
+  try {
+    advanced = await client.post(`/v1/jobs/${job.id}/advance`,
+      options.model ? { model: options.model } : {}, rid());
+  } catch (error) {
+    // Poll the job itself: the request's fate is knowable from the durable record.
+    if (error?.code !== "REQUEST_IN_PROGRESS") throw error;
+    for (let i = 0; i < 40; i += 1) {
+      await new Promise((r) => setTimeout(r, 5000));
+      const status = await client.get(`/v1/jobs/${job.id}`);
+      if (status.job.status !== "RUNNING") { advanced = { stage: "polled", attempts: status.attempts }; break; }
+    }
+  }
   return { job, advanced, attempt: advanced.attempts.at(-1) };
 }
 

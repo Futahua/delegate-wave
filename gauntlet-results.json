@@ -1,0 +1,37 @@
+[
+  {
+    "name": "1  trusted Harness ordinary job integrates",
+    "ok": false,
+    "detail": "HarnessBackend/trusted 02e11c8->02e11c8"
+  },
+  {
+    "name": "1b Hermes reports Done with honest cost",
+    "ok": false,
+    "detail": "not in done"
+  },
+  {
+    "name": "2  trusted worker uses the shell",
+    "ok": true,
+    "detail": "(Get-ChildItem -Force -File).Count"
+  },
+  {
+    "name": "3  worker git commits do not truncate the candidate",
+    "ok": true,
+    "detail": "parents=1 files=G3A.md,G3B.md"
+  },
+  {
+    "name": "4  restricted worker cannot read the outside verifier",
+    "ok": true,
+    "detail": "profile=restricted wrote=\"DENIED\""
+  },
+  {
+    "name": "5  Luna routes to OpenCode on the same server",
+    "ok": true,
+    "detail": "OpenCodeBackend SUCCEEDED"
+  },
+  {
+    "name": "6  cancel kills the live Harness worker",
+    "ok": true,
+    "detail": "killed=8448 alive_after=false quarantined=1"
+  }
+]
