@@ -138,7 +138,7 @@ cannot run and every job falls back to OpenCode.
 ## Everyday use
 
 ```bash
-delegate-wave status                      # working / needs a decision / ready to check / done
+delegate-wave status                      # working / needs a decision / ready to check / done / reverted
 delegate-wave proposal list               # what Hermes has proposed
 delegate-wave proposal authorize --proposal ID   # decision 1: runs the work
 delegate-wave integration approve --proposal ID  # decision 2: integrates it

@@ -23,7 +23,7 @@ cancel            durable intent, process kill, stale-callback refusal, terminal
 budget            enforced ceilings; unmeasured spend blocks rather than passes
 recovery          backup with checksums, verified restore, compare-and-swap rollback
 auto-advance      two human decisions instead of six operator steps
-Hermes surface    working / needs a decision / ready to check / done, with honest cost
+Hermes surface    working / needs a decision / ready to check / done / reverted, with honest cost
 fence             symlink and junction aware attempt-root confinement, for `restricted` work
 gauntlet          sixteen failure modes asserted as tests
 Harness           default executor, selectable capability profile, per-call usage evidence
@@ -97,9 +97,9 @@ live gauntlet        8/8 final sweep, plus the full Hermes-initiated product pat
 doctor               healthy
 ```
 
-Remaining non-blocking UX work: a `Reverted` bucket in the briefing. After a rollback the job
-correctly leaves `done` -- the truth is right -- but it disappears from every bucket rather than
-saying what happened. That is information design, not a truth bug.
+Remaining UX work, in the order it will be taken: natural approval wording, failure phrasing (one
+useful human sentence first, technical evidence on demand), a read-only T3 cockpit, and then
+whatever actually annoys in daily use rather than anything from a roadmap.
 
 ## Still deferred, deliberately
 
