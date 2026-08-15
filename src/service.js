@@ -954,13 +954,22 @@ export class Dispatcher {
          ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
       FROM jobs j JOIN projects p ON p.id = j.project_id
       WHERE j.status = 'NEEDS_ATTENTION' ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
-      .map((row) => ({
-        job: row.id,
-        project: row.project,
-        goal: short(row.goal),
-        why: this.lastFailureReason(row.id),
-        cost: jobCost(row.id),
-      }));
+      .map((row) => {
+        // What happened to the change, then what it means, then the mechanism -- never the internal
+        // state name. `why` is retained because callers and the detailed tools already use it.
+        const outcome = this.jobOutcome(row.id);
+        return {
+          job: row.id,
+          project: row.project,
+          goal: short(row.goal),
+          says: outcome?.headline ?? null,
+          because: outcome?.detail ?? null,
+          state: outcome?.state ?? null,
+          needs_decision: outcome?.needs_decision ?? false,
+          why: this.lastFailureReason(row.id),
+          cost: jobCost(row.id),
+        };
+      });
 
     // A job whose integration was rolled back is not Done: the change it describes is gone.
     const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
@@ -1034,6 +1043,216 @@ export class Dispatcher {
     }
   }
 
+  // Turns recorded state into the sentence a person actually needs.
+  //
+  // Presentation only: nothing here decides anything. The ordering is deliberate -- what happened to
+  // the change, then whether anything landed, then whether the person must act, and only then the
+  // mechanism. "COMMAND_FAILED" and "validation_state=FAILED" are true and useless.
+  //
+  // The distinctions matter because they are different events with different meanings, and collapsing
+  // them is how a system starts lying gently: a worker that never produced anything did not fail
+  // validation, an interrupted validation reached no verdict, and a cancellation is not a test result.
+  jobOutcome(jobId) {
+    const job = this.getJob(jobId);
+    if (!job) return null;
+    const goal = String(job.goal ?? "").replace(/\s+/g, " ").trim().replace(/[.!?\s]+$/, "");
+    const quoted = goal.length > 70 ? `"${goal.slice(0, 69)}..."` : `"${goal}"`;
+    const attempts = this.db.prepare(
+      "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal",
+    ).all(jobId);
+    const last = attempts.at(-1) ?? null;
+    const spend = this.jobSpend(jobId);
+    const spent = spend.spent > 0
+      ? `About $${spend.spent.toFixed(4)} was spent${spend.complete ? "" : " so far"}`
+      : null;
+
+    // Nothing has run yet, so there is nothing to explain.
+    if (!last) return { state: "pending", headline: `${quoted} has not started yet.`, needs_decision: false };
+
+    const nothingIntegrated = "Nothing was integrated.";
+    const detail = this.failureDetail(jobId);
+
+    if (job.status === "CANCELLED" || last.terminal_state === "CANCELLED") {
+      return {
+        state: "cancelled",
+        headline: `Stopped ${quoted}. ${nothingIntegrated}`,
+        // Cancellation is not a verdict on the work, so no failure detail is offered -- only what it
+        // cost, which is the one thing a person may not expect after stopping something.
+        detail: spent ? `${spent} before it stopped.` : null,
+        needs_decision: false,
+      };
+    }
+
+    // The executor succeeded but validation reached no verdict. Saying "validation failed" here
+    // would assert a test result that was never produced.
+    if (last.terminal_state === "SUCCEEDED" && last.validation_state === "NOT_RUN") {
+      return {
+        state: "validation-interrupted",
+        headline: `Validation was interrupted before it finished. ${nothingIntegrated}`,
+        detail: `${quoted} was implemented, but nothing has checked it yet.`,
+        needs_decision: job.status === "NEEDS_ATTENTION",
+      };
+    }
+
+    // The executor succeeded and validation genuinely ran and rejected the candidate.
+    if (last.terminal_state === "SUCCEEDED" && last.validation_state === "FAILED") {
+      // Out of attempts means the person now has to decide something, and saying only what went
+      // wrong leaves them waiting for a retry that will never come. If it took more than one
+      // attempt, the count is worth stating: it is the difference between bad luck and a real wall.
+      const stuck = job.status === "NEEDS_ATTENTION";
+      const tries = stuck && attempts.length > 1 ? ` after ${attempts.length} attempts` : "";
+      return {
+        state: "validation-failed",
+        headline: `${quoted} was implemented, but validation failed${tries}. ${nothingIntegrated}`
+          + `${stuck ? " I need your decision." : ""}`,
+        detail,
+        needs_decision: stuck,
+      };
+    }
+
+    // Another attempt is genuinely under way right now.
+    if (job.status === "RUNNING" && attempts.length > 1) {
+      return {
+        state: "retrying",
+        headline: `The first attempt at ${quoted} didn't work, so I'm trying again.`,
+        needs_decision: false,
+      };
+    }
+
+    if (job.status === "NEEDS_ATTENTION") {
+      const budget = this.budgetObstacle(job, spend);
+      if (budget) return budget;
+
+      // The same failure twice is a different situation from two unrelated ones: more attempts are
+      // unlikely to help, and the person should hear that rather than watch it repeat.
+      const signatures = attempts.map((a) => a.failure_signature).filter(Boolean);
+      const repeated = signatures.length >= 2 && signatures.at(-1) === signatures.at(-2);
+      if (repeated) {
+        return {
+          state: "repeated-blocker",
+          headline: `I hit the same problem again with ${quoted}. ${nothingIntegrated} `
+            + "I need your decision before trying more.",
+          detail,
+          needs_decision: true,
+        };
+      }
+      // "after 1 attempt" only carries meaning once something was actually retried. A single failure
+      // gets the plain statement of what happened.
+      if (attempts.length === 1) {
+        return {
+          state: "worker-failed",
+          headline: `Couldn't complete ${quoted}. ${nothingIntegrated} I need your decision.`,
+          detail,
+          needs_decision: true,
+        };
+      }
+      return {
+        state: "exhausted",
+        headline: `I couldn't finish ${quoted} after ${attempts.length} attempts. `
+          + `${nothingIntegrated} I need your decision.`,
+        detail,
+        needs_decision: true,
+      };
+    }
+
+    // An attempt failed before producing anything to check. Validation never happened, so it is not
+    // mentioned at all.
+    if (last.terminal_state === "FAILED") {
+      return {
+        state: "worker-failed",
+        headline: `Couldn't complete ${quoted}. ${nothingIntegrated}`,
+        detail,
+        needs_decision: false,
+      };
+    }
+
+    return {
+      state: String(job.status).toLowerCase(),
+      headline: `${quoted} is ${String(job.status).toLowerCase().replace(/_/g, " ")}.`,
+      needs_decision: false,
+    };
+  }
+
+  // Why another attempt cannot start, when a recorded ceiling is the reason.
+  //
+  // Derived rather than stored: a budget refusal happens before an attempt exists, so there is no
+  // failure record to read. Unmeasured spend must never render as "$0" -- that is the difference
+  // between "this cost nothing" and "I cannot tell you what this cost".
+  budgetObstacle(job, spend) {
+    // Trailing zeros make a limit read as an instrument reading rather than an amount of money.
+    const money = (value) => Number(value).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+    const ceiling = job.maximum_cost;
+    if (ceiling === null || ceiling === undefined) return null;
+    if (!spend.complete) {
+      return {
+        state: "budget-unverifiable",
+        headline: "I paused before another attempt because I can't verify the total spend yet.",
+        detail: `${spend.unpriced_attempts} attempt${spend.unpriced_attempts === 1 ? "" : "s"} `
+          + `${spend.unpriced_attempts === 1 ? "has" : "have"} usage that could not be measured, so `
+          + `spend against the $${money(ceiling)} limit cannot be established.`,
+        needs_decision: true,
+      };
+    }
+    if (spend.spent >= ceiling) {
+      return {
+        state: "budget-reached",
+        headline: "I stopped before another attempt because this job reached its "
+          + `$${money(ceiling)} limit.`,
+        detail: `About $${spend.spent.toFixed(4)} has been spent.`,
+        needs_decision: true,
+      };
+    }
+    return null;
+  }
+
+  // One useful technical fact, in words rather than in the system's own vocabulary.
+  //
+  // A generic "something went wrong" is worse than a stack trace, and a stack trace is worse than
+  // the one line that says what to do next.
+  failureDetail(jobId) {
+    const raw = this.lastFailureReason(jobId);
+    if (!raw || raw === "stopped without a recorded reason") return null;
+
+    // The compact summary folds newlines into spaces, which runs a stack trace into the one line
+    // worth reading. The raw event still has its line breaks, so take the first line from there.
+    const recorded = this.db.prepare(`SELECT e.payload_json FROM events e
+      JOIN attempts a ON a.id = e.entity_id
+      WHERE a.job_id = ? AND e.kind = 'ATTEMPT_FAILED'
+      ORDER BY e.sequence DESC LIMIT 1`).get(jobId);
+    let firstLine = raw;
+    if (recorded) {
+      try {
+        const message = String(JSON.parse(recorded.payload_json).message ?? "");
+        firstLine = message.split(/[\r\n]/).map((line) => line.trim()).find(Boolean) || raw;
+      } catch { /* the summary is still usable */ }
+    }
+
+    const validation = raw.match(/^validation failed \((\d+)\): (.+)$/);
+    if (validation) return "`" + validation[2].trim().slice(0, 80) + "` failed.";
+
+    const blocked = raw.match(/^Protected path changed: ([^\s(]+)/);
+    if (blocked) return `It tried to change a protected file: ${blocked[1]}.`;
+
+    if (/^worker completed without changing files/.test(raw)) {
+      return "The worker finished without changing anything.";
+    }
+    if (/^worker produced only files this project ignores/.test(raw)) {
+      return raw.replace(
+        /^worker produced only files this project ignores[^:]*:\s*/,
+        "Everything it produced is ignored by this project: ",
+      );
+    }
+    if (/^worker timeout/.test(raw)) return "The worker ran out of time.";
+    if (/^cancelled by operator/.test(raw)) return null;
+
+    // Matched against the first line, so the worker's own first error survives and its stack does
+    // not follow it into the sentence.
+    const exited = firstLine.match(/^worker exited \d+: (.+)$/);
+    if (exited) return `The worker stopped: ${exited[1].trim().slice(0, 120)}`;
+    // Configuration and process-level problems: the worker never really started.
+    if (/is not installed|spawn |EINVAL|ENOENT/.test(raw)) return "The worker could not start.";
+    return raw.slice(0, 120);
+  }
   // What actually landed, so "Done" can say what changed rather than only that something did.
   integratedFiles(jobId) {
     const record = this.db.prepare(`SELECT r.detail, r.proposal_id FROM integration_records r

@@ -172,8 +172,17 @@ export function summarizeStatus(status) {
       parts.push(`I can do "${goal}" with a cheap worker${ceiling}. Approve?${also}`);
     }
   }
+  // One thing, said properly, rather than a recital. A person handles the newest problem first, and
+  // a count of the rest is enough to know more is waiting -- reading eight failures aloud is how a
+  // status answer becomes something to skim past.
   if (status.ready_to_check.length) {
-    parts.push(`Ready to check: ${status.ready_to_check.length}`);
+    const first = status.ready_to_check[0];
+    const rest = status.ready_to_check.length - 1;
+    const said = first.says ?? `${first.goal} needs attention`;
+    const because = first.because ? ` ${first.because}` : "";
+    const older = rest > 0
+      ? ` And ${rest} older item${rest === 1 ? " needs" : "s need"} attention.` : "";
+    parts.push(`${said}${because}${older}`);
   }
   if (status.done.length) {
     const spent = status.done.reduce((total, job) => total + (job.cost.reference_cost_usd ?? 0), 0);

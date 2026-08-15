@@ -114,7 +114,8 @@ test("a failure explains itself without a transcript", async (t) => {
   assert.match(item.why, /worker exited 1/, "the reason is stated in words");
   assert.ok(item.why.length <= 200, "the reason is a sentence, not a dump");
   assert.ok(item.cost.reference_cost_usd > 0, "failed work still reports its cost");
-  assert.match(summarizeStatus(status), /Ready to check: 1/);
+  // The sentence now says what happened rather than counting queue depth.
+  assert.match(summarizeStatus(status), /Couldn't complete "will fail"\. Nothing was integrated\./);
 });
 
 test("unmeasured cost is disclosed rather than reported as a confident number", async (t) => {
