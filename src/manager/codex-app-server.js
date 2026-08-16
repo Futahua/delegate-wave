@@ -48,14 +48,35 @@ export class CodexAppServer {
     this.cwd = cwd;
     this.env = env;
     this.turnTimeoutMs = turnTimeoutMs;
-    this.onNotification = onNotification;
     this.child = null;
     this.nextId = 1;
     this.pending = new Map();
+    // A SET of listeners, not one mutable slot.
+    //
+    // The single-slot version worked only because exactly one turn was ever in flight. Two
+    // concurrent turns -- or one turn plus an observer -- would overwrite each other's collector,
+    // and the loser would wait forever for notifications now being delivered to someone else. That
+    // failure is silent and arrives the day the manager first overlaps two calls.
+    this.listeners = new Set();
+    if (onNotification) this.listeners.add(onNotification);
+    // Turn collectors awaiting a terminal signal. Held so a process exit can settle them as
+    // UNCERTAIN rather than leaving them pending until their timeout.
+    this.turns = new Set();
     this.buffer = "";
     this.stderr = "";
     this.closed = false;
     this.exitReason = null;
+  }
+
+  addListener(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  emit(method, params) {
+    for (const listener of [...this.listeners]) {
+      try { listener(method, params); } catch { /* a bad observer must not break the transport */ }
+    }
   }
 
   async start() {
@@ -80,6 +101,15 @@ export class CodexAppServer {
       // again is affordable.
       for (const [, entry] of this.pending) entry.reject(new Error(this.exitReason));
       this.pending.clear();
+      // A turn already ACCEPTED by the server, whose process then died before reporting completion,
+      // is the textbook uncertain case: the model may well have run and the quota may well have been
+      // consumed. Settling it as a plain failure would invite a retry that pays twice.
+      for (const turn of [...this.turns]) {
+        turn.settle(null, Object.assign(new Error(
+          `the manager turn was accepted but the ${this.exitReason}`,
+        ), { uncertain: true }));
+      }
+      this.turns.clear();
     });
     this.child.on("error", (error) => {
       this.closed = true;
@@ -119,7 +149,7 @@ export class CodexAppServer {
       this.write({ id: message.id, result: { decision: "denied" } });
       return;
     }
-    if (message.method && this.onNotification) this.onNotification(message.method, message.params ?? {});
+    if (message.method) this.emit(message.method, message.params ?? {});
   }
 
   write(payload) {
@@ -170,22 +200,50 @@ export class CodexAppServer {
     return result?.thread?.id ?? threadId;
   }
 
-  // Runs one turn and collects its terminal evidence.
+  // Runs one turn and waits for its TERMINAL signal.
   //
-  // Returns { text, usage, turnId, status }. `usage` is whatever `thread/tokenUsage/updated` reported
-  // for THIS turn (tokenUsage.last), or null. Null is not zero: a turn whose usage never arrived
-  // consumed real quota that this process cannot account for, and the receipt records UNKNOWN.
+  // The distinction this method exists to respect: `turn/start` resolving means the turn was
+  // ACCEPTED, not that it finished. An earlier version checked for collected output the moment
+  // acceptance returned, which reads a race as an answer -- on a fast machine it would usually find
+  // nothing and declare the turn empty, and on a slow one it would occasionally find a partial
+  // message and parse it as the manager's decision. Everything above this method would then have
+  // been built on a false terminal signal.
+  //
+  //   install collector
+  //        -> turn/start                    (acceptance only)
+  //        -> WAIT
+  //             item/completed              collect the final agent message
+  //             thread/tokenUsage/updated   collect this turn's usage
+  //             turn/completed              TERMINAL -- only now is there an answer
+  //
+  // Returns facts whenever a terminal signal was observed, including a turn that completed with no
+  // agent message or with status `failed`; interpreting those is policy, not transport. Throws only
+  // when no terminal signal arrived at all, and marks `uncertain` on the throw when the turn had
+  // already been accepted -- because a turn that was accepted may have run and been billed, and a
+  // blind retry would spend the scarce resource twice to answer a question that may already have an
+  // answer.
+  //
+  // `usage` is whatever `thread/tokenUsage/updated` reported for THIS turn (tokenUsage.last), or
+  // null. Null is not zero: a turn whose usage never arrived consumed real quota this process cannot
+  // account for, and its receipt records UNKNOWN.
   async runTurn({ threadId, text, effort = null }) {
     const collected = { text: null, usage: null, turnId: null, status: null, error: null };
+    let settle = null;
+    const terminal = new Promise((resolve, reject) => {
+      settle = (value, error) => (error ? reject(error) : resolve(value));
+    });
+    const turn = { threadId, settle: (value, error) => { if (!turn.done) { turn.done = true; settle(value, error); } }, done: false };
+
     const listener = (method, params) => {
+      // Notifications for other threads belong to other turns. Silently absorbing them would let a
+      // sibling conversation's completion terminate this wait with the wrong answer.
       if (params?.threadId && threadId && params.threadId !== threadId) return;
       if (method === "thread/tokenUsage/updated") {
         collected.usage = params?.tokenUsage?.last ?? null;
         collected.turnId = params?.turnId ?? collected.turnId;
       } else if (method === "item/completed") {
-        // The manager's answer. Later agentMessage items overwrite earlier ones, so the final
-        // statement wins -- a model that thinks aloud in messages must not have its first draft
-        // parsed as its decision.
+        // Later agentMessage items overwrite earlier ones, so the final statement wins: a model that
+        // thinks aloud across messages must not have its first draft parsed as its decision.
         if (params?.item?.type === "agentMessage" && typeof params.item.text === "string") {
           collected.text = params.item.text;
         }
@@ -193,33 +251,60 @@ export class CodexAppServer {
         collected.status = params?.turn?.status ?? "completed";
         collected.turnId = params?.turn?.id ?? collected.turnId;
         if (params?.turn?.error) collected.error = params.turn.error?.message ?? "turn failed";
+        turn.settle({ ...collected });
       } else if (method === "error") {
         collected.error = params?.message ?? "app-server reported an error";
+        turn.settle(null, Object.assign(new Error(collected.error), { uncertain: true }));
       }
     };
-    const previous = this.onNotification;
-    this.onNotification = (method, params) => {
-      listener(method, params);
-      if (previous) previous(method, params);
-    };
+
+    const remove = this.addListener(listener);
+    this.turns.add(turn);
+    let accepted = false;
+    let timer = null;
     try {
       const params = { threadId, input: [{ type: "text", text }] };
       if (effort) params.effort = effort;
-      const result = await this.request("turn/start", params);
-      // turn/start resolves when the turn is accepted; the terminal evidence arrives as
-      // notifications. If the response itself carried the completed turn, take it.
-      if (result?.turn?.status) collected.status = result.turn.status;
-      if (!collected.text && typeof result?.turn?.items?.at === "function") {
-        const message = [...result.turn.items].reverse().find((item) => item?.type === "agentMessage");
-        if (message?.text) collected.text = message.text;
+      let response;
+      try {
+        response = await this.request("turn/start", params);
+        accepted = true;
+      } catch (error) {
+        // A clean protocol rejection means the turn never started, so nothing was billed. A timeout
+        // means we do not know whether it started, which is a different and more expensive fact.
+        throw Object.assign(error, { uncertain: Boolean(error.timedOut) });
       }
-      if (collected.error) throw new Error(collected.error);
-      if (collected.text === null) {
-        throw new Error("the manager turn completed without producing an agent message");
+
+      // Some versions answer turn/start with the completed turn inline. That IS a terminal signal,
+      // so take it rather than waiting for a notification that will never come.
+      if (response?.turn?.status) {
+        collected.status = response.turn.status;
+        collected.turnId = response.turn.id ?? collected.turnId;
+        if (response.turn.error) collected.error = response.turn.error?.message ?? "turn failed";
+        if (Array.isArray(response.turn.items)) {
+          const message = [...response.turn.items].reverse().find((item) => item?.type === "agentMessage");
+          if (message?.text && collected.text === null) collected.text = message.text;
+        }
+        turn.settle({ ...collected });
       }
-      return collected;
+
+      timer = setTimeout(() => {
+        turn.settle(null, Object.assign(
+          new Error(`the manager turn was accepted but did not complete within ${this.turnTimeoutMs}ms`),
+          { uncertain: true, timedOut: true },
+        ));
+      }, this.turnTimeoutMs);
+
+      return await terminal;
+    } catch (error) {
+      // Anything thrown after acceptance is uncertain by construction; before acceptance it keeps
+      // whatever certainty the transport could establish.
+      if (accepted && error.uncertain === undefined) error.uncertain = true;
+      throw error;
     } finally {
-      this.onNotification = previous;
+      if (timer) clearTimeout(timer);
+      remove();
+      this.turns.delete(turn);
     }
   }
 

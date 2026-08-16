@@ -725,7 +725,7 @@ export class Dispatcher {
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET validation_state = 'PASSED' WHERE id = ?").run(attemptId);
         recordEvent(this.db, { kind: "VALIDATION_PASSED", entityType: "job", entityId: jobId, epoch });
-        if (settlement.state === "EXCEEDED") {
+        if (settlement.blocks_integration_offer) {
           this.db.prepare("UPDATE jobs SET status = 'NEEDS_ATTENTION', updated_at = ? WHERE id = ?").run(now(), jobId);
           recordEvent(this.db, {
             kind: "BUDGET_EXCEEDED", entityType: "job", entityId: jobId, epoch,
@@ -1728,7 +1728,21 @@ export class Dispatcher {
     throw new Error(`Job ${jobId} has a parent chain deeper than delegation permits`);
   }
 
-  // Every job that settles against one ceiling: the root and everything it commissioned.
+  // NOT YET CONCURRENCY-SAFE, and this must be fixed before parallel exploration lands.
+  //
+  // familySpend() sums COMPLETED usage receipts. Three exploration workers started at the same
+  // instant would each observe $0 spent, each pass assertWithinBudget against the same $0.10
+  // authority, and collectively spend three times it. Nothing reserves headroom at admission time.
+  //
+  // This is not exploitable today only because the bootstrap scheduler admits one running job at a
+  // time -- runJob() refuses to claim while any job is RUNNING or any attempt is live. The safety
+  // therefore comes from a scheduler restriction that the manager's 2-3 concurrent explorations are
+  // specifically meant to remove.
+  //
+  // Before parallel exploration: admission must reserve against the family authority atomically, in
+  // the same BEGIN IMMEDIATE that claims the attempt, with pending starts counting toward the total
+  // and the reservation settling against the real receipt afterwards. Claudexor states the property
+  // as "admission is atomic and monotonic (pending starts count toward the max)".
   familyJobIds(rootJobId) {
     const seen = new Set([rootJobId]);
     const queue = [rootJobId];
@@ -1822,6 +1836,22 @@ export class Dispatcher {
   // under an unestablished total, so the remaining exposure is bounded at the attempt that already
   // ran -- and the honest response to that is to say the cost is unknown, not to claim the limit
   // held.
+  // Two consequences, reported separately, because they genuinely differ per state.
+  //
+  // An earlier version carried a single `authorized` boolean, which had to answer a ternary question
+  // and therefore lied about UNVERIFIED: it read `true`, while the prose one screen above said
+  // compliance could not be claimed either way. A boolean cannot express "I do not know", so it
+  // stopped being asked.
+  //
+  //   state        blocks_further_spend   blocks_integration_offer
+  //   WITHIN       false                  false
+  //   EXCEEDED     true                   true
+  //   UNVERIFIED   true                   false
+  //
+  // UNVERIFIED blocking further spend is not a policy choice made here -- it is a restatement of what
+  // assertWithinBudget() already does, since an unestablished total cannot be shown to be intact. It
+  // does not block the integration offer, because a validated candidate already paid for should not
+  // be withheld from the human over an executor's silence about its cost.
   budgetState(jobId) {
     const { rootJobId, ceiling } = this.budgetAuthority(jobId);
     const spend = this.familySpend(rootJobId);
@@ -1829,17 +1859,19 @@ export class Dispatcher {
       ceiling: ceiling ?? null, root_job_id: rootJobId, spent: spend.spent,
       complete: spend.complete, unpriced_attempts: spend.unpriced_attempts, jobs: spend.jobs,
     };
-    if (ceiling === null || ceiling === undefined) return { ...base, state: "WITHIN", authorized: true };
-    if (spend.complete && spend.spent >= ceiling) return { ...base, state: "EXCEEDED", authorized: false };
-    if (!spend.complete) return { ...base, state: "UNVERIFIED", authorized: true };
-    return { ...base, state: "WITHIN", authorized: true };
+    const decided = (state, blocksSpend, blocksOffer) => ({
+      ...base, state, blocks_further_spend: blocksSpend, blocks_integration_offer: blocksOffer,
+    });
+    if (ceiling === null || ceiling === undefined) return decided("WITHIN", false, false);
+    if (spend.complete && spend.spent >= ceiling) return decided("EXCEEDED", true, true);
+    if (!spend.complete) return decided("UNVERIFIED", true, false);
+    return decided("WITHIN", false, false);
   }
 
-  // Retained name for the settlement moment; `state` is the budget truth, `blocks_progression` is
-  // the only thing settlement is permitted to decide about the engineering lifecycle.
+  // The settlement moment. `state` is the budget truth; `blocks_integration_offer` is the only thing
+  // settlement is permitted to decide about the engineering lifecycle.
   settleBudget(jobId) {
-    const budget = this.budgetState(jobId);
-    return { ...budget, verdict: budget.state, blocks_progression: budget.state === "EXCEEDED" };
+    return this.budgetState(jobId);
   }
 
   // --- Cancellation -----------------------------------------------------------------------------

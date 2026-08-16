@@ -144,8 +144,14 @@ export class DirectRuntime extends AgentRuntime {
       attemptId,
       worktreePath: workspacePath,
       artifactDir,
-      // Both the instruction and the objective travel. Backends render the instruction; the
-      // objective is available for framing but must never replace it.
+      // TEMPORARY, and stated honestly: only the instruction travels today. `goal` is set to the
+      // instruction because the current backends still read `goal`, which means the human objective
+      // is NOT separately available to them yet.
+      //
+      // When the instruction seam lands, this becomes two distinct inputs -- `objective` and
+      // `instruction` -- and a backend must render the instruction. Falling back to the objective for
+      // managed work would hand the worker the human's sentence in place of the manager's brief,
+      // which is the exact collapse the whole layer exists to undo, reintroduced as a default.
       instruction,
       goal: instruction,
       model,
@@ -180,15 +186,20 @@ export class DirectRuntime extends AgentRuntime {
 //
 // Three findings decide this, and only the first is about effort:
 //
-//  1. Completion is an idle heuristic. The documented wait is `terminal wait --for tui-idle`, which
-//     answers "the TUI stopped printing", not "the agent finished". Candidate capture is the one
-//     moment where being wrong is unrecoverable: snapshotting a quiet-but-unfinished worktree commits
-//     a mid-edit tree as the attempt's complete work. Agent Orchestrator, which owns TUI sessions
-//     natively, refuses to treat idle as terminal and requires explicit signal AND idle AND process
-//     exit to converge. Orca's terminal layer reports request-accepted, not effect-observed.
+//  1. Completion is quiescence, not task completion. The documented wait is `terminal wait --for
+//     tui-idle`, which proves observed TUI quiescence -- strictly stronger than request-acceptance,
+//     since something really was observed, and strictly weaker than the agent having finished. A
+//     model pausing to think is quiescent and unfinished. Candidate capture is the one moment where
+//     being wrong is unrecoverable: snapshotting a quiet-but-unfinished worktree commits a mid-edit
+//     tree as the attempt's complete work. Agent Orchestrator, which owns TUI sessions natively,
+//     refuses to treat idle as terminal and requires explicit signal AND idle AND process exit to
+//     converge.
 //
-//  2. `worktree create` cannot be pointed at a recorded base commit or a chosen path, and
-//     snapshotCandidate measures every candidate against exactly such a commit.
+//  2. Orca-OWNED `worktree create` cannot be pointed at a recorded base commit or a chosen path, and
+//     snapshotCandidate measures every candidate against exactly such a commit. That is a statement
+//     about Orca-owned workspaces through the documented surface, not about Orca: an adapter could
+//     run an Orca session inside a delegate-wave-owned worktree instead, which is exactly why
+//     provisionWorkspace and spawn are separate methods.
 //
 //  3. The orchestration contract is unreadable from outside the install. skills/orchestration/SKILL.md
 //     states it is "a discovery stub, not the usage guide" and that commands "change between Orca

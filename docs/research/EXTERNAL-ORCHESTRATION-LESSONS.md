@@ -170,6 +170,13 @@ harness)"* is our "capability is a preference, authority is not."
    count toward the max of 8)."* Counting only finished children lets a burst of concurrent spawns
    pass a cap that was never actually free.
 
+   **Open in delegate-wave, deliberately.** `familySpend()` sums completed receipts, so three
+   explorations started together would each see $0 spent and each pass the same $0.10 gate. This is
+   unexploitable *today* only because the bootstrap scheduler admits one running job at a time — and
+   that restriction is exactly what parallel exploration removes. **Atomic family admission must land
+   before parallel exploration does.** Recorded here and at `familyJobIds()` so the dependency cannot
+   be discovered by overspending.
+
 3. **Settlement can retract a success.** *"a late overshoot or unverifiable child settlement replaces
    the prepared success with a typed budget failure."* This is the honest answer to delegate-wave's
    own weakest claim. We cannot terminate a worker mid-call on cost, so a pre-attempt gate will
