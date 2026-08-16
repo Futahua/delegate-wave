@@ -139,32 +139,69 @@ export class Dispatcher {
 
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
-  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null }) {
+  insertJobRow({
+    projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null,
+    strategy = "direct", parentJobId = null, internalKind = null,
+  }) {
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
       id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
-      capability_profile, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`).run(
+      capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost,
-      capabilityProfile, timestamp, timestamp,
+      capabilityProfile, strategy, parentJobId, internalKind, timestamp, timestamp,
     );
-    recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
+    recordEvent(this.db, {
+      kind: "JOB_CREATED", entityType: "job", entityId: jobId,
+      payload: { baseSha, mode, strategy, parentJobId, internalKind },
+    });
     return this.getJob(jobId);
   }
 
   async createJob({
     projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null, capabilityProfile = null,
+    strategy = "direct", parentJobId = null, internalKind = null,
   }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
+    if (!["direct", "managed"].includes(strategy)) throw new Error("strategy must be direct or managed");
+
+    // A child job carries no ceiling of its own, and this is refused rather than ignored.
+    //
+    // Authority over spending belongs to one family, held by the root. Letting a child carry its own
+    // number would create a second authority that nothing reconciles: five explorations at $0.10
+    // each would each pass their own check while spending five times what the operator authorized.
+    // Silently discarding the argument would be worse than refusing it, because the caller would go
+    // on believing the child was bounded by the figure it supplied.
+    if (parentJobId) {
+      const parent = this.getJob(parentJobId);
+      if (!parent) throw new Error(`Unknown parent job: ${parentJobId}`);
+      if (parent.project_id !== projectId) {
+        throw new Error("A child job must belong to the same project as its parent");
+      }
+      if (parent.parent_job_id) {
+        // Nesting depth one. A child that could commission children turns a bounded delegation into
+        // a recursive one, and the cap that made it affordable stops meaning anything.
+        throw new Error("Delegation nests one level: a child job may not commission further children");
+      }
+      if (maximumCost !== null) {
+        throw new Error(
+          "A child job may not carry its own cost ceiling; it settles against its parent's family budget",
+        );
+      }
+    } else if (internalKind) {
+      throw new Error("An internal job requires a parent job");
+    }
+
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
     // Validated at creation, so an unusable profile is refused when the job is described rather
     // than discovered when a worker is about to run.
     if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
     return transaction(this.db, () => this.insertJobRow({
       projectId, goal, mode, maxAttempts, baseSha, maximumCost, capabilityProfile,
+      strategy, parentJobId, internalKind,
     }));
   }
 
@@ -544,7 +581,12 @@ export class Dispatcher {
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
       // Checked inside the claim transaction, so a ceiling cannot be raced by two starts.
-      this.assertWithinBudget(jobId, current.maximum_cost);
+      //
+      // Resolved rather than passed in. Handing `current.maximum_cost` to the gate would ask a child
+      // job about its own ceiling, which is NULL by construction -- so every exploration would pass
+      // unbounded while the family it belongs to was already over budget. The authority is the
+      // family's, and only the family can answer.
+      this.assertWithinBudget(jobId);
       const ordinal = previousAttempts + 1;
       const attemptId = `${job.id}.${ordinal}`;
       const worktreePath = path.join(this.paths.worktrees, project.id, `attempt-${ordinal}-${job.id.slice(-8)}`);
@@ -666,12 +708,49 @@ export class Dispatcher {
 
       for (const command of validationPlan) await this.validate(attemptId, epoch, worktreePath, artifactDir, command);
 
+      // Settled AFTER validation and BEFORE the job claims to be ready.
+      //
+      // Two independent truths, kept independent. The attempt's engineering record is written
+      // unconditionally: it succeeded, its validation passed, its candidate stands. Settlement never
+      // writes to that record, because a cost overrun does not make correct code incorrect, and
+      // stamping a failure on the attempt would falsify engineering history to express a financial
+      // fact.
+      //
+      // What an exceeded budget withholds is automatic progression. The job does not announce
+      // READY_FOR_INTEGRATION -- that is an invitation to integrate, and the operator has not agreed
+      // to buy this at this price -- and the start gate independently refuses any further paid call,
+      // because family spend now sits at or above the ceiling. The candidate commit is preserved, so
+      // raising the limit recovers work already paid for rather than repurchasing it.
+      const settlement = this.settleBudget(jobId);
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET validation_state = 'PASSED' WHERE id = ?").run(attemptId);
+        recordEvent(this.db, { kind: "VALIDATION_PASSED", entityType: "job", entityId: jobId, epoch });
+        if (settlement.state === "EXCEEDED") {
+          this.db.prepare("UPDATE jobs SET status = 'NEEDS_ATTENTION', updated_at = ? WHERE id = ?").run(now(), jobId);
+          recordEvent(this.db, {
+            kind: "BUDGET_EXCEEDED", entityType: "job", entityId: jobId, epoch,
+            payload: {
+              ceiling: settlement.ceiling, spent: settlement.spent, attemptId,
+              // Named explicitly so the record shows the candidate was preserved, not discarded.
+              candidate: resultCommit, validation: "PASSED", root_job_id: settlement.root_job_id,
+            },
+          });
+          return;
+        }
+        if (settlement.state === "UNVERIFIED") {
+          // Not a violation and not a clean pass. The candidate proceeds; what cannot be stated is
+          // that it stayed inside the limit, and the everyday surface says so rather than implying it.
+          recordEvent(this.db, {
+            kind: "BUDGET_UNVERIFIED", entityType: "job", entityId: jobId, epoch,
+            payload: {
+              ceiling: settlement.ceiling, spent: settlement.spent,
+              unpriced_attempts: settlement.unpriced_attempts, root_job_id: settlement.root_job_id,
+            },
+          });
+        }
         this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(
           job.mode === "write" ? "READY_FOR_INTEGRATION" : "SUCCEEDED", now(), jobId,
         );
-        recordEvent(this.db, { kind: "VALIDATION_PASSED", entityType: "job", entityId: jobId, epoch });
       }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
       return this.status(jobId);
     } catch (error) {
@@ -1123,7 +1202,7 @@ export class Dispatcher {
       "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal",
     ).all(jobId);
     const last = attempts.at(-1) ?? null;
-    const spend = this.jobSpend(jobId);
+    const spend = this.familySpend(this.budgetRootJobId(jobId));
     const spent = spend.spent > 0
       ? `About $${spend.spent.toFixed(4)} was spent${spend.complete ? "" : " so far"}`
       : null;
@@ -1243,8 +1322,29 @@ export class Dispatcher {
   budgetObstacle(job, spend) {
     // Trailing zeros make a limit read as an instrument reading rather than an amount of money.
     const money = (value) => Number(value).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
-    const ceiling = job.maximum_cost;
+    const ceiling = this.budgetAuthority(job.id).ceiling;
     if (ceiling === null || ceiling === undefined) return null;
+
+    // Retraction reads completely differently from refusal, and conflating them would be the worst
+    // kind of wrong: "I stopped before another attempt" when the work is finished and a validated
+    // candidate is sitting there would send someone looking for a failure that did not happen.
+    const exceeded = this.db.prepare(
+      "SELECT payload_json FROM events WHERE kind = 'BUDGET_EXCEEDED' AND entity_id = ? ORDER BY sequence DESC LIMIT 1",
+    ).get(job.id);
+    if (exceeded) {
+      const payload = parseJson(exceeded.payload_json, {});
+      return {
+        state: "budget-exceeded",
+        headline: "The work is finished and passed its checks, but it cost about "
+          + `$${Number(payload.spent ?? spend.spent).toFixed(4)} against a $${money(ceiling)} limit. `
+          + "I have not offered it for integration. I need your decision.",
+        detail: "Nothing was integrated and nothing was thrown away: the change itself is fine and "
+          + "the candidate is intact, so raising the limit accepts work you have already paid for "
+          + "rather than repeating it.",
+        needs_decision: true,
+      };
+    }
+
     if (!spend.complete) {
       return {
         state: "budget-unverifiable",
@@ -1605,25 +1705,141 @@ export class Dispatcher {
     return { spent, priced_attempts: priced, unpriced_attempts: unpriced, complete: unpriced === 0 };
   }
 
+  // --- Budget authority is held by a family, not by a job -----------------------------------------
+  //
+  // A managed job commissions child jobs for exploration. The obvious implementation gives each child
+  // its own ceiling, which silently multiplies the operator's limit by the number of children: five
+  // explorations under a $0.10 ceiling would authorize $0.60 of work while every individual check
+  // passed. So a ceiling belongs to the family that shares it, and a child settles against its root.
+  //
+  // Learned rather than derived: Claudexor's delegation belt keeps "one live parent-owned paid-budget
+  // authority shared by the parent and every child", and states the failure mode as a typed refusal
+  // rather than an independent budget. See docs/research/EXTERNAL-ORCHESTRATION-LESSONS.md.
+
+  // The job that owns the ceiling this job spends against. Bounded rather than recursive: nesting is
+  // one level by construction, and a cycle introduced by a bad write must not hang the scheduler.
+  budgetRootJobId(jobId) {
+    let current = jobId;
+    for (let depth = 0; depth < 8; depth += 1) {
+      const row = this.db.prepare("SELECT parent_job_id FROM jobs WHERE id = ?").get(current);
+      if (!row?.parent_job_id) return current;
+      current = row.parent_job_id;
+    }
+    throw new Error(`Job ${jobId} has a parent chain deeper than delegation permits`);
+  }
+
+  // Every job that settles against one ceiling: the root and everything it commissioned.
+  familyJobIds(rootJobId) {
+    const seen = new Set([rootJobId]);
+    const queue = [rootJobId];
+    while (queue.length) {
+      const parent = queue.shift();
+      for (const row of this.db.prepare("SELECT id FROM jobs WHERE parent_job_id = ?").all(parent)) {
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        queue.push(row.id);
+      }
+    }
+    return [...seen];
+  }
+
+  // Family spend, in the same shape and with the same honesty as jobSpend.
+  familySpend(rootJobId) {
+    const ids = this.familyJobIds(rootJobId);
+    const totals = { spent: 0, priced_attempts: 0, unpriced_attempts: 0 };
+    for (const id of ids) {
+      const spend = this.jobSpend(id);
+      totals.spent += spend.spent;
+      totals.priced_attempts += spend.priced_attempts;
+      totals.unpriced_attempts += spend.unpriced_attempts;
+    }
+    return { ...totals, complete: totals.unpriced_attempts === 0, jobs: ids.length };
+  }
+
+  // The ceiling in force for this job, and who holds it.
+  budgetAuthority(jobId) {
+    const rootJobId = this.budgetRootJobId(jobId);
+    const root = this.db.prepare("SELECT maximum_cost FROM jobs WHERE id = ?").get(rootJobId);
+    return { rootJobId, ceiling: root?.maximum_cost ?? null };
+  }
+
   // Refuses to start work that a recorded ceiling cannot cover.
   //
   // Unaccounted spend blocks rather than passes: if an earlier attempt's cost is unknown, the honest
   // answer is that the budget cannot be shown to be intact, not that it is.
-  assertWithinBudget(jobId, ceiling) {
-    if (ceiling === null || ceiling === undefined) return null;
-    const spend = this.jobSpend(jobId);
+  //
+  // This is a START GATE and nothing more. It cannot bound the attempt it admits: once a worker is
+  // running there is no live cost cutoff, so an attempt admitted with $0.01 of headroom may spend
+  // many times the ceiling before it exits. settleBudget() below is what gives the ceiling
+  // consequences after the fact.
+  assertWithinBudget(jobId, ceiling = undefined) {
+    const authority = this.budgetAuthority(jobId);
+    const limit = ceiling === undefined ? authority.ceiling : ceiling;
+    if (limit === null || limit === undefined) return null;
+    const spend = this.familySpend(authority.rootJobId);
     if (!spend.complete) {
       throw new Error(
         `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
-        + `the ${ceiling} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
+        + `the ${limit} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
       );
     }
-    if (spend.spent >= ceiling) {
+    if (spend.spent >= limit) {
       throw new Error(
-        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling; refusing to start more work`,
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${limit} ceiling; refusing to start more work`,
       );
     }
     return spend;
+  }
+
+  // What the ceiling turned out to mean, once the work is done and the receipts are in.
+  //
+  // The start gate above can only ever ask "was the budget intact BEFORE this?", so a ceiling has
+  // historically been describable only as a permission to begin. Settlement is where it acquires
+  // consequences.
+  //
+  // The critical framing: a cost overrun does not make correct code incorrect. These are two
+  // independent truths about one attempt, and collapsing them would corrupt both.
+  //
+  //   ENGINEERING OUTCOME     candidate captured? validation passed? manager accepted?
+  //   BUDGET OUTCOME          within authorization? exceeded? unverifiable?
+  //
+  // So nothing here touches the attempt's record. The attempt succeeded and its validation passed;
+  // stamping a failure signature on it to express a budget opinion would falsify engineering history
+  // to record a financial fact. What settlement withholds is AUTOMATIC PROGRESSION -- the job does
+  // not claim READY_FOR_INTEGRATION, no further paid call may start, and the overrun is surfaced --
+  // while the candidate commit is preserved intact. You cannot unspend money; you can decline to
+  // spend more of it, and decline to imply the work is cleared to proceed.
+  //
+  // Three states, matching the COMPLETE/PARTIAL/UNKNOWN discipline the usage receipts already use:
+  //
+  //   WITHIN      measured spend is complete and under the ceiling
+  //   EXCEEDED    measured spend reached or passed the ceiling -- progression is blocked
+  //   UNVERIFIED  spend cannot be established, so compliance cannot be claimed either way
+  //
+  // UNVERIFIED does NOT block. An executor that failed to report usage is a reporting gap, not
+  // evidence of overspending, and withholding a validated candidate over one would penalise the
+  // operator for an executor's silence. The start gate already refuses to spend anything further
+  // under an unestablished total, so the remaining exposure is bounded at the attempt that already
+  // ran -- and the honest response to that is to say the cost is unknown, not to claim the limit
+  // held.
+  budgetState(jobId) {
+    const { rootJobId, ceiling } = this.budgetAuthority(jobId);
+    const spend = this.familySpend(rootJobId);
+    const base = {
+      ceiling: ceiling ?? null, root_job_id: rootJobId, spent: spend.spent,
+      complete: spend.complete, unpriced_attempts: spend.unpriced_attempts, jobs: spend.jobs,
+    };
+    if (ceiling === null || ceiling === undefined) return { ...base, state: "WITHIN", authorized: true };
+    if (spend.complete && spend.spent >= ceiling) return { ...base, state: "EXCEEDED", authorized: false };
+    if (!spend.complete) return { ...base, state: "UNVERIFIED", authorized: true };
+    return { ...base, state: "WITHIN", authorized: true };
+  }
+
+  // Retained name for the settlement moment; `state` is the budget truth, `blocks_progression` is
+  // the only thing settlement is permitted to decide about the engineering lifecycle.
+  settleBudget(jobId) {
+    const budget = this.budgetState(jobId);
+    return { ...budget, verdict: budget.state, blocks_progression: budget.state === "EXCEEDED" };
   }
 
   // --- Cancellation -----------------------------------------------------------------------------
