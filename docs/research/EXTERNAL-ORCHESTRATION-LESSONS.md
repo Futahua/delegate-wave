@@ -1,0 +1,220 @@
+# External orchestration lessons
+
+Reconnaissance before building. Each entry records one mechanism, what it solves, and what
+delegate-wave decided. Not a literature review — entries exist to stop us rediscovering something a
+maintained project already learned, or to record why we deliberately did not adopt it.
+
+Read 2026-08-17 against: `stablyai/orca`, `HenryLach/taskplane`, `razzant/claudexor`,
+`ComposioHQ/agent-orchestrator`.
+
+---
+
+## Orca — can it satisfy `AgentRuntime`?
+
+```text
+External mechanism:   Desktop orchestrator; per-worktree agents; CLI over terminals and worktrees
+Problem it solves:    Running several coding agents side by side, each isolated, tracked in one place
+Public interface:     orca worktree create|rm|list|ps|show|set
+                      orca terminal create|read|send|wait|stop|close|show
+                      orca skills get orchestration   (version-matched guide, binary-resident)
+State it owns:        Worktrees, terminal handles (runtime-scoped), agent processes
+Failure semantics:    `terminal_handle_stale` after an Orca restart; reacquire via `terminal list`
+Resume semantics:     `terminal send --text "continue" --enter` — keystroke injection into a TUI
+Windows support:      Yes, native desktop app (.exe)
+Evidence returned:    `--json` on every command; completion via `terminal wait --for tui-idle`
+Recommendation:       DO NOT USE YET — seam kept, adapter not written
+Relevant files:       skill-guides/orca-cli.md, skills/orchestration/SKILL.md
+```
+
+**Four blockers, in order of severity.**
+
+1. **Completion is an idle heuristic.** The documented wait is `terminal wait --for tui-idle
+   --timeout-ms 300000`. That answers "the TUI stopped printing", not "the agent finished". Candidate
+   capture is the one moment in delegate-wave where being wrong is unrecoverable: snapshotting on a
+   quiet TUI captures a mid-edit tree and commits it as the attempt's complete work. This is the
+   disqualifying finding, and it is exactly the `request accepted` versus `effect observed`
+   distinction the directive asked us to test. Orca's terminal layer reports the former.
+
+2. **`worktree create` takes no ref and no path.** Documented flags are `--name`, `--repo`,
+   `--agent`, `--prompt`, `--no-parent`. delegate-wave requires a worktree at an *exact recorded base
+   commit*, at a path it chose, because `snapshotCandidate` measures the result against that commit.
+   Nothing in the documented surface provides either.
+
+3. **The CLI ships inside the desktop app.** "The CLI is distributed as part of the desktop
+   installation, not separately." delegate-wave runs headless under a Windows Task Scheduler
+   supervisor; taking a GUI desktop application as a hard dependency of the unattended path is a
+   large operational cost for a component we would only be renting.
+
+4. **The contract we would depend on is unreadable from outside.** `skills/orchestration/SKILL.md`
+   says plainly: *"This file is a discovery stub, not the usage guide"*, and the real reference comes
+   from `orca skills get orchestration` on the installed binary because commands *"change between
+   Orca releases."* The orchestration primitives that motivated this whole evaluation — dispatch,
+   `worker_done`, ask/reply, decision gates, coordinator loops, task DAGs — are named there and
+   specified only there. Orca is not installed on this machine, so those contracts were not read.
+
+**Decision.** The `AgentRuntime` seam stays, because the seam is cheap and the reason for it is
+sound. `OrcaRuntime` is not written. A first draft *was* written against guessed commands
+(`orca agent start --instruction-file`, `worktree create --ref <sha> --path`) and every one of them
+was wrong — which is the concrete argument for this directive, and the reason the file now carries a
+verification checklist instead of an implementation.
+
+**Status: SEAM ONLY. Revisit after installing Orca and reading the version-matched guide.**
+
+---
+
+## Taskplane — persistent worker context and inline revision
+
+```text
+External mechanism:   Worker calls a `review_step` tool at step boundaries; reviewer spawns with
+                      telemetry, writes .reviews/R00N-{type}-step{N}.md; worker reads it and
+                      continues in the same context
+Problem it solves:    Revision without paying to rediscover the repository
+Public interface:     review_step tool; verdicts APPROVE / REVISE / RETHINK / UNAVAILABLE
+State it owns:        Worker conversation, worktree, step-boundary commits
+Failure semantics:    UNAVAILABLE = reviewer produced no output; worker "proceeds cautiously"
+Resume semantics:     Same process, same conversation, same worktree — review is mid-turn
+Windows support:      Not stated
+Evidence returned:    Baseline commit SHA per code review, so the reviewer sees one step's diff
+Recommendation:       ADAPT PATTERN (partially) — and explicitly REJECT the inline-review shape
+Relevant files:       README.md, docs/explanation/review-loop.md
+```
+
+**The part we cannot take, and why it matters.** Taskplane's persistent context works *because the
+review happens inside the worker's turn*. That is incompatible with delegate-wave's central
+guarantee. Our review runs after the attempt terminates, after `snapshotCandidate` has written one
+immutable tree, and after deterministic validation ran against that same tree. If the worker keeps
+running past the review, the reviewed tree is no longer the integrated tree, and "semantic review
+accepted this candidate" stops naming anything. **Do not move review inside the worker's turn.**
+
+**The part we take.** Persistence of the *conversation* across attempts is orthogonal to when review
+happens. A correction can reach the same agent that already loaded the repository, and then that
+agent produces a *new* attempt with a *new* captured tree. So `AgentRuntime.send(session, revision)`
+is worth having; `review_step` is not.
+
+**Verdict vocabulary we were missing.** Taskplane has four verdicts; our contract had three actions
+and folded two distinct situations together.
+
+- `RETHINK` — the *plan* is wrong, not the code. Distinct from REVISE, and it maps to re-entering
+  exploration rather than reissuing an implementation brief. Our `EXPLORE` action already covers the
+  mechanism; the finding is that a reviewer must be able to reach it *after* seeing a candidate, not
+  only before one exists.
+- `UNAVAILABLE` — the reviewer produced no usable output. This independently validates the
+  `UNCERTAIN` manager-turn state. Their policy is that the worker "proceeds cautiously"; **ours must
+  be the opposite.** A review that did not happen can never become an acceptance, because acceptance
+  is the gate in front of a human's repository.
+
+**Status: ADOPT `send()` SEAM AND THE UNAVAILABLE DISTINCTION. REJECT INLINE REVIEW.**
+
+---
+
+## Claudexor — bounded delegation and family budget authority
+
+```text
+External mechanism:   `agent --delegate` belt: a parent harness spawns bounded isolated children
+Problem it solves:    Letting a strong agent buy cheap labour without giving that labour authority
+Public interface:     claudexor_ask / _plan / _run / _best_of / _run_status / _run_result
+State it owns:        Daemon-owned budget authority per run family; admission counters; event log
+Failure semantics:    Typed refusals; a late overshoot or unverifiable child settlement replaces a
+                      prepared success with a typed budget failure
+Resume semantics:     Parent cancellation cascades to children; retry creates a fresh top-level family
+Windows support:      NO — CLI/daemon are macOS + Linux. Concrete blocker.
+Evidence returned:    credential_profile_id / credential_route per event; live subscription quota
+Recommendation:       ADOPT CONCEPTS — cannot consume the dependency
+Relevant files:       docs/ARCHITECTURE.md, README.md
+```
+
+**Closest prior art to our authority model, and it agrees with us.** *"There is NO
+apply/decision/thread/settings tool: the PARENT integrates results in its own workspace."* That is
+our "manager ACCEPT means semantic review accepted this candidate; it does not mean integrate",
+reached independently. Likewise *"enforced SERVER-SIDE at the tool boundary (never trusting the
+harness)"* is our "capability is a preference, authority is not."
+
+**Three things we would have got wrong.**
+
+1. **One budget authority per family, not per participant.** *"one live parent-owned paid-budget
+   authority shared by the parent and every child... exhaustion is a typed refusal, never a silent
+   independent or unlimited budget."* Our managed jobs spawn exploration children. The obvious
+   implementation gives each child job its own `maximum_cost`, which silently multiplies the
+   operator's ceiling by the number of children. Children must settle against the parent's ceiling.
+
+2. **Admission counts pending, not completed.** *"admission is atomic and monotonic (pending starts
+   count toward the max of 8)."* Counting only finished children lets a burst of concurrent spawns
+   pass a cap that was never actually free.
+
+3. **Settlement can retract a success.** *"a late overshoot or unverifiable child settlement replaces
+   the prepared success with a typed budget failure."* This is the honest answer to delegate-wave's
+   own weakest claim. We cannot terminate a worker mid-call on cost, so a pre-attempt gate will
+   always permit overshoot. But we *can* refuse to report a managed run as successful when
+   settlement shows the ceiling was breached, or when spend cannot be established. That turns a
+   start-gate into something with real consequences without building streaming cost interception.
+
+**Nesting depth 1 and a child cap** are theirs too, and match the limits we had already chosen for
+different reasons.
+
+**Cannot consume.** CLI and daemon are macOS and Linux; Windows is not supported. That is the
+blocker, not architecture taste.
+
+**Status: ADOPT CONCEPTS (family budget, pending admission, settlement retraction). DO NOT DEPEND.**
+
+---
+
+## Agent Orchestrator — Windows process lifecycle and session modes
+
+```text
+External mechanism:   RuntimeAdapter port with tmux (POSIX) and ConPTY (Windows) implementations
+Problem it solves:    Owning long-lived coding-agent sessions natively on Windows, without tmux
+Public interface:     backend/internal/adapters/runtime/ ; session_manager ; observe/reaper
+State it owns:        sessions{runtime_handle_id, provider_conversation_id, session_mode,
+                      controller_generation, activity_state, is_terminated}; conversations;
+                      conversation_turns; conversation_messages
+Failure semantics:    lifecycle.Manager terminates only when runtime dead AND process dead AND no
+                      recent activity AND no merged-PR ownership
+Resume semantics:     Boot reconciliation; TUI reattaches to tmux, Chat resumes provider conversation
+Windows support:      Yes — ConPTY, native, no tmux requirement
+Evidence returned:    activity_state in {active, idle, waiting_input, blocked, exited}; 5s reaper probe
+Recommendation:       ADAPT PATTERN — ignore the issue/PR product model
+Relevant files:       docs/architecture.md, backend/internal/adapters/runtime/
+```
+
+**The distinction worth stealing: session *mode*.** AO persists `session_mode` as `tui` or `chat`
+and selects the messenger from it at dispatch time. TUI sends keystrokes through a runtime handle;
+Chat enqueues provider turns against `provider_conversation_id`. That is precisely the difference
+between what Orca offers and what our Harness/Codex backends offer, and it says our runtime
+capability flags should name the mode rather than pretending one mechanism covers both.
+
+**Completion detection, from a project that does it properly.** AO combines *explicit agent signal +
+idle probe + process exit*, and terminates only when all conditions converge. This is independent
+confirmation that Orca's `--for tui-idle` alone is not a completion signal — a project that owns TUI
+sessions natively refuses to treat idle as terminal.
+
+**`controller_generation`** is AO's fencing token against a stale controller acting after a handoff.
+delegate-wave already has `scheduler_epoch` doing the same job. Two projects converging on the same
+mechanism is mild evidence the invariant is real.
+
+**Do not import** the issue → worktree → PR → CI → review product model. Our problem is one fuzzy
+objective needing expensive judgment, not twenty known issues needing parallel throughput. That
+machinery becomes interesting only if delegate-wave ever grows into a backlog factory.
+
+**Status: ADOPT `session_mode` CONCEPT AND CONVERGENT-COMPLETION RULE. DO NOT DEPEND.**
+
+---
+
+## What delegate-wave still owns after all four
+
+Nothing above replaces any of these, and three of the four projects independently confirm the
+boundary:
+
+```text
+when scarce intelligence is worth spending
+what the manager asks cheap workers to learn
+how that evidence is compressed
+how evidence becomes an implementation brief
+when a result is revised, re-explored, escalated, or abandoned
+finished work / scarce-model usage, and human interventions / finished work
+which statements must be proven rather than believed
+```
+
+Plus the mechanical kernel none of them offers: candidate capture through a delegate-wave-owned
+index, protected-path policy on the same tree that gets committed, deterministic validation against
+that exact tree, disjoint usage receipts with COMPLETE/PARTIAL/UNKNOWN honesty, and compare-and-swap
+integration behind a human approval.
