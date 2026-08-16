@@ -22,23 +22,38 @@ Failure semantics:    `terminal_handle_stale` after an Orca restart; reacquire v
 Resume semantics:     `terminal send --text "continue" --enter` — keystroke injection into a TUI
 Windows support:      Yes, native desktop app (.exe)
 Evidence returned:    `--json` on every command; completion via `terminal wait --for tui-idle`
-Recommendation:       DO NOT USE YET — seam kept, adapter not written
+Recommendation:       DEFERRED — seam kept, adapter not written. NOT "rejected".
 Relevant files:       skill-guides/orca-cli.md, skills/orchestration/SKILL.md
 ```
 
 **Four blockers, in order of severity.**
 
-1. **Completion is an idle heuristic.** The documented wait is `terminal wait --for tui-idle
-   --timeout-ms 300000`. That answers "the TUI stopped printing", not "the agent finished". Candidate
-   capture is the one moment in delegate-wave where being wrong is unrecoverable: snapshotting on a
-   quiet TUI captures a mid-edit tree and commits it as the attempt's complete work. This is the
-   disqualifying finding, and it is exactly the `request accepted` versus `effect observed`
-   distinction the directive asked us to test. Orca's terminal layer reports the former.
+1. **Completion is quiescence, not task completion.** The documented wait is `terminal wait --for
+   tui-idle --timeout-ms 300000`.
 
-2. **`worktree create` takes no ref and no path.** Documented flags are `--name`, `--repo`,
-   `--agent`, `--prompt`, `--no-parent`. delegate-wave requires a worktree at an *exact recorded base
-   commit*, at a path it chose, because `snapshotCandidate` measures the result against that commit.
-   Nothing in the documented surface provides either.
+   ```text
+   Orca `terminal wait` proves observed TUI quiescence,
+   not semantic/task completion.
+   ```
+
+   That is the precise disqualifier, and the precision matters. Quiescence is *stronger* than
+   request-accepted — something really was observed — but *weaker* than the agent having finished its
+   task. A model that pauses to think, or a harness that buffers, is quiescent and unfinished.
+   Candidate capture is the one moment in delegate-wave where being wrong is unrecoverable:
+   snapshotting a quiet-but-unfinished worktree commits a mid-edit tree as the attempt's complete
+   work. Agent Orchestrator, which owns TUI sessions natively, refuses to treat idle as terminal and
+   requires explicit signal AND idle AND process exit to converge — independent confirmation that
+   quiescence alone cannot trigger capture.
+
+2. **Orca-owned worktree creation cannot currently meet our exact-base contract.** Documented flags
+   for `worktree create` are `--name`, `--repo`, `--agent`, `--prompt`, `--no-parent` — no ref, no
+   path. `snapshotCandidate` measures every candidate against an exact recorded base commit at a path
+   delegate-wave chose.
+
+   This is a statement about *Orca-owned workspaces through the documented surface*, not about Orca.
+   A future adapter could attach an Orca terminal or session to a **delegate-wave-owned worktree**,
+   which sidesteps the issue entirely — the runtime contract already separates `provisionWorkspace`
+   from `spawn` for exactly this reason. Do not record this as permanent.
 
 3. **The CLI ships inside the desktop app.** "The CLI is distributed as part of the desktop
    installation, not separately." delegate-wave runs headless under a Windows Task Scheduler
@@ -58,7 +73,9 @@ sound. `OrcaRuntime` is not written. A first draft *was* written against guessed
 was wrong — which is the concrete argument for this directive, and the reason the file now carries a
 verification checklist instead of an implementation.
 
-**Status: SEAM ONLY. Revisit after installing Orca and reading the version-matched guide.**
+**Status: ORCARUNTIME DEFERRED, SEAM KEPT. Not a rejection of Orca — a statement that its documented
+completion signal cannot drive candidate capture, and that its orchestration contract is unreadable
+without the binary. Revisit after installing Orca and running `orca skills get orchestration`.**
 
 ---
 
@@ -86,10 +103,22 @@ immutable tree, and after deterministic validation ran against that same tree. I
 running past the review, the reviewed tree is no longer the integrated tree, and "semantic review
 accepted this candidate" stops naming anything. **Do not move review inside the worker's turn.**
 
-**The part we take.** Persistence of the *conversation* across attempts is orthogonal to when review
-happens. A correction can reach the same agent that already loaded the repository, and then that
-agent produces a *new* attempt with a *new* captured tree. So `AgentRuntime.send(session, revision)`
-is worth having; `review_step` is not.
+**The part we take, and its status.** Persistence of the *conversation* across attempts is orthogonal
+to when review happens. A correction can reach the same agent that already loaded the repository, and
+that agent then produces a *new* attempt with a *new* captured tree. So `AgentRuntime.send(session,
+revision)` is worth having; `review_step` is not.
+
+**Correctness must never depend on it.** Conversation reuse is an economic optimization — it avoids
+paying twice to rediscover the repository — and a runtime whose session died with its process must
+produce the same *outcome*, only more expensively. So the policy branches on a declared capability:
+
+```text
+if resumable:  reuse the conversation, send the revision
+else:          fresh worker + previous evidence + revision brief
+```
+
+A managed run that silently produced worse results on a non-resumable runtime would have smuggled a
+performance feature into the definition of correct.
 
 **Verdict vocabulary we were missing.** Taskplane has four verdicts; our contract had three actions
 and folded two distinct situations together.
