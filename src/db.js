@@ -9,9 +9,13 @@ import { managedPaths } from "./paths.js";
 // 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
 // 12: usage receipts record cost provenance and enforce their value invariants.
 // 13: durable cancellation intents and results.
-// 14: jobs carry an enforced cost ceiling.
+// 14: jobs carry a pre-attempt worker budget gate.
 // 15: integration rollbacks are a first-class recorded outcome.
-export const SCHEMA_VERSION = "18";
+// 19: the semantic layer. Jobs carry a strategy and a parent; attempts record the exact instruction
+//     they were given and the tree they started from; manager runs, turns and usage receipts give
+//     scarce-model activity its own ledger; work proposals bind to the repository head they were
+//     written against.
+export const SCHEMA_VERSION = "19";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -51,8 +55,20 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- An explicit request for a narrower worker: a task run against something untrusted, or an
   -- experiment with hidden verifiers. Null means the system default, which is broad.
   capability_profile TEXT,
+  -- How this job reaches a candidate. 'direct' is the original path: one authorization, one worker,
+  -- the goal as its instruction. 'managed' hands the job to a strong manager that plans, delegates,
+  -- reviews and revises. Both paths use the same attempt machinery and the same integration gate;
+  -- only who writes the worker's instruction differs.
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
+  -- Set on jobs the manager created for itself. A child is real work with real cost and real
+  -- evidence -- it is deliberately NOT a private side channel -- but it belongs to its parent's
+  -- accounting rather than to the operator's queue.
+  parent_job_id TEXT REFERENCES jobs(id),
+  internal_kind TEXT CHECK (internal_kind IS NULL OR internal_kind IN ('MANAGER_EXPLORATION')),
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- An internal job without a parent would be invisible with nothing to be visible under.
+  CHECK (internal_kind IS NULL OR parent_job_id IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -89,6 +105,25 @@ CREATE TABLE IF NOT EXISTS attempts (
   -- everyday surface say "3 files changed" without recomputing a diff, and lets a person ask which.
   changed_files_json TEXT,
   failure_signature TEXT,
+  -- The tree this attempt's worktree was created from.
+  --
+  -- Distinct from jobs.base_sha, and the distinction is the whole point of managed revision: a
+  -- revising worker starts from the previous candidate so it corrects an implementation rather than
+  -- rewriting one from nothing, while candidate capture still measures the result against the
+  -- AUTHORIZED base. Without this column those two would have to be the same commit, and a revision
+  -- would either lose the prior work or produce a candidate that is not a complete net change from
+  -- what the operator authorized.
+  start_sha TEXT,
+  -- The exact text this worker was given, and its identity.
+  --
+  -- Stored as an artifact path plus a digest rather than inline: instructions carry whole evidence
+  -- packs and SQLite is the operational ledger, not a document store. The digest is what makes
+  -- "attempt 2 was told something different from attempt 1" a fact rather than a claim.
+  instruction_artifact TEXT,
+  instruction_digest TEXT,
+  -- What the worker said it did, as an immutable artifact. The candidate is what it actually did;
+  -- this is testimony, and the reviewer needs both to notice when they disagree.
+  result_text_artifact TEXT,
   UNIQUE(job_id, ordinal)
 );
 
@@ -195,6 +230,14 @@ CREATE TABLE IF NOT EXISTS work_proposals (
   mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
   action_digest TEXT NOT NULL,
   expected_state_version TEXT,
+  -- The integration head this proposal was written against.
+  --
+  -- expected_state_version alone hashes delegate-wave's own job rows, which says nothing about the
+  -- code. A proposal reasoned about repository version A could be authorized against version B with
+  -- the state version unchanged, and authorization resolves the branch head fresh -- so the system
+  -- would report that the world matched while the only world that matters had moved.
+  expected_base_sha TEXT,
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
   maximum_cost REAL,
   expires_at TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -336,6 +379,100 @@ CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
 BEFORE DELETE ON attempt_usage_receipts
 BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
 
+-- One strong-manager run per managed job.
+--
+-- Mutable on purpose, unlike almost everything else here: this is the run's live position in its
+-- state machine, and it is the row a reboot reads to discover where it was. The immutable history of
+-- what the manager actually did lives in manager_turns and in events.
+--
+-- The round counters are the bounded-authority invariant. Token accounting depends on what a
+-- provider chooses to report; a turn ceiling does not, so the scarce resource stays bounded even
+-- when its usage is UNKNOWN.
+CREATE TABLE IF NOT EXISTS manager_runs (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  status TEXT NOT NULL CHECK (status IN (
+    'PLANNING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING',
+    'ACCEPTED', 'AWAITING_HUMAN', 'FAILED', 'CANCELLED'
+  )),
+  model TEXT,
+  -- The manager's conversation identity with its provider. One managed job is one thread, so the
+  -- manager's own context is the provider's problem rather than something reassembled per turn.
+  thread_id TEXT,
+  exploration_round INTEGER NOT NULL DEFAULT 0,
+  revision_round INTEGER NOT NULL DEFAULT 0,
+  max_exploration_rounds INTEGER NOT NULL,
+  max_revision_rounds INTEGER NOT NULL,
+  max_turns INTEGER NOT NULL,
+  -- The child job currently carrying this run forward, if any.
+  active_child_job_id TEXT REFERENCES jobs(id),
+  last_candidate_attempt_id TEXT REFERENCES attempts(id),
+  -- Set when the manager escalated: the question a person actually has to answer.
+  escalation_question TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- One row per scarce-model call, recorded BEFORE the call is made.
+--
+-- Intent and result are separate states of the same row for the reason the Control API already
+-- established: a process that dies after an expensive call but before its response is durable must
+-- leave evidence that the call happened. Re-asking would be a second scarce call to answer a
+-- question that may already have been answered and paid for, which is precisely the resource this
+-- system exists to conserve.
+CREATE TABLE IF NOT EXISTS manager_turns (
+  id TEXT PRIMARY KEY,
+  manager_run_id TEXT NOT NULL REFERENCES manager_runs(id),
+  ordinal INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('PLAN', 'SYNTHESIS', 'REVIEW')),
+  state TEXT NOT NULL CHECK (state IN ('INTENDED', 'RUNNING', 'COMPLETED', 'FAILED', 'UNCERTAIN')),
+  model TEXT,
+  prompt_artifact TEXT,
+  response_artifact TEXT,
+  response_digest TEXT,
+  -- The parsed decision, small enough to live inline and the thing every later turn reads back.
+  action TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(manager_run_id, ordinal)
+);
+
+-- One immutable usage observation per manager turn.
+--
+-- Deliberately NOT attempt_usage_receipts. That table means one executor attempt, one observation,
+-- and widening it to cover a different kind of actor would make "cheap worker cost" and "scarce
+-- manager cost" indistinguishable in exactly the query the whole project is optimizing.
+--
+-- No reference_cost_usd column: the pricing bases price cheap-worker models against a common basis
+-- so two executors can be compared. A subscription-plan manager has no marginal token price, and
+-- inventing one would be the same fabrication the executor receipts refuse to make. Tokens and turns
+-- are what can honestly be reported, so tokens and turns are what is stored.
+CREATE TABLE IF NOT EXISTS manager_usage_receipts (
+  manager_turn_id TEXT PRIMARY KEY REFERENCES manager_turns(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  source TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  -- An UNKNOWN receipt carries no numbers. A manager whose provider reported nothing has unknown
+  -- cost, not zero cost, and the difference is the entire point of measuring the scarce side.
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+  )),
+  CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_update
+BEFORE UPDATE ON manager_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'manager_usage_receipts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_delete
+BEFORE DELETE ON manager_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'manager_usage_receipts is immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
 BEFORE UPDATE ON work_proposals
 BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END;
@@ -399,6 +536,8 @@ CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
 CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_rollbacks_proposal ON integration_rollbacks(proposal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_manager_turns_run ON manager_turns(manager_run_id, ordinal);
 `;
 
 export function initializeDataRoot(root) {
@@ -470,6 +609,17 @@ function migrate(db) {
   }
   if (!jobColumns.includes("capability_profile")) {
     db.exec("ALTER TABLE jobs ADD COLUMN capability_profile TEXT");
+  }
+  // Every job that predates the semantic layer really was a direct job: one worker, the goal as its
+  // instruction. Defaulting them to `direct` records history rather than rewriting it.
+  if (!jobColumns.includes("strategy")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN strategy TEXT NOT NULL DEFAULT 'direct'");
+  }
+  if (!jobColumns.includes("parent_job_id")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT REFERENCES jobs(id)");
+  }
+  if (!jobColumns.includes("internal_kind")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN internal_kind TEXT");
   }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   if (!attemptColumns.includes("changed_files_json")) {
