@@ -62,6 +62,18 @@ export class CodexAppServer {
     // Turn collectors awaiting a terminal signal. Held so a process exit can settle them as
     // UNCERTAIN rather than leaving them pending until their timeout.
     this.turns = new Set();
+    // One active turn per thread, enforced rather than multiplexed.
+    //
+    // Notifications carry a threadId, so turns on DIFFERENT threads separate cleanly. Two turns on
+    // the SAME thread do not: both collectors would match every notification and both would resolve
+    // on the first completion, each believing it had received its own answer. Two manager turns
+    // silently sharing one response is the most expensive possible failure here.
+    //
+    // Multiplexing by turnId is not the fix, because the turnId only arrives with the notifications
+    // being demultiplexed. The real observation is that the architecture never needs this: one
+    // managed job is one thread, and PLAN -> SYNTHESIS -> REVIEW -> REVIEW is inherently sequential.
+    // So the invariant is enforced at the door and the ambiguity cannot arise.
+    this.activeTurnByThread = new Map();
     this.buffer = "";
     this.stderr = "";
     this.closed = false;
@@ -227,6 +239,16 @@ export class CodexAppServer {
   // null. Null is not zero: a turn whose usage never arrived consumed real quota this process cannot
   // account for, and its receipt records UNKNOWN.
   async runTurn({ threadId, text, effort = null }) {
+    // Refused before `turn/start`, so a mistake costs nothing. Checked synchronously at entry: an
+    // await between the check and the claim would reopen the window it exists to close.
+    if (this.activeTurnByThread.has(threadId)) {
+      throw new Error(
+        `thread ${threadId} already has an active turn. A manager conversation runs one turn at a `
+        + "time; concurrent turns on one thread cannot be told apart from their notifications.",
+      );
+    }
+    this.activeTurnByThread.set(threadId, true);
+
     const collected = { text: null, usage: null, turnId: null, status: null, error: null };
     let settle = null;
     const terminal = new Promise((resolve, reject) => {
@@ -305,6 +327,7 @@ export class CodexAppServer {
       if (timer) clearTimeout(timer);
       remove();
       this.turns.delete(turn);
+      this.activeTurnByThread.delete(threadId);
     }
   }
 

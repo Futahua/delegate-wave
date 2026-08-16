@@ -122,18 +122,47 @@ test("a turn answered inline with a completed turn is a terminal signal", async 
   });
 });
 
-test("two concurrent turns each receive their own terminal signal", async (t) => {
-  // The single-slot listener this replaced would have let the second turn overwrite the first's
-  // collector, leaving the first waiting for notifications delivered to someone else.
+test("a second turn on the same thread is refused before it is ever started", async (t) => {
+  // Notifications identify a thread, not a turn, so two collectors on one thread both match
+  // everything and both resolve on the first completion -- each believing it received its own
+  // answer. Two manager turns silently sharing one response is the most expensive failure available
+  // here, and demultiplexing cannot fix it because the turn id arrives inside the very notifications
+  // being demultiplexed.
+  //
+  // The architecture never needs it: one managed job is one thread, and PLAN -> SYNTHESIS -> REVIEW
+  // is inherently sequential. So the ambiguity is refused at the door instead.
   await withServer(t, "delayed", {}, async (client, threadId) => {
-    const [first, second] = await Promise.all([
-      client.runTurn({ threadId, text: "one" }),
+    const first = client.runTurn({ threadId, text: "one" });
+    await assert.rejects(
       client.runTurn({ threadId, text: "two" }),
-    ]);
-    assert.equal(first.status, "completed");
-    assert.equal(second.status, "completed");
-    assert.ok(first.text && second.text);
+      /already has an active turn/,
+    );
+    const result = await first;
+    assert.equal(JSON.parse(result.text).reason, "one", "the first turn keeps its own answer");
+
+    // The refusal is not a permanent lock: the thread is usable again once the turn settles.
+    const next = await client.runTurn({ threadId, text: "three" });
+    assert.equal(JSON.parse(next.text).reason, "three");
   });
+});
+
+test("turns on different threads run concurrently and keep their own answers", async (t) => {
+  const client = server("two-threads");
+  t.after(async () => { await client.close(); });
+  await client.start();
+  const alpha = await client.startThread({ cwd: here });
+  const beta = await client.startThread({ cwd: here });
+  assert.notEqual(alpha, beta, "the fixture must issue genuinely distinct threads");
+
+  // Thread `alpha` is deliberately the slower one, so a client that confused the two would resolve
+  // it with beta's answer.
+  const [first, second] = await Promise.all([
+    client.runTurn({ threadId: alpha, text: "one" }),
+    client.runTurn({ threadId: beta, text: "two" }),
+  ]);
+  assert.equal(JSON.parse(first.text).reason, "one");
+  assert.equal(JSON.parse(second.text).reason, "two");
+  assert.notEqual(first.turnId, second.turnId);
 });
 
 test("delegate-wave control credentials are never inherited by the manager", async () => {

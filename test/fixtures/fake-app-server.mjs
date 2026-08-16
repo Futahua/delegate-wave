@@ -17,7 +17,15 @@ import readline from "node:readline";
 const scenario = process.env.DW_FAKE_SCENARIO;
 if (!scenario) process.exit(0);
 
-const THREAD = "thread-fake-1";
+// Threads and turns get genuinely distinct identities.
+//
+// An earlier version returned one fixed thread id and `turn-1` for every start, which made the
+// concurrency test unfalsifiable: two turns collecting the same notifications both resolved, and the
+// test saw two successes without ever proving they were different answers.
+let threadCounter = 0;
+let turnCounter = 0;
+const nextThread = () => `thread-fake-${++threadCounter}`;
+const nextTurn = () => `turn-${++turnCounter}`;
 
 function send(payload) { process.stdout.write(`${JSON.stringify(payload)}\n`); }
 function reply(id, result) { send({ jsonrpc: "2.0", id, result }); }
@@ -35,21 +43,23 @@ const usage = {
   },
 };
 
-const decision = JSON.stringify({ action: "ACCEPT", reason: "the candidate satisfies the objective" });
+// The reply echoes the prompt, so a test can prove WHICH turn's answer it received rather than only
+// that some answer arrived.
+const decision = (prompt) => JSON.stringify({ action: "ACCEPT", reason: prompt });
 
-async function completeTurn(turnId, { withMessage = true, withUsage = true } = {}) {
+async function completeTurn(threadId, turnId, prompt, { withMessage = true, withUsage = true } = {}) {
   // The gap that matters. A collector installed only around the turn/start round-trip sees none of
   // what follows.
   await sleep(40);
-  if (withUsage) notify("thread/tokenUsage/updated", { threadId: THREAD, turnId, tokenUsage: usage });
+  if (withUsage) notify("thread/tokenUsage/updated", { threadId, turnId, tokenUsage: usage });
   await sleep(10);
   if (withMessage) {
     notify("item/completed", {
-      threadId: THREAD, turnId, item: { id: "item-1", type: "agentMessage", text: decision },
+      threadId, turnId, item: { id: `item-${turnId}`, type: "agentMessage", text: decision(prompt) },
     });
   }
   await sleep(10);
-  notify("turn/completed", { threadId: THREAD, turn: { id: turnId, status: "completed", items: [] } });
+  notify("turn/completed", { threadId, turn: { id: turnId, status: "completed", items: [] } });
 }
 
 readline.createInterface({ input: process.stdin }).on("line", async (line) => {
@@ -60,24 +70,28 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
   const { id, method } = message;
 
   if (method === "initialize") return reply(id, { userAgent: "fake-app-server/0" });
-  if (method === "thread/start") return reply(id, { thread: { id: THREAD } });
-  if (method === "thread/resume") return reply(id, { thread: { id: THREAD } });
+  if (method === "thread/start") return reply(id, { thread: { id: nextThread() } });
+  if (method === "thread/resume") return reply(id, { thread: { id: message.params?.threadId ?? nextThread() } });
 
   if (method === "turn/start") {
-    const turnId = "turn-1";
+    const turnId = nextTurn();
+    // Every notification is tagged with the thread the client actually asked about, so two threads
+    // are genuinely separable rather than separable-looking.
+    const threadId = message.params?.threadId;
+    const prompt = message.params?.input?.[0]?.text ?? "";
 
     // Acceptance and completion are separate events, always.
     if (scenario === "delayed") {
       reply(id, { turn: { id: turnId } });
-      return completeTurn(turnId);
+      return completeTurn(threadId, turnId, prompt);
     }
     if (scenario === "no-message") {
       reply(id, { turn: { id: turnId } });
-      return completeTurn(turnId, { withMessage: false });
+      return completeTurn(threadId, turnId, prompt, { withMessage: false });
     }
     if (scenario === "no-usage") {
       reply(id, { turn: { id: turnId } });
-      return completeTurn(turnId, { withUsage: false });
+      return completeTurn(threadId, turnId, prompt, { withUsage: false });
     }
     // Accepted, then the process dies before saying anything terminal. The quota may already be gone.
     if (scenario === "die-after-accept") {
@@ -100,15 +114,22 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       notify("turn/completed", {
         threadId: "thread-someone-else", turn: { id: "turn-x", status: "completed", items: [] },
       });
-      return completeTurn(turnId);
+      return completeTurn(threadId, turnId, prompt);
+    }
+    // Two threads in flight together. Each thread's completion is delayed by a different amount, so
+    // a client that mixed them up would resolve with the other thread's answer.
+    if (scenario === "two-threads") {
+      reply(id, { turn: { id: turnId } });
+      await sleep(prompt === "one" ? 120 : 20);
+      return completeTurn(threadId, turnId, prompt);
     }
     // The turn really did finish, and it failed. That is a fact, not an uncertainty.
     if (scenario === "turn-failed") {
       reply(id, { turn: { id: turnId } });
       await sleep(20);
-      notify("thread/tokenUsage/updated", { threadId: THREAD, turnId, tokenUsage: usage });
+      notify("thread/tokenUsage/updated", { threadId, turnId, tokenUsage: usage });
       return notify("turn/completed", {
-        threadId: THREAD,
+        threadId,
         turn: { id: turnId, status: "failed", error: { message: "model refused" }, items: [] },
       });
     }
@@ -117,7 +138,7 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, {
         turn: {
           id: turnId, status: "completed",
-          items: [{ id: "item-1", type: "agentMessage", text: decision }],
+          items: [{ id: `item-${turnId}`, type: "agentMessage", text: decision(prompt) }],
         },
       });
     }
