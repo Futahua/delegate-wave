@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { initializeDataRoot, openDatabase, SCHEMA_VERSION } from "../src/db.js";
+import { managedPaths } from "../src/paths.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { runProcess } from "../src/process.js";
@@ -84,7 +85,11 @@ async function fixture() {
   initializeDataRoot(root);
 
   // Replace the fresh database with a genuine schema-18 one.
-  const databasePath = path.join(root, "state", "delegate-wave.db");
+  // The MANAGED path, not an invented one. An earlier version wrote its schema-18 fixture to
+  // state/delegate-wave.db while the Dispatcher opens state/delegate-wave.sqlite, so the "runs
+  // against a migrated database" test was quietly running against a fresh one and passing for the
+  // wrong reason.
+  const databasePath = managedPaths(root).database;
   for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${databasePath}${suffix}`, { force: true });
   const old = new DatabaseSync(databasePath);
   old.exec(SCHEMA_18);
