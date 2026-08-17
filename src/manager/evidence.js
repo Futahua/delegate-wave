@@ -134,7 +134,7 @@ export function buildPlanEvidence({ objective, baseSha, validationCommands, prot
 // Git is reached through the injected `diffCommits` so this module stays free of process spawning,
 // but the two commits it is given come from the attempt and its job, never from a caller.
 export async function buildReviewEvidence({
-  db, repoPath, attemptId, diffCommits, priorDecisions = [], budget = null,
+  db, attemptId, diffCommits, priorDecisions = [], budget = null,
 }) {
   if (!db) throw new Error("review evidence requires the database it reads from");
   if (!attemptId) throw new Error("review evidence requires the attempt it is about");
@@ -143,6 +143,16 @@ export async function buildReviewEvidence({
   if (!attempt) throw new Error(`Unknown attempt: ${attemptId}`);
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(attempt.job_id);
   if (!job) throw new Error(`Attempt ${attemptId} has no job`);
+  // The repository is DERIVED, never supplied.
+  //
+  // It was the last identifier still crossing this boundary, and it was the one that mattered most:
+  // a caller could pass attempt A with repository B and the pack would compute a diff between two
+  // commits in the wrong repository -- or, if those commits happened to exist there, a plausible
+  // diff of an entirely different change. Every other field was already keyed to the attempt, which
+  // made this the one remaining way to assemble a mixed-world review.
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(job.project_id);
+  if (!project) throw new Error(`Job ${job.id} has no project`);
+  const repoPath = project.repo_path;
 
   const validationRuns = db.prepare(
     "SELECT * FROM validation_runs WHERE attempt_id = ? ORDER BY started_at",
@@ -154,9 +164,24 @@ export async function buildReviewEvidence({
 
   // Computed from the attempt's own commit against its own job's authorized base. A caller cannot
   // substitute a different range.
+  // Computed from the attempt's own commit against its own job's authorized base.
+  //
+  // A failure to produce it is recorded rather than swallowed. An attempt that produced a candidate
+  // and whose diff cannot be established leaves the reviewer looking at filenames, and no semantic
+  // judgment about an implementation can be made from a list of paths -- "changed src/export.js" is
+  // equally consistent with the fix and with its opposite.
   let diff = null;
+  let diffState = "ABSENT";
   if (attempt.result_commit && diffCommits) {
-    diff = await diffCommits(repoPath, job.base_sha, attempt.result_commit);
+    try {
+      diff = await diffCommits(repoPath, job.base_sha, attempt.result_commit);
+      diffState = diff === null || diff === undefined ? "MISSING" : "PRESENT";
+    } catch (error) {
+      diffState = "CORRUPT";
+      diff = null;
+    }
+  } else if (attempt.result_commit) {
+    diffState = "MISSING";
   }
 
   const objective = job.goal;
@@ -194,6 +219,12 @@ export async function buildReviewEvidence({
   }
   if (changedFiles.state === "CORRUPT" || changedFiles.state === "MISSING") {
     unreadable.push({ evidence: "changed_files", state: changedFiles.state });
+  }
+  // A candidate exists, so its diff is load-bearing. Previously only the instruction and the changed
+  // file list were treated as required, which allowed evidence_complete to be true while
+  // candidate_diff was null -- an ACCEPT reached on filenames alone.
+  if (attempt.result_commit && diffState !== "PRESENT") {
+    unreadable.push({ evidence: "candidate_diff", state: diffState });
   }
 
   return {

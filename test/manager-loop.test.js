@@ -125,6 +125,39 @@ test("PLAN to IMPLEMENT to REVIEW to ACCEPT reaches integration-ready, and only 
   assert.equal(dispatcher.listApprovals(proposal.id).length, 0);
 });
 
+test("runJob never promotes a managed root, whatever happens afterwards", async (t) => {
+  // Sweep D1. The test below could not catch a bypass here: runJob would promote to
+  // READY_FOR_INTEGRATION, the manager would then halt, and halt() overwrites the status with
+  // NEEDS_ATTENTION -- erasing the dangerous state before any assertion could see it.
+  //
+  // So the promotion rule is checked where it lives, with no manager in the loop at all.
+  const { dispatcher, job } = await fixture(t, []);
+  await dispatcher.runJob(job.id, {
+    model: "opencode-go/deepseek-v4-flash", instruction: "implement it",
+  });
+
+  const attempt = dispatcher.status(job.id).attempts.at(-1);
+  assert.equal(attempt.terminal_state, "SUCCEEDED", "the dangerous state is real: the candidate passed");
+  assert.equal(attempt.validation_state, "PASSED");
+  assert.ok(attempt.result_commit);
+
+  // Deterministic success is not semantic acceptance. Only the coordinator may promote.
+  assert.equal(dispatcher.getJob(job.id).status, "RUNNING");
+  assert.notEqual(dispatcher.getJob(job.id).status, "READY_FOR_INTEGRATION");
+  await assert.rejects(
+    dispatcher.proposeIntegration({ jobId: job.id }),
+    /READY_FOR_INTEGRATION|no accepted candidate/,
+  );
+
+  // And the fact is durable, not merely a status.
+  assert.equal(
+    dispatcher.db.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE kind = 'CANDIDATE_AWAITING_REVIEW' AND entity_id = ?",
+    ).get(job.id).count,
+    1,
+  );
+});
+
 test("a validated candidate is NOT integration-ready before review", async (t) => {
   // The trap: READY_FOR_INTEGRATION means "validation passed" for direct work. If a managed root
   // inherited that, the operator could integrate a candidate the manager was about to reject.
@@ -252,6 +285,73 @@ test("an accepted attempt that is not the run's own is refused", async (t) => {
     dispatcher.proposeIntegration({ jobId: job.id }),
     /no completed REVIEW turn accepted that attempt|belongs to job/,
   );
+});
+
+test("review evidence derives its repository from the attempt, not from its caller", async (t) => {
+  // Sweep C1. Every other field was already keyed to the attempt; repoPath was the last identifier
+  // crossing the boundary, and therefore the last way to assemble a mixed-world review: attempt A
+  // with repository B produces either a failure or -- worse, if those commits happen to exist there
+  // -- a plausible diff of an entirely different change.
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    { action: "ACCEPT", reason: "ok" },
+  ]);
+  await service.advance(job.id);
+  const attempt = dispatcher.status(job.id).attempts.at(-1);
+
+  const { buildReviewEvidence } = await import("../src/manager/evidence.js");
+  const asked = [];
+  const pack = await buildReviewEvidence({
+    db: dispatcher.db,
+    attemptId: attempt.id,
+    // A caller trying to supply a repository has nowhere to put it: the parameter no longer exists.
+    repoPath: "D:/some/other/repository",
+    diffCommits: (repoPath, from, to) => { asked.push(repoPath); return "diff"; },
+  });
+
+  const expected = dispatcher.getProject(dispatcher.getJob(job.id).project_id).repo_path;
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0], expected, "the diff must be computed in the attempt's own repository");
+  assert.notEqual(asked[0], "D:/some/other/repository");
+  assert.equal(pack.subject_attempt_id, attempt.id);
+});
+
+test("a candidate whose diff cannot be established cannot be ACCEPTed", async (t) => {
+  // Sweep C2. evidence_complete required the instruction and the changed-file list, but not the
+  // diff -- so a write candidate could be accepted on filenames alone. "changed src/export.js" is
+  // equally consistent with the fix and with its opposite, and no semantic judgment survives that.
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    { action: "ACCEPT", reason: "looks right from the filenames" },
+  ]);
+
+  // Break only the diff. Instruction, changed files, validation and the candidate itself are intact.
+  const { git: realGit } = await import("../src/git.js");
+  const evidence = await import("../src/manager/evidence.js");
+  const pack = await evidence.buildReviewEvidence({
+    db: dispatcher.db,
+    attemptId: "unused",
+    diffCommits: async () => { throw new Error("object store unreadable"); },
+  }).catch(() => null);
+  assert.equal(pack, null, "an unknown attempt is refused outright");
+
+  await service.advance(job.id);
+  const attempt = dispatcher.status(job.id).attempts.at(-1);
+  assert.ok(attempt.result_commit, "the dangerous state needs a real candidate");
+
+  const broken = await evidence.buildReviewEvidence({
+    db: dispatcher.db,
+    attemptId: attempt.id,
+    diffCommits: async () => { throw new Error("object store unreadable"); },
+  });
+  assert.equal(broken.candidate_diff, null);
+  assert.equal(broken.evidence_complete, false, "a candidate with no readable diff is incomplete evidence");
+  assert.ok(broken.unreadable_evidence.some((item) => item.evidence === "candidate_diff"));
+
+  // And the rendered prompt tells the manager it cannot accept on this basis.
+  const rendered = evidence.renderEvidence(broken);
+  assert.match(rendered, /You cannot ACCEPT on this basis/);
+  assert.ok(realGit);
 });
 
 test("ACCEPT is refused when deterministic validation did not pass", async (t) => {

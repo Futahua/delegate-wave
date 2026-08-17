@@ -60,7 +60,62 @@ needed: the protection was already correct, only unproven.
 
 ---
 
-## Waves B–E
+## Waves B–D (partial)
+
+| # | Invariant | Mutation | Red | Finding |
+|---|---|---|---|---|
+| B1 | An interrupted manager turn becomes UNCERTAIN, never replayed | reconcile marks `FAILED` instead | **yes** | — |
+| B2 | A half-applied restore leaves a durable unhealthy marker | delete the `writeRestoreMarker` call | **yes** | — |
+| C1 | Review evidence is built from one attempt, in that attempt's repository | *(none — see finding)* | **NO** | **C1** |
+| C2 | A candidate with no readable diff cannot be ACCEPTed | *(none — see finding)* | **NO** | **C2** |
+| C3 | An unmeasured manager turn is not zero | drop the UNKNOWN branch from the summariser | **yes** | — |
+| D1 | `runJob` never promotes a managed root | `managedRoot = false` | **NO** | **D1** |
+| D2 | Everyday cost is the family's cost | `familySpend` → `jobSpend` | **yes** | — |
+
+### C1 — the repository still crossed the boundary
+
+`buildReviewEvidence()` derived attempt, job, validation, instruction and commit from `attemptId`,
+and then accepted `repoPath` from its caller. Normal execution passed the right one, so nothing was
+wrong in practice — but the API permitted **attempt A with repository B**, which produces either a
+failure or, if those commits happen to exist there, a plausible diff of an entirely different change.
+
+Fixed structurally: the repository is now derived `attemptId → job → project.repo_path`, and the
+parameter no longer exists. The guarding test passes a decoy path and asserts the diff was computed
+in the attempt's own repository.
+
+### C2 — ACCEPT was reachable on filenames alone
+
+`evidence_complete` treated the instruction and the changed-file list as load-bearing but not the
+candidate diff, so a write attempt could reach the manager with `candidate_diff: null` and
+`evidence_complete: true`. "changed src/export.js" is equally consistent with the fix and with its
+opposite; no semantic judgment survives that.
+
+A candidate's diff is now required whenever `result_commit` exists, with ABSENT / MISSING / CORRUPT
+distinguished, and the rendered prompt tells the manager it cannot accept on that basis.
+
+### D1 — the existing test could not observe the bypass
+
+Setting `managedRoot = false` — promoting a managed root the moment validation passes, with no
+semantic review — left all 20 manager tests green.
+
+The reason is the same shape as A3, one level further out. *"A validated candidate is NOT
+integration-ready before review"* drives the loop until the manager fails at REVIEW, and `halt()`
+then sets the job to `NEEDS_ATTENTION`. So `runJob` promoted, the halt overwrote it, and the
+assertion inspected a status that had already been corrected. **The dangerous state existed and was
+erased before it could be seen.**
+
+Closed by checking the promotion rule where it lives, with no manager in the loop at all: run a
+managed root's attempt directly, assert the candidate genuinely passed, then assert the job is
+`RUNNING`, that integration is refused, and that `CANDIDATE_AWAITING_REVIEW` was recorded.
+
+### A methodological note
+
+D2 first appeared as a finding and was not one: the mutation string had failed to match, so nothing
+was actually broken and the green result meant nothing. **Every mutation must assert that it
+applied** before its result is interpreted — a mutation that silently no-ops manufactures false
+confidence in exactly the direction the sweep is trying to remove.
+
+## Waves C4, E and loaded runs
 
 Pending.
 
