@@ -107,31 +107,48 @@ export function assessExperimentalCondition(record, expected = {}) {
     reasons.push(`runtime provenance is CONTRADICTED: ${record.detail ?? "observation disagrees with configuration"}`);
   }
 
+  // `requested` explains INTENT and never satisfies a condition.
+  //
+  // Falling back to it would let a sample pass because delegate-wave asked for something, with no
+  // evidence it was ever applied -- which is the precise failure this module exists to prevent,
+  // committed by the module itself. Observed supersedes applied for the dimension it independently
+  // establishes; below that there is nothing, and nothing means invalid.
+  const established = (dimension, { observable = false } = {}) => (
+    observable ? (record[`observed_${dimension}`] ?? record[`applied_${dimension}`]) : record[`applied_${dimension}`]
+  );
+  const unestablished = (dimension, requested) => (
+    `${dimension} cannot be established from runtime evidence`
+    + `${present(requested) ? ` (only the requested value ${requested} is known)` : ""}`
+  );
+
   if (expected.executor) {
-    const actual = record.applied_executor ?? record.requested_executor;
-    if (actual !== expected.executor) {
-      // A fallback is a different capability condition, not a degraded version of the same one:
-      // Harness `trusted` has a shell and OpenCode does not. Pooling them would compare two things.
-      reasons.push(`executor was ${actual ?? "unknown"}; the protocol requires ${expected.executor}`);
+    // A fallback executor is a different capability condition, not a degraded version of the same
+    // one: Harness `trusted` has a shell and OpenCode does not. Pooling them would compare two
+    // things.
+    const actual = established("executor");
+    if (!present(actual)) reasons.push(unestablished("executor", record.requested_executor));
+    else if (actual !== expected.executor) {
+      reasons.push(`executor was ${actual}; the protocol requires ${expected.executor}`);
     }
   }
   if (expected.capabilityProfile) {
-    const actual = record.applied_capability_profile ?? record.requested_capability_profile;
-    if (actual !== expected.capabilityProfile) {
-      reasons.push(`capability profile was ${actual ?? "unknown"}; the protocol requires ${expected.capabilityProfile}`);
+    const actual = established("capability_profile");
+    if (!present(actual)) reasons.push(unestablished("capability profile", record.requested_capability_profile));
+    else if (actual !== expected.capabilityProfile) {
+      reasons.push(`capability profile was ${actual}; the protocol requires ${expected.capabilityProfile}`);
     }
   }
   if (expected.model) {
-    const observed = bareModel(record.observed_model);
-    const applied = bareModel(record.applied_model ?? record.requested_model);
+    const actual = bareModel(established("model", { observable: true }));
     const wanted = bareModel(expected.model);
-    if (applied !== wanted) reasons.push(`model was ${applied ?? "unknown"}; the protocol requires ${wanted}`);
-    else if (observed && observed !== wanted) reasons.push(`the runtime served ${observed}, not ${wanted}`);
+    if (!present(actual)) reasons.push(unestablished("model", record.requested_model));
+    else if (actual !== wanted) reasons.push(`model was ${actual}; the protocol requires ${wanted}`);
   }
   if (expected.effort) {
-    const actual = record.applied_effort ?? record.requested_effort;
-    if (actual !== expected.effort) {
-      reasons.push(`reasoning effort was ${actual ?? "unknown"}; the protocol requires ${expected.effort}`);
+    const actual = established("effort", { observable: true });
+    if (!present(actual)) reasons.push(unestablished("reasoning effort", record.requested_effort));
+    else if (actual !== expected.effort) {
+      reasons.push(`reasoning effort was ${actual}; the protocol requires ${expected.effort}`);
     }
   }
 

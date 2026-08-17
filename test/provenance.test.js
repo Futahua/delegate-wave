@@ -244,6 +244,93 @@ test("the capability profile recorded is the one the backend composed", async (t
   );
 });
 
+test("a second, contradictory receipt cannot overwrite the first", async (t) => {
+  // The table carries immutability triggers, but the writer used INSERT OR REPLACE. SQLite resolves
+  // a primary-key collision by deleting and re-inserting, and does not fire delete triggers for that
+  // unless recursive_triggers is on -- so the guarantee the reader trusts was watching a receipt get
+  // rewritten and saying nothing.
+  const { service, project } = await fixture(t, backendWithProvenance({
+    appliedModel: "deepseek-v4-pro", appliedExecutor: "harness", appliedSource: "harness-profile-patch",
+  }));
+  const attempt = await runOnce(service, project);
+  const first = service.getRuntimeProvenance(attempt.id);
+  assert.equal(first.applied_executor, "harness");
+
+  service.recordRuntimeProvenance({
+    attemptId: attempt.id,
+    model: "opencode-go/deepseek-v4-flash",
+    backend: { constructor: { name: "OpenCodeBackend" } },
+    selection: { selected: "opencode" },
+    backendResult: { provenance: { appliedModel: "deepseek-v4-flash", appliedExecutor: "opencode" } },
+    requestedProfile: null,
+  });
+
+  const after = service.getRuntimeProvenance(attempt.id);
+  assert.deepEqual(after, first, "the first account of what ran must survive intact");
+  // The disagreement is not discarded either; it becomes evidence of its own.
+  assert.equal(
+    service.db.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE kind = 'PROVENANCE_CONFLICT' AND entity_id = ?",
+    ).get(attempt.id).count,
+    1,
+  );
+});
+
+test("a requested value never satisfies an experimental condition on its own", async (t) => {
+  // The module's own rule, previously broken by the module itself: assess fell back to `requested`
+  // when `applied` was absent, so a condition could pass because delegate-wave ASKED for something
+  // with no evidence it was ever applied.
+  const { service, project } = await fixture(t, backendWithProvenance({
+    // The backend reports nothing it can prove.
+  }, { profile: "trusted", effort: "high" }));
+  const attempt = await runOnce(service, project, "opencode-go/deepseek-v4-pro");
+  const record = service.getRuntimeProvenance(attempt.id);
+
+  // Intent was recorded, which is right: it explains what we were trying to do.
+  assert.equal(record.requested_model, "opencode-go/deepseek-v4-pro");
+  assert.equal(record.requested_effort, "high");
+  assert.equal(record.requested_capability_profile, "trusted");
+  // But nothing was established.
+  assert.equal(record.applied_model, null);
+  assert.equal(record.applied_effort, null);
+
+  for (const expected of [
+    { capabilityProfile: "trusted" },
+    { model: "deepseek-v4-pro" },
+    { effort: "high" },
+  ]) {
+    const verdict = service.assessExperimentalCondition(attempt.id, expected);
+    assert.equal(verdict.valid, false, `${JSON.stringify(expected)} must not pass on intent alone`);
+    assert.ok(
+      verdict.reasons.some((reason) => /cannot be established from runtime evidence/.test(reason)),
+      `expected an unestablished reason, got: ${verdict.reasons.join("; ")}`,
+    );
+  }
+
+  // The executor is the one dimension the DISPATCHER can prove without the backend's help: it
+  // constructed that object and called it. So it is established -- as FakeBackend -- and the
+  // condition fails because it is the wrong executor, not because nothing is known.
+  const executorVerdict = service.assessExperimentalCondition(attempt.id, { executor: "harness" });
+  assert.equal(executorVerdict.valid, false);
+  assert.ok(executorVerdict.reasons.some((reason) => /executor was FakeBackend/.test(reason)));
+});
+
+test("observed evidence can establish a dimension that applied evidence missed", async (t) => {
+  // The one direction the hierarchy allows: observation supersedes a missing applied value for the
+  // exact dimension it independently establishes.
+  const { service, project } = await fixture(t, backendWithProvenance({
+    appliedExecutor: "harness", appliedSource: "harness-profile-patch",
+    observedModel: "deepseek-v4-pro", observedSource: "provider-report",
+  }));
+  const attempt = await runOnce(service, project);
+  assert.equal(service.getRuntimeProvenance(attempt.id).applied_model, null);
+  assert.equal(
+    service.assessExperimentalCondition(attempt.id, { model: "deepseek-v4-pro" }).valid,
+    true,
+    "an independently observed model establishes the model",
+  );
+});
+
 test("status derivation is a pure function of what is known", () => {
   const base = { requested_model: "m", requested_effort: "high", applied_model: "m", applied_effort: "high" };
   assert.equal(deriveProvenanceStatus({ ...base }).status, PROVENANCE_STATUS.UNVERIFIED);

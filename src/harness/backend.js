@@ -393,9 +393,14 @@ export class HarnessBackend {
       ...result, stdoutPath, stderrPath,
       sessionLogPath: this.sessionLogPath(artifactDir),
       capabilityProfile: this.profile,
-      // The strongest LOCAL provenance available: delegate-wave builds this patch itself, so the
-      // wire model, reasoning effort and capability profile it composed are mechanically known
-      // rather than assumed. `harness-profile-patch` names that evidence.
+      // The strongest LOCAL provenance available, and precisely bounded: delegate-wave writes this
+      // patch itself, so what it SUPPLIED TO HARNESS AT LAUNCH is mechanically known.
+      //
+      // Not "composed". This file already documents that the loader skips patch entries it does not
+      // accept and merely warns -- which is exactly why assertFenceComposed() exists for the fenced
+      // profile. Without a config dump or runtime evidence, the patch proves the invocation, not
+      // that every entry survived composition. `harness-profile-patch` names that weaker claim
+      // honestly; a `--dump-config` run would be needed to name the stronger one.
       //
       // Every field is APPLIED, never observed. The session log is parsed for usage and for the
       // turn/end marker and reports no model identity, so nothing here may claim what DeepSeek

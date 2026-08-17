@@ -548,9 +548,11 @@ CREATE TABLE IF NOT EXISTS attempt_runtime_provenance (
   requested_effort TEXT,
   requested_executor TEXT,
   requested_capability_profile TEXT,
-  -- What the local executor can mechanically prove it composed or launched: a dumped Harness
-  -- configuration, the argv a CLI was invoked with. Strong evidence that intent reached the runtime;
-  -- no evidence whatsoever about what a remote provider then served.
+  -- What the local executor can mechanically prove it SUPPLIED AT LAUNCH: the patch delegate-wave
+  -- wrote, the argv a CLI was invoked with. Strong evidence that intent reached the runtime, and no
+  -- evidence whatsoever about what a remote provider then served -- nor, without a config dump, that
+  -- every entry survived the runtime's own composition, since Harness skips entries it rejects and
+  -- only warns.
   applied_model TEXT,
   applied_effort TEXT,
   applied_executor TEXT,

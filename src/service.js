@@ -1153,8 +1153,30 @@ export class Dispatcher {
       observed_source: reported.observedSource ?? null,
     };
     const { status, detail } = deriveProvenanceStatus(record);
+
+    // Plain INSERT, never INSERT OR REPLACE.
+    //
+    // REPLACE resolves a primary-key collision by deleting the existing row and inserting the new
+    // one, and SQLite does not fire delete triggers for that unless recursive_triggers is on -- so
+    // the immutability triggers on this table would have watched a receipt be overwritten and said
+    // nothing. An "immutable" receipt that a second call silently rewrites is worse than a mutable
+    // one, because the guarantee is what the reader trusts.
+    const existing = this.getRuntimeProvenance(attemptId);
+    if (existing) {
+      const differs = Object.keys(record).some((key) => (existing[key] ?? null) !== (record[key] ?? null));
+      if (differs) {
+        // Two different accounts of what ran. Neither is discarded and neither wins: the first
+        // stands, and the disagreement itself becomes evidence.
+        recordEvent(this.db, {
+          kind: "PROVENANCE_CONFLICT", entityType: "attempt", entityId: attemptId,
+          payload: { recorded: existing, rejected: { ...record, status, detail } },
+        });
+      }
+      return existing;
+    }
+
     try {
-      this.db.prepare(`INSERT OR REPLACE INTO attempt_runtime_provenance(
+      this.db.prepare(`INSERT INTO attempt_runtime_provenance(
         attempt_id, requested_model, requested_effort, requested_executor, requested_capability_profile,
         applied_model, applied_effort, applied_executor, applied_capability_profile, applied_source,
         observed_model, observed_effort, observed_source, status, detail, created_at
