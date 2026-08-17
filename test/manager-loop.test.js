@@ -191,6 +191,69 @@ test("REVISE produces a second attempt from the first candidate, and only it is 
   assert.notEqual(proposal.attempt_id, first.id);
 });
 
+test("a later PASSED attempt cannot displace the accepted one", async (t) => {
+  // Sweep finding: replacing acceptedCandidate() with "the latest PASSED attempt" left every test
+  // green, because in every existing scenario the accepted attempt IS the latest. The invariant is
+  // that acceptance names one exact attempt, and that identity must survive another candidate
+  // appearing afterwards -- a late-settling worker, a stale scheduler, a bug elsewhere. Without this
+  // the operator could be handed a candidate no manager ever reviewed.
+  const received = [];
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "first pass", brief: BRIEF() },
+    { action: "ACCEPT", reason: "this one solves it" },
+  ], { received });
+
+  await service.advance(job.id);
+  const accepted = service.getRun(job.id).accepted_attempt_id;
+  const first = dispatcher.status(job.id).attempts.at(-1);
+  assert.equal(accepted, first.id);
+
+  // A second attempt appears afterwards and also passes. Nothing reviewed it.
+  const project = dispatcher.getProject(dispatcher.getJob(job.id).project_id);
+  dispatcher.db.prepare(`INSERT INTO attempts(
+    id, job_id, ordinal, scheduler_epoch, backend, model, started_at, finished_at,
+    terminal_state, validation_state, result_commit, start_sha
+  ) VALUES (?, ?, 2, ?, 'FakeBackend', 'm', ?, ?, 'SUCCEEDED', 'PASSED', ?, ?)`).run(
+    `${job.id}.2`, job.id, dispatcher.schedulerGeneration(),
+    new Date().toISOString(), new Date().toISOString(),
+    first.result_commit, dispatcher.getJob(job.id).base_sha,
+  );
+
+  const later = dispatcher.db.prepare(
+    "SELECT * FROM attempts WHERE job_id = ? AND validation_state = 'PASSED' ORDER BY ordinal DESC LIMIT 1",
+  ).get(job.id);
+  assert.equal(later.id, `${job.id}.2`, "the dangerous state is real: a newer PASSED attempt exists");
+  assert.notEqual(later.id, accepted);
+
+  // The proposal must still name the reviewed attempt, not the newest one.
+  const proposal = await dispatcher.proposeIntegration({ jobId: job.id });
+  assert.equal(proposal.attempt_id, accepted, "only the attempt a REVIEW turn accepted may be offered");
+  assert.notEqual(proposal.attempt_id, later.id);
+  assert.ok(project);
+});
+
+test("an accepted attempt that is not the run's own is refused", async (t) => {
+  // The foreign key proves the subject is an attempt; it does not prove whose. A run pointed at
+  // another job's attempt must not be able to offer it.
+  const { dispatcher, service, project, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    { action: "ACCEPT", reason: "ok" },
+  ]);
+  await service.advance(job.id);
+
+  const other = await dispatcher.createJob({ projectId: project.id, goal: "someone else's work" });
+  await dispatcher.runJob(other.id, { model: "opencode-go/deepseek-v4-flash" });
+  const foreign = dispatcher.status(other.id).attempts.at(-1);
+
+  const run = service.getRun(job.id);
+  dispatcher.db.prepare("UPDATE manager_runs SET accepted_attempt_id = ? WHERE id = ?").run(foreign.id, run.id);
+
+  await assert.rejects(
+    dispatcher.proposeIntegration({ jobId: job.id }),
+    /no completed REVIEW turn accepted that attempt|belongs to job/,
+  );
+});
+
 test("ACCEPT is refused when deterministic validation did not pass", async (t) => {
   // A failing worker, then a manager that accepts anyway. Semantic acceptance cannot substitute for
   // mechanical truth, so the run halts rather than promoting.
