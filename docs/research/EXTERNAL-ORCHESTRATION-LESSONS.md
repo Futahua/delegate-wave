@@ -67,6 +67,32 @@ Relevant files:       skill-guides/orca-cli.md, skills/orchestration/SKILL.md
    `worker_done`, ask/reply, decision gates, coordinator loops, task DAGs — are named there and
    specified only there. Orca is not installed on this machine, so those contracts were not read.
 
+5. **Model and effort provenance is unproven, by Orca's own account.** Issue #10846 (OPEN, read
+   2026-08-17) is the concern that maps most directly onto what delegate-wave exists to establish:
+
+   > `applyAgentSessionOptionLaunch` ... returns early when the model is not in the seed, so a
+   > requested effort simply vanishes from the launch args ... A caller that asked for `xhigh` cannot
+   > tell it launched at the default.
+
+   On the catalog itself, after drift from the live API: it *"simultaneously offers an invalid choice
+   and hides a valid one."* The issue states the general rule outright — *"a requested flag is not
+   proof of the active model"* — and says there is currently no mechanism to satisfy it beyond
+   reading terminal banners.
+
+   This matters more than it first looks. `attempts.model` and `attempts.capability_profile` are
+   recorded as **evidence of what ran**, and every cost figure, pricing basis and executor comparison
+   is keyed to them. Under a runtime that cannot report what it applied, those columns quietly become
+   records of what was *requested* — the same manufactured provenance as writing `codex-default` into
+   a model column, which this project has already had to remove once.
+
+   It is not a reason to reject Orca. It is a precise statement of the boundary: **if Orca becomes the
+   runtime, delegate-wave keeps owning launch provenance**, or its cost accounting describes
+   intentions rather than events.
+
+   (Issue #7748 — `ok:true` reported when a prompt had not reached the target TUI — was cited as
+   closed-as-completed. GitHub's API returned 503 during this check, so that status is **unverified
+   here** and is not relied on in either direction.)
+
 **Decision.** The `AgentRuntime` seam stays, because the seam is cheap and the reason for it is
 sound. `OrcaRuntime` is not written. A first draft *was* written against guessed commands
 (`orca agent start --instruction-file`, `worktree create --ref <sha> --path`) and every one of them
