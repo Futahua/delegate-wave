@@ -23,7 +23,7 @@ import path from "node:path";
 import { recordEvent, transaction } from "../db.js";
 import { git } from "../git.js";
 import {
-  MANAGER_LIMITS, instructionDigest, parseManagerDecision, renderBrief,
+  MANAGER_LIMITS, instructionDigest, parseManagerDecision, renderBrief, renderExploration,
 } from "./contracts.js";
 import { buildPlanEvidence, buildReviewEvidence, renderEvidence } from "./evidence.js";
 import { observeManagerUsage } from "./backend.js";
@@ -210,6 +210,16 @@ export class ManagerService {
     const job = this.dispatcher.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (job.strategy !== "managed") throw new Error(`Job ${jobId} is a ${job.strategy} job`);
+
+    // The authorized-base guard must fire HERE, not only before the root's own first attempt.
+    //
+    // A managed run buys exploration before it implements anything, and those children skip the
+    // guard by design because they inherit a base rather than being independently authorized. So the
+    // root's first-attempt check would fire only after the family had already spent money
+    // investigating a world the implementation is then refused permission to touch. Checked once, at
+    // the entry to any paid activity.
+    await this.dispatcher.assertAuthorizedBaseIntact(job, this.dispatcher.getProject(job.project_id));
+
     let run = await this.ensureRun(jobId);
 
     try {
@@ -218,6 +228,7 @@ export class ManagerService {
         run = this.getRun(jobId);
         if (["ACCEPTED", "AWAITING_HUMAN", "FAILED", "CANCELLED"].includes(run.status)) break;
         if (run.status === "PLANNING") await this.plan(run);
+        else if (run.status === "EXPLORING") await this.explore(run);
         else if (run.status === "IMPLEMENTING") await this.implement(run);
         else if (run.status === "REVIEWING") await this.review(run);
         else break;
@@ -266,10 +277,185 @@ export class ManagerService {
     if (decision.action === "ESCALATE") {
       throw new ManagerStop(decision.reason, "ESCALATED", decision.question);
     }
-    // EXPLORE and RETHINK at PLAN both mean "I need facts first". Exploration is a later lane, so
-    // the run stops here rather than silently implementing without the investigation it asked for.
+    if (decision.action === "EXPLORE" || decision.action === "RETHINK") {
+      return this.openExplorationRound(run, decision.explorations, decision.reason);
+    }
     throw new ManagerStop(
-      `the manager answered ${decision.action} during planning, which this build cannot yet perform: ${decision.reason}`,
+      `the manager answered ${decision.action} during planning: ${decision.reason}`,
+      "UNSUPPORTED",
+    );
+  }
+
+  // Commits to an exploration round BEFORE any of its work is bought.
+  //
+  // The ordering is the whole point. If the round were recorded after launching the first child, a
+  // crash in between would leave children with no round that owns them, and recovery would open the
+  // round again and pay for the same investigations twice. Persisting first means the worst case is
+  // a round that exists with no children yet, which is simply resumed.
+  openExplorationRound(run, explorations, reason) {
+    if (!explorations.length) {
+      // RETHINK may legitimately arrive with no questions: the manager wants to re-plan rather than
+      // re-investigate. Nothing to buy, so go straight back to planning.
+      transaction(this.db, () => {
+        this.setRun(run.id, { status: "PLANNING", last_candidate_attempt_id: null });
+        recordEvent(this.db, {
+          kind: "MANAGER_REPLAN", entityType: "job", entityId: run.job_id,
+          payload: { runId: run.id, reason },
+        });
+      });
+      return;
+    }
+    const round = run.exploration_round + 1;
+    if (round > run.max_exploration_rounds) {
+      throw new ManagerStop(
+        `the manager asked for exploration round ${round} but only ${run.max_exploration_rounds} are permitted`,
+        "EXPLORATION_LIMIT",
+      );
+    }
+    this.writeRoundPlan(run, round, explorations);
+    transaction(this.db, () => {
+      this.setRun(run.id, {
+        exploration_round: round, status: "EXPLORING", last_candidate_attempt_id: null,
+      });
+      recordEvent(this.db, {
+        kind: "MANAGER_EXPLORATION_REQUESTED", entityType: "job", entityId: run.job_id,
+        payload: { runId: run.id, round, questions: explorations.map((item) => item.question), reason },
+      });
+    });
+  }
+
+  roundPlanPath(run, round) {
+    return path.join(this.dispatcher.paths.artifacts, "manager", run.id, `explorations-${round}.json`);
+  }
+
+  writeRoundPlan(run, round, explorations) {
+    const target = this.roundPlanPath(run, round);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify(explorations, null, 2));
+  }
+
+  readRoundPlan(run, round) {
+    const target = this.roundPlanPath(run, round);
+    if (!fs.existsSync(target)) throw new ManagerStop(`exploration round ${round} has no recorded plan`, "NO_PLAN");
+    return JSON.parse(fs.readFileSync(target, "utf8"));
+  }
+
+  // Runs this round's investigations, then synthesizes them.
+  //
+  // Serial on purpose. Family budget admission sums SETTLED receipts, so three children started
+  // together would each observe the same spend and could collectively exceed one ceiling. Running
+  // them one at a time proves the semantic algorithm without reopening that race; parallelism waits
+  // for atomic admission.
+  async explore(run) {
+    const job = this.dispatcher.getJob(run.job_id);
+    const round = run.exploration_round;
+    const plan = this.readRoundPlan(run, round);
+
+    for (const exploration of plan) {
+      // Resumable by identity rather than by position: a child is found by the question it was
+      // created for, so a crash between creating a child and recording anything about it resumes
+      // rather than commissioning the same investigation twice.
+      let child = this.db.prepare(
+        "SELECT * FROM jobs WHERE parent_job_id = ? AND internal_kind = 'MANAGER_EXPLORATION' AND goal = ?",
+      ).get(run.job_id, exploration.question);
+
+      if (!child) {
+        child = await this.dispatcher.createJob({
+          projectId: job.project_id,
+          goal: exploration.question,
+          mode: "read",
+          maxAttempts: 1,
+          parentJobId: run.job_id,
+          internalKind: "MANAGER_EXPLORATION",
+        });
+      }
+      // Already finished on an earlier pass; do not pay for it again.
+      if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(child.status)) continue;
+
+      const instruction = renderExploration({ objective: job.goal, exploration });
+      try {
+        await this.dispatcher.runJob(child.id, { model: this.workerModel, instruction });
+      } catch (error) {
+        // A failed investigation is a fact the synthesis turn must be told, not a reason to abandon
+        // the round. It becomes an UNKNOWN report below.
+        recordEvent(this.db, {
+          kind: "MANAGER_EXPLORATION_FAILED", entityType: "job", entityId: run.job_id,
+          payload: { runId: run.id, round, childJobId: child.id, error: String(error?.message ?? error) },
+        });
+      }
+    }
+
+    return this.synthesize(run, round, plan);
+  }
+
+  // Reads each investigation's report back from its own attempt artifact.
+  //
+  // From disk, not from an in-memory string the worker happened to return: the report has to survive
+  // a reboot, and it has to be attributable to one exact child attempt. A missing or unreadable
+  // report is reported as UNKNOWN rather than as an empty answer, because "we could not find out"
+  // and "there is nothing there" lead the manager to opposite conclusions.
+  collectReports(run, plan) {
+    return plan.map((exploration) => {
+      const child = this.db.prepare(
+        "SELECT * FROM jobs WHERE parent_job_id = ? AND internal_kind = 'MANAGER_EXPLORATION' AND goal = ?",
+      ).get(run.job_id, exploration.question);
+      if (!child) return { question: exploration.question, state: "NOT_RUN", answer: null, jobId: null };
+
+      const attempt = this.db.prepare(
+        "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+      ).get(child.id);
+      if (!attempt) return { question: exploration.question, state: "NOT_RUN", answer: null, jobId: child.id };
+      if (attempt.terminal_state !== "SUCCEEDED") {
+        return {
+          question: exploration.question, state: "FAILED", answer: null, jobId: child.id,
+          detail: attempt.failure_signature ?? this.dispatcher.lastFailureReason(child.id),
+        };
+      }
+      if (!attempt.result_text_artifact || !fs.existsSync(attempt.result_text_artifact)) {
+        return { question: exploration.question, state: "UNKNOWN", answer: null, jobId: child.id };
+      }
+      try {
+        return {
+          question: exploration.question,
+          state: "PRESENT",
+          answer: fs.readFileSync(attempt.result_text_artifact, "utf8"),
+          jobId: child.id,
+          attemptId: attempt.id,
+        };
+      } catch {
+        return { question: exploration.question, state: "CORRUPT", answer: null, jobId: child.id };
+      }
+    });
+  }
+
+  async synthesize(run, round, plan) {
+    const job = this.dispatcher.getJob(run.job_id);
+    const project = this.dispatcher.getProject(job.project_id);
+    const reports = this.collectReports(run, plan);
+    const pack = buildPlanEvidence({
+      objective: job.goal,
+      baseSha: job.base_sha,
+      validationCommands: JSON.parse(project.validation_json || "[]"),
+      protectedPaths: JSON.parse(project.protected_json || "[]"),
+      explorations: reports,
+    });
+
+    // SYNTHESIS rather than a second PLAN. The turn ledger exists to say what scarce budget was
+    // spent on, and "deciding what to investigate" and "deciding what to build given findings" are
+    // different questions at the same price.
+    const { decision } = await this.runTurn(run, { phase: "SYNTHESIS", prompt: renderEvidence(pack) });
+
+    if (decision.action === "IMPLEMENT") {
+      this.storeBrief(run, decision.brief);
+      this.setRun(run.id, { status: "IMPLEMENTING" });
+      return;
+    }
+    if (decision.action === "ESCALATE") throw new ManagerStop(decision.reason, "ESCALATED", decision.question);
+    if (decision.action === "EXPLORE" || decision.action === "RETHINK") {
+      return this.openExplorationRound(this.getRun(run.job_id), decision.explorations, decision.reason);
+    }
+    throw new ManagerStop(
+      `the manager answered ${decision.action} after synthesizing round ${round}: ${decision.reason}`,
       "UNSUPPORTED",
     );
   }
@@ -423,23 +609,21 @@ export class ManagerService {
     this.storeBrief(this.getRun(run.job_id), decision.brief);
   }
 
-  // The diagnosis was wrong, so correcting the code cannot help. Returns to planning rather than
-  // spending another implementation attempt executing a plan already known to be broken.
+  // The diagnosis was wrong, so correcting the code cannot help.
+  //
+  // Any investigations the manager attached are honoured directly rather than discarded. Throwing
+  // them away and returning to PLANNING would spend a second scarce turn asking for the questions it
+  // just asked for -- the manager pays to repeat itself, and the round it already reasoned about is
+  // lost. The contract allows RETHINK to carry explorations precisely so this does not happen.
   rethink(run, decision) {
-    if (run.exploration_round + 1 > run.max_exploration_rounds) {
-      throw new ManagerStop("the manager asked to rethink beyond its planning rounds", "EXPLORATION_LIMIT");
-    }
-    transaction(this.db, () => {
-      this.setRun(run.id, {
-        exploration_round: run.exploration_round + 1,
-        status: "PLANNING",
-        last_candidate_attempt_id: null,
-      });
-      recordEvent(this.db, {
-        kind: "MANAGER_RETHINK", entityType: "job", entityId: run.job_id,
-        payload: { runId: run.id, reason: decision.reason },
-      });
+    recordEvent(this.db, {
+      kind: "MANAGER_RETHINK", entityType: "job", entityId: run.job_id,
+      payload: {
+        runId: run.id, reason: decision.reason,
+        questions: decision.explorations.map((item) => item.question),
+      },
     });
+    return this.openExplorationRound(run, decision.explorations, decision.reason);
   }
 
   // What a reboot makes of an interrupted run.

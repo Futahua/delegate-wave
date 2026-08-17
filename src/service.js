@@ -197,7 +197,19 @@ export class Dispatcher {
       throw new Error("An internal job requires a parent job");
     }
 
-    const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
+    // A child inherits its parent's authorized world; it does not resolve its own.
+    //
+    // Resolving the branch fresh for a child is a mixed-world bug with a plausible face: the root is
+    // authorized against A, the branch moves to B, and an investigation commissioned to inform work
+    // on A comes back describing B. The manager then writes a brief for a repository that is not the
+    // one being changed, and every individual step looks correct.
+    //
+    // This is also the premise assertAuthorizedBaseIntact() relies on when it skips children: they
+    // are not independently authorized, so there is nothing of their own to re-check.
+    const parent = parentJobId ? this.getJob(parentJobId) : null;
+    const baseSha = parent
+      ? parent.base_sha
+      : await resolveRevision(project.repo_path, project.integration_branch);
     // Validated at creation, so an unusable profile is refused when the job is described rather
     // than discovered when a worker is about to run.
     if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
@@ -820,6 +832,20 @@ export class Dispatcher {
       const snapshot = await snapshotCandidate(worktreePath, job.base_sha, artifactDir);
       const files = snapshot.files;
       this.assertAllowedDiff(files, parseJson(project.protected_json));
+
+      // A read investigation that modified the tree is a failed investigation.
+      //
+      // Read mode previously just ignored whatever a worker left behind, because nothing downstream
+      // consumed it. Once a manager reasons from these reports that stops being harmless: an
+      // investigation that edited the code is describing a repository state that no longer matches
+      // the one the eventual implementation will start from, and it says so nowhere. Enforced at the
+      // product contract rather than trusted to the executor's permissions, which are a preference.
+      if (job.mode === "read" && files.length > 0) {
+        throw new Error(
+          `investigation modified ${files.length} file(s) and is therefore invalid: ${files.slice(0, 5).join(", ")}`,
+        );
+      }
+
       let resultCommit = null;
       if (job.mode === "write") {
         if (files.length === 0) {

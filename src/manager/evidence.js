@@ -103,10 +103,17 @@ export function buildPlanEvidence({ objective, baseSha, validationCommands, prot
     validation_commands: validationCommands ?? [],
     protected_paths: protectedPaths ?? [],
     // Present only after an exploration round; empty on the first turn.
+    //
+    // The report's STATE travels with it. An investigation that failed, was never run, or whose
+    // report cannot be read is not an investigation that found nothing -- and rendering it as an
+    // empty answer tells the manager the second thing while the first is true. It would then plan
+    // confidently around an absence it was never told about.
     explorations: explorations.map((report) => ({
       question: report.question,
-      answer: bounded(report.answer, EVIDENCE_LIMITS.explorationReport, { keep: "head" }),
-      job_id: report.jobId,
+      state: report.state ?? (report.answer ? "PRESENT" : "UNKNOWN"),
+      answer: report.answer ? bounded(report.answer, EVIDENCE_LIMITS.explorationReport, { keep: "head" }) : null,
+      job_id: report.jobId ?? null,
+      detail: report.detail ?? null,
     })),
   };
 }
@@ -262,9 +269,23 @@ export function renderEvidence(pack) {
     }
     if (pack.explorations.length) {
       section("What investigation established");
+      const failed = pack.explorations.filter((item) => item.state !== "PRESENT");
+      if (failed.length) {
+        lines.push(
+          `${failed.length} of ${pack.explorations.length} investigations produced no usable report. `
+          + "Those questions are UNANSWERED, which is not the same as answered with nothing. Plan "
+          + "around what you actually know, or ask for them again.",
+        );
+        lines.push("");
+      }
       for (const item of pack.explorations) {
         lines.push(`### ${item.question}`, "");
-        clip(item.answer, "investigation report");
+        if (item.state === "PRESENT") {
+          clip(item.answer, "investigation report");
+        } else {
+          lines.push(`[${item.state}: this question was not answered.`
+            + `${item.detail ? ` ${item.detail}` : ""} Do not treat it as having no answer.]`);
+        }
         lines.push("");
       }
     }
