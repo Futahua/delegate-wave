@@ -269,9 +269,14 @@ export class ControlService {
         projectId: args.projectId,
         goal: args.goal,
         mode: args.mode || "write",
+        // How the work will be executed is part of what the operator authorizes, so it is proposed
+        // rather than chosen later. It is bound into the action digest, which is why it cannot be
+        // altered between the proposal an operator read and the job that runs.
+        strategy: args.strategy || "direct",
         maximumCost: args.maximumCost ?? null,
         expiresAt: args.expiresAt || null,
         expectedStateVersion: args.expectedStateVersion || null,
+        expectedBaseSha: args.expectedBaseSha || null,
         idempotencyKey: args.idempotencyKey,
         principal: context.principalId,
         origin: context.originChannel,

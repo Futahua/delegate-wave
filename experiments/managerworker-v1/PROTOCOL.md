@@ -47,13 +47,27 @@ is exactly the kind of difference a handful of tasks can show.
 Secondary, and reported honestly as a guard rather than a hypothesis:
 
 ```text
-completion rate            B must not be WORSE than A (non-inferiority)
+completion rate            a QUALITY GUARDRAIL, not a statistical claim
 cheap-worker dollars
 wall time
 ```
 
-Completion rate is not the thing being tested. If B completes 4/5 and A completes 4/5 while B used a
-fifth of the strong tokens and required no interventions, the experiment succeeded.
+At this sample size "non-inferiority" would be statistical language the data cannot support. The
+honest phrasing is a guardrail: if M completes visibly fewer tasks than S or P, that stops the
+experiment regardless of token savings. It does not license a claim of equivalence when it does not.
+
+If M completes 4/5 and S completes 4/5 while M used a fifth of the strong tokens and required no
+interventions, the experiment succeeded.
+
+Report the paired per-task numbers alongside any ratio. A mean of per-task ratios hides the case
+where one task dominates the total, and with five tasks that case is likely rather than exotic.
+
+## A run whose condition cannot be established is invalid data
+
+Not "probably fine". If the executor fell back, if the requested model or effort cannot be shown to
+be what actually ran, or if usage came back UNKNOWN, the sample is excluded and the exclusion is
+reported. Harness `trusted` and the OpenCode fallback are different capability conditions — one has
+shell access and one does not — so a fallback run is never pooled with an intended run.
 
 ## Calibration, and why the band is not 1/3
 
@@ -79,26 +93,65 @@ RESCUE PROBE    1-2 tasks where direct Pro succeeds 0/3 or 1/3.
                 cannot -- and cannot be pooled with the primary set.
 ```
 
-Discard on sight any task where both arms score 3/3 with near-identical token counts: that is the
-saturated corpus again.
+## Task selection freezes before treatment
+
+An earlier draft of this protocol said to "discard on sight any task where both arms score 3/3 with
+near-identical token counts." That is selection on the outcome, and it is disqualifying: dropping the
+tasks where the arms agreed guarantees a difference in whatever survives, whether or not one exists.
+It is the same error as the saturated corpus, arriving from the opposite direction.
+
+The order is therefore fixed:
+
+```text
+1. Calibrate with P ONLY. The other arms are not run, and their results cannot influence which
+   tasks are chosen because they do not exist yet.
+2. Freeze the task IDs. Write them down. This list does not change afterwards for any reason.
+3. Run S and M fresh on exactly that frozen list.
+```
+
+A task that turns out to be uninformative stays in the reported results. That is what the sample
+looked like.
 
 ## Arms
 
-Same substrate on both sides. The executor, candidate capture, validation, protected paths, usage
-accounting and integration gate are identical; only who writes the worker's instruction differs.
+Three, not two. Two arms cannot separate "cheap execution is sufficient" from "strong judgment
+removes the errors" — the comparison that motivated the whole project needs both contrasts.
 
 ```text
-A   objective -> Pro -> candidate -> validation
+P   cheap direct
+    objective -> Pro -> candidate -> validation
 
-B   objective
-    -> strong manager (PLAN)
-    -> cheap exploration, at most 2-3 bounded investigations
-    -> strong manager (SYNTHESIS -> implementation brief)
-    -> Pro implementation, against the brief
+S   strong direct
+    objective -> Codex with ordinary repository and tool access -> candidate -> validation
+
+M   ManagerWorker
+    objective
+    -> text-only Codex manager (PLAN)
+    -> Pro exploration, at most 2-3 bounded investigations
+    -> Codex synthesis -> implementation brief
+    -> Pro implementation against the brief
     -> candidate + validation
-    -> strong manager (REVIEW) -> ACCEPT / REVISE / RETHINK / ESCALATE
+    -> Codex semantic review -> ACCEPT / REVISE / RETHINK / ESCALATE
     -> at most 2 revision rounds
 ```
+
+```text
+M vs S   can cheap execution substitute for strong execution, at lower strong-token cost?
+M vs P   does scarce judgment remove the semantic errors that otherwise cost human attention?
+```
+
+Same substrate throughout. Candidate capture, validation, protected paths, usage accounting and the
+integration gate are identical in all three; only who writes the worker's instruction differs.
+
+## The manager does not grade itself
+
+Manager `ACCEPT` is part of M's algorithm. It is **not** the experiment's ground truth, and using it
+as such would let the arm under test define its own success while P and S are judged by something
+else.
+
+Final semantic correctness comes from one arm-blinded evaluator — a hidden behavioural verifier where
+the task admits one, otherwise a judge that sees the diff without knowing which arm produced it. The
+same judge scores P, S and M. Its own cost is reported separately and never counted against any arm.
 
 Nothing else varies. No prompt tuning, no effort changes, no staged tool catalogs, no runtime swap.
 `agent/exp-pro-scaffold` stays frozen and unmerged; if `promptBuilder` proves useful it is

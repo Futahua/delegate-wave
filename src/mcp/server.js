@@ -62,7 +62,20 @@ const TOOLS = Object.freeze([
         project_id: { type: "string" },
         goal: { type: "string", description: "What the worker should accomplish, in plain language." },
         mode: { type: "string", enum: ["read", "write"] },
-        maximum_cost: { type: "number", description: "Optional cost ceiling in dollars." },
+        strategy: {
+          type: "string",
+          enum: ["direct", "managed"],
+          description:
+            "How the work is executed. 'direct' sends the goal straight to one cheap worker. "
+            + "'managed' hands the objective to a strong manager that investigates, writes an "
+            + "explicit brief, reviews the result and may request revisions. Defaults to direct.",
+        },
+        maximum_cost: {
+          type: "number",
+          description:
+            "Optional cost ceiling in dollars, shared by the whole job family including any "
+            + "investigations a manager commissions.",
+        },
         idempotency_key: { type: "string", description: "Stable key so a retried proposal is not duplicated." },
       },
       required: ["project_id", "goal", "idempotency_key"],
@@ -124,6 +137,7 @@ export class HermesMcpAdapter {
         projectId: requiredString(args, "project_id"),
         goal: requiredString(args, "goal"),
         mode: args.mode || "write",
+        strategy: args.strategy || "direct",
         maximumCost: args.maximum_cost ?? null,
         idempotencyKey: requiredString(args, "idempotency_key"),
       }, `req_${randomUUID()}`);

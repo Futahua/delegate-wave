@@ -214,9 +214,13 @@ export class Dispatcher {
   // Digest of the requested action only. The expiry is deliberately excluded: it may be defaulted
   // from the clock, and including it would make two identical retries hash differently and defeat
   // the idempotency key.
-  workActionDigest({ projectId, goal, mode, maximumCost, expectedStateVersion }) {
+  // Every bound the proposal makes, including the world it was written against and how it will be
+  // executed. Anything outside this hash is a field an operator could be shown at proposal time and
+  // silently authorize differently.
+  workActionDigest({ projectId, goal, mode, maximumCost, expectedStateVersion, strategy, expectedBaseSha }) {
     return crypto.createHash("sha256").update(JSON.stringify([
       projectId, goal, mode, maximumCost ?? null, expectedStateVersion ?? null,
+      strategy ?? "direct", expectedBaseSha ?? null,
     ])).digest("hex");
   }
 
@@ -232,13 +236,15 @@ export class Dispatcher {
       .slice(0, 16);
   }
 
-  proposeWork({
+  async proposeWork({
     projectId, goal, mode = "write", maximumCost = null, expiresAt = null,
-    expectedStateVersion = null, idempotencyKey, principal, origin,
+    expectedStateVersion = null, expectedBaseSha = null, strategy = "direct",
+    idempotencyKey, principal, origin,
   }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!["read", "write"].includes(mode)) throw new Error("mode must be read or write");
+    if (!["direct", "managed"].includes(strategy)) throw new Error("strategy must be direct or managed");
     if (typeof goal !== "string" || !goal.trim()) throw new Error("goal must be a non-empty string");
     if (!idempotencyKey || typeof idempotencyKey !== "string") throw new Error("idempotency_key is required");
     if (!principal || !origin) throw new Error("Proposal origin identity is required");
@@ -251,8 +257,17 @@ export class Dispatcher {
     if (Number.isNaN(Date.parse(expiry))) throw new Error("expires_at must be an ISO timestamp");
 
     const stateVersion = expectedStateVersion || this.projectStateVersion(projectId);
+    // The repository state this proposal was written against.
+    //
+    // projectStateVersion() hashes delegate-wave's own job rows, which says nothing whatsoever about
+    // the code. A proposal reasoned about repository version A could be authorized against version B
+    // with that hash unchanged -- and since authorization resolves the branch head fresh, the system
+    // would report that the world matched while the only world that matters had moved underneath it.
+    const baseSha = expectedBaseSha
+      || await resolveRevision(project.repo_path, project.integration_branch);
     const actionDigest = this.workActionDigest({
       projectId, goal: goal.trim(), mode, maximumCost, expectedStateVersion: stateVersion,
+      strategy, expectedBaseSha: baseSha,
     });
 
     const proposalId = id("wprop");
@@ -269,15 +284,15 @@ export class Dispatcher {
         return this.getWorkProposal(existing.id);
       }
       this.db.prepare(`INSERT INTO work_proposals(
-        id, project_id, goal, mode, action_digest, expected_state_version, maximum_cost,
-        expires_at, idempotency_key, origin_principal, origin_channel, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        proposalId, projectId, goal.trim(), mode, actionDigest, stateVersion,
-        maximumCost, expiry, idempotencyKey, principal, origin, timestamp,
+        id, project_id, goal, mode, action_digest, expected_state_version, expected_base_sha,
+        strategy, maximum_cost, expires_at, idempotency_key, origin_principal, origin_channel, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        proposalId, projectId, goal.trim(), mode, actionDigest, stateVersion, baseSha,
+        strategy, maximumCost, expiry, idempotencyKey, principal, origin, timestamp,
       );
       recordEvent(this.db, {
         kind: "WORK_PROPOSED", entityType: "work_proposal", entityId: proposalId,
-        payload: { projectId, mode, origin, principal },
+        payload: { projectId, mode, origin, principal, strategy, expectedBaseSha: baseSha },
       });
       return this.getWorkProposal(proposalId);
     });
@@ -299,7 +314,10 @@ export class Dispatcher {
 
   // The human gate. Turns one exact proposal into one job, under operator identity, and refuses
   // anything the proposal did not already bound.
-  assertAuthorizable(proposal) {
+  // `currentBaseSha` is the branch head resolved at authorization time. Compared for exact equality
+  // against the head the proposal was written against: a proposal is a statement about one world,
+  // and authorizing it against a different one silently substitutes work nobody proposed.
+  assertAuthorizable(proposal, { currentBaseSha = null } = {}) {
     if (Date.parse(proposal.expires_at) <= Date.now()) {
       throw new Error(`Work proposal ${proposal.id} expired at ${proposal.expires_at}`);
     }
@@ -310,10 +328,20 @@ export class Dispatcher {
         + `but the project is at ${currentVersion}`,
       );
     }
+    // Proposals that predate this binding carry no recorded head and cannot be checked against one;
+    // they are still bounded by their state version and expiry. New proposals always carry it.
+    if (proposal.expected_base_sha && currentBaseSha && proposal.expected_base_sha !== currentBaseSha) {
+      throw new Error(
+        `Work proposal ${proposal.id} was written against ${proposal.expected_base_sha.slice(0, 12)} `
+        + `but the branch is now at ${currentBaseSha.slice(0, 12)}; re-propose against the current state`,
+      );
+    }
     // Re-derive the digest so a tampered stored row cannot authorize different work than proposed.
+    // Strategy and base are inside it, so neither can be edited after the operator saw the proposal.
     const expected = this.workActionDigest({
       projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode,
       maximumCost: proposal.maximum_cost, expectedStateVersion: proposal.expected_state_version,
+      strategy: proposal.strategy, expectedBaseSha: proposal.expected_base_sha,
     });
     if (expected !== proposal.action_digest) {
       throw new Error(`Work proposal ${proposal.id} action digest does not match its stored intent`);
@@ -333,12 +361,13 @@ export class Dispatcher {
       if (preliminary.decision.decision === "AUTHORIZED") return preliminary;
       throw new Error(`Work proposal ${proposalId} was already rejected`);
     }
-    this.assertAuthorizable(preliminary);
-
     const project = this.getProject(preliminary.project_id);
     if (!project) throw new Error(`Unknown project: ${preliminary.project_id}`);
-    // Async Git resolution must happen outside the transaction.
+    // Async Git resolution must happen outside the transaction, and it must happen BEFORE the first
+    // authorizability check: the head is one of the things being checked, so resolving it afterwards
+    // would leave the branch unverified on the path that matters.
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
+    this.assertAuthorizable(preliminary, { currentBaseSha: baseSha });
 
     return transaction(this.db, () => {
       // Re-read under BEGIN IMMEDIATE: a concurrent request may have decided this proposal since
@@ -348,11 +377,15 @@ export class Dispatcher {
         if (proposal.decision.decision === "AUTHORIZED") return this.getWorkProposal(proposalId);
         throw new Error(`Work proposal ${proposalId} was already rejected`);
       }
-      this.assertAuthorizable(proposal);
+      // Re-checked inside the transaction against the SAME head that was resolved above, so a branch
+      // that moved between the two checks cannot slip through the second one.
+      this.assertAuthorizable(proposal, { currentBaseSha: baseSha });
 
       // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
-      // bound the scheduler keeps, not a note.
+      // bound the scheduler keeps, not a note. Its strategy travels the same way -- a managed
+      // proposal must produce a managed job, or the operator authorized one thing and got another.
       const job = this.insertJobRow({
+        strategy: proposal.strategy ?? "direct",
         projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
         maximumCost: proposal.maximum_cost,
       });

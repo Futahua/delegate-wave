@@ -28,24 +28,66 @@ export const EVIDENCE_LIMITS = Object.freeze({
 
 // Clips to a byte budget and says so. Returns the shape the renderer understands, never a bare
 // string, so a caller cannot accidentally drop the truncation flag on the way to the prompt.
+//
+// Genuinely BYTES. The first version measured with String.length and cut with slice(), which count
+// UTF-16 code units -- so a limit named `total_bytes` was neither a byte count nor an upper bound on
+// one. Vietnamese, CJK and emoji are two to four UTF-8 bytes per code unit, and this project's own
+// paths are Vietnamese, so a pack advertising 24,000 bytes could ship three times that to the most
+// expensive component in the system. Truncation is done on the Buffer and then decoded, cutting back
+// to a valid character boundary rather than emitting a replacement character.
 export function bounded(text, limit, { keep = "tail" } = {}) {
   const source = String(text ?? "");
-  if (source.length <= limit) {
-    return { text: source, truncated: false, total_bytes: source.length, included_bytes: source.length };
+  const buffer = Buffer.from(source, "utf8");
+  if (buffer.byteLength <= limit) {
+    return { text: source, truncated: false, total_bytes: buffer.byteLength, included_bytes: buffer.byteLength };
   }
   // Validation output keeps its TAIL: the failure and the summary line live at the end, and a head
   // clip would show the manager a successful-looking prelude to a failed run. Diffs keep their HEAD,
   // because a diff is read from the top and its early hunks carry the shape of the change.
-  const text2 = keep === "tail" ? source.slice(-limit) : source.slice(0, limit);
-  return { text: text2, truncated: true, total_bytes: source.length, included_bytes: text2.length };
+  const slice = keep === "tail"
+    ? buffer.subarray(buffer.byteLength - limit)
+    : buffer.subarray(0, limit);
+  // A cut can land mid-sequence. Decoding with fatal:false would silently insert U+FFFD; trimming to
+  // the boundary keeps the text honest and the byte count accurate.
+  const clipped = trimToCharacterBoundary(slice, keep);
+  const decoded = clipped.toString("utf8");
+  return {
+    text: decoded,
+    truncated: true,
+    total_bytes: buffer.byteLength,
+    included_bytes: clipped.byteLength,
+  };
 }
 
+// Walks off a partial UTF-8 sequence at whichever end was cut.
+function trimToCharacterBoundary(buffer, keep) {
+  const isContinuation = (byte) => (byte & 0b1100_0000) === 0b1000_0000;
+  if (keep === "tail") {
+    let start = 0;
+    while (start < buffer.byteLength && isContinuation(buffer[start])) start += 1;
+    return buffer.subarray(start);
+  }
+  let end = buffer.byteLength;
+  while (end > 0 && isContinuation(buffer[end - 1])) end -= 1;
+  // Step back over the lead byte of the sequence that was cut.
+  if (end > 0 && (buffer[end - 1] & 0b1000_0000) !== 0) end -= 1;
+  return buffer.subarray(0, end);
+}
+
+// Reads an artifact, distinguishing THREE outcomes rather than two.
+//
+// The first version collapsed "no artifact recorded" and "the file is unreadable" into null, which is
+// the absence-became-zero error this project forbids everywhere else, wearing a different hat. For
+// semantic review the difference decides whether ACCEPT is even permissible: an attempt with no
+// worker report may be fine, while an attempt whose instruction artifact is corrupt means nobody can
+// establish what the worker was told, and no judgment about it can be sound.
 function readArtifact(artifactPath, limit, options) {
-  if (!artifactPath || !fs.existsSync(artifactPath)) return null;
+  if (!artifactPath) return { state: "ABSENT", value: null };
+  if (!fs.existsSync(artifactPath)) return { state: "MISSING", value: null, path: artifactPath };
   try {
-    return bounded(fs.readFileSync(artifactPath, "utf8"), limit, options);
-  } catch {
-    return null;
+    return { state: "PRESENT", value: bounded(fs.readFileSync(artifactPath, "utf8"), limit, options) };
+  } catch (error) {
+    return { state: "CORRUPT", value: null, path: artifactPath, reason: String(error?.message ?? error) };
   }
 }
 
@@ -112,13 +154,44 @@ export async function buildReviewEvidence({
 
   const objective = job.goal;
 
+  // Absence is not zero, here least of all.
+  //
+  // `JSON.parse(x ?? "[]") catch []` rendered as "0 files changed: none" -- a confident statement
+  // that the worker changed nothing, produced from the fact that we could not tell what it changed.
+  // A manager shown that would correctly REVISE a candidate that may have been perfect, or worse,
+  // ACCEPT a change it believes is empty.
   const changedFiles = (() => {
-    try { return JSON.parse(attempt.changed_files_json ?? "[]"); } catch { return []; }
+    if (attempt.changed_files_json === null || attempt.changed_files_json === undefined) {
+      return { state: attempt.result_commit ? "MISSING" : "ABSENT", files: null };
+    }
+    try {
+      const parsed = JSON.parse(attempt.changed_files_json);
+      if (!Array.isArray(parsed)) return { state: "CORRUPT", files: null };
+      return { state: "PRESENT", files: parsed };
+    } catch {
+      return { state: "CORRUPT", files: null };
+    }
   })();
 
   const brief = briefRead;
 
+  // Which evidence ACCEPT depends on, and whether it can be established.
+  //
+  // The instruction and the change set are load-bearing: without the first nobody knows what the
+  // worker was told, and without the second nobody knows what it did. A semantic judgment resting on
+  // either of those being unreadable is not a judgment, so the gate refuses ACCEPT rather than
+  // letting the manager reason past a gap it was not told about.
+  const unreadable = [];
+  if (brief.state === "CORRUPT" || brief.state === "MISSING") {
+    unreadable.push({ evidence: "instruction", state: brief.state, path: brief.path });
+  }
+  if (changedFiles.state === "CORRUPT" || changedFiles.state === "MISSING") {
+    unreadable.push({ evidence: "changed_files", state: changedFiles.state });
+  }
+
   return {
+    evidence_complete: unreadable.length === 0,
+    unreadable_evidence: unreadable,
     kind: "REVIEW",
     objective,
     // The instruction this worker actually received, read back from its artifact.
@@ -139,7 +212,6 @@ export async function buildReviewEvidence({
       instruction_digest: attempt.instruction_digest,
     },
     changed_files: changedFiles,
-    changed_file_count: changedFiles.length,
     candidate_diff: diff ? bounded(diff, EVIDENCE_LIMITS.candidateDiff, { keep: "head" }) : null,
     validation: (validationRuns ?? []).map((run) => ({
       command: run.command,
@@ -199,14 +271,38 @@ export function renderEvidence(pack) {
     return lines.join("\n");
   }
 
+  // Renders an artifact honestly across its three states. "Unknown" must never render as a fact.
+  const artifact = (entry, label) => {
+    if (!entry || entry.state === "ABSENT") { lines.push(`(no ${label} was recorded for this attempt)`); return; }
+    if (entry.state === "MISSING") { lines.push(`[the ${label} was recorded but its file is gone. Its content is UNKNOWN, not empty.]`); return; }
+    if (entry.state === "CORRUPT") { lines.push(`[the ${label} could not be read. Its content is UNKNOWN, not empty.]`); return; }
+    clip(entry.value, label);
+  };
+
+  if (!pack.evidence_complete) {
+    section("Evidence you were NOT given");
+    lines.push("Some evidence this decision would rest on could not be established:");
+    for (const item of pack.unreadable_evidence) lines.push(`- ${item.evidence}: ${item.state}`);
+    lines.push("");
+    lines.push("You cannot ACCEPT on this basis. Judging a change without knowing what the worker "
+      + "was told, or without knowing what it changed, is not a judgment. Say so and escalate.");
+  }
+
   section("The brief this worker was given");
-  if (pack.brief) clip(pack.brief, "brief");
-  else lines.push("(no instruction artifact was recorded for this attempt)");
+  artifact(pack.brief, "instruction");
 
   section("What actually changed");
   lines.push(`Attempt ${pack.attempt.id} (${pack.attempt.model ?? "unknown model"})`);
   lines.push(`Started from ${pack.attempt.start_sha ?? "the authorized base"}; produced ${pack.attempt.result_commit ?? "no commit"}.`);
-  lines.push(`${pack.changed_file_count} file(s) changed: ${pack.changed_files.join(", ") || "none"}`);
+  if (pack.changed_files.state === "PRESENT") {
+    const files = pack.changed_files.files;
+    lines.push(`${files.length} file(s) changed: ${files.join(", ") || "none"}`);
+  } else {
+    // The distinction that matters: "changed nothing" and "we cannot tell what it changed" are
+    // different facts, and only one of them is a reason to reject the work.
+    lines.push(`The set of changed files is UNKNOWN (${pack.changed_files.state}). `
+      + "This is not a report that nothing changed.");
+  }
   if (pack.candidate_diff) {
     lines.push("");
     clip(pack.candidate_diff, "candidate diff");
@@ -218,17 +314,13 @@ export function renderEvidence(pack) {
   }
   for (const run of pack.validation) {
     lines.push(`\`${run.command}\` exited ${run.exit_code}.`);
-    if (run.output) {
-      lines.push("");
-      clip(run.output, "check output");
-      lines.push("");
-    }
+    lines.push("");
+    artifact(run.output, "check output");
+    lines.push("");
   }
 
-  if (pack.worker_report) {
-    section("What the worker says it did (testimony, not evidence)");
-    clip(pack.worker_report, "worker report");
-  }
+  section("What the worker says it did (testimony, not evidence)");
+  artifact(pack.worker_report, "worker report");
 
   if (pack.prior_decisions.length) {
     section("Your earlier decisions on this job");

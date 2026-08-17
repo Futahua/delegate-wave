@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/mcp/server.js && node --check src/supervisor.js && node --test"
+    "syntax": "node -e \"const{readdirSync,statSync}=require('node:fs');const{join}=require('node:path');const{execFileSync}=require('node:child_process');const walk=d=>readdirSync(d).flatMap(e=>{const p=join(d,e);return statSync(p).isDirectory()?walk(p):(p.endsWith('.js')?[p]:[])});let bad=0;for(const f of walk('src')){try{execFileSync(process.execPath,['--check',f],{stdio:'pipe'})}catch(e){bad++;console.error(f+':\\n'+String(e.stderr))}}if(bad)process.exit(1);console.log('syntax ok')\"",
+    "check": "npm run syntax && node --test"
   },
   "engines": {
     "node": ">=24"

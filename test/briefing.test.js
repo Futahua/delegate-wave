@@ -68,7 +68,9 @@ test("an idle system says so plainly", async (t) => {
 test("a pending proposal appears as a decision with its bound and goal", async (t) => {
   const { service, repo } = await fixture(t);
   const project = await service.addProject({ name: "Surface", repoPath: repo, branch: "integration", validation: [] });
-  service.proposeWork({
+  // Awaited: proposing now resolves the repository head it is being written against, so the call is
+  // asynchronous.
+  await service.proposeWork({
     projectId: project.id, goal: "add a summary file to the report directory",
     maximumCost: 0.25, idempotencyKey: "k1", principal: "hermes-proposer", origin: "hermes-mcp-proposal",
   });
