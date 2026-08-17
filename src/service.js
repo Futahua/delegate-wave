@@ -20,6 +20,8 @@ import {
 } from "./git.js";
 import { runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
+import { readFinalText } from "./manager/runtime.js";
+import { instructionDigest } from "./manager/contracts.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
 import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
@@ -556,7 +558,24 @@ export class Dispatcher {
     return resolved;
   }
 
-  async runJob(jobId, { model = null } = {}) {
+  // Runs one attempt.
+  //
+  // `instruction` is the seam this whole layer exists for. Before it, every attempt received
+  // `job.goal` -- the human's sentence -- which meant the strong model's only channel into execution
+  // was the same string the human typed, and attempt 2 received it again byte-for-byte. Retry was a
+  // re-roll rather than iterative problem solving.
+  //
+  // Direct mode still passes the goal, explicitly, right here. That explicitness matters: the
+  // fallback lives at the dispatcher where "direct" is a deliberate choice, not inside the backend
+  // where a managed attempt missing its brief would silently receive the objective instead and
+  // reintroduce the exact collapse this seam undoes.
+  //
+  // `startSha` is where the worktree begins, which is NOT what the candidate is measured against. A
+  // revision starts from the previous candidate so it corrects an implementation rather than
+  // rewriting one from nothing, while snapshotCandidate still measures the result against the
+  // AUTHORIZED base, so what is offered for integration remains one complete net change from what
+  // the operator approved.
+  async runJob(jobId, { model = null, instruction = null, startSha = null } = {}) {
     model = this.resolveModel(model);
     // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
     // A job may ask for a narrower worker; otherwise the system default applies.
@@ -569,6 +588,8 @@ export class Dispatcher {
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
     const project = this.getProject(job.project_id);
     const validationPlan = job.mode === "write" ? parseValidationPlan(project.validation_json) : [];
+    const instructionText = instruction ?? job.goal;
+    const startFrom = startSha ?? job.base_sha;
     const claim = transaction(this.db, () => {
       const current = this.getJob(jobId);
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
@@ -595,13 +616,16 @@ export class Dispatcher {
       this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
       this.db.prepare(`INSERT INTO attempts(
         id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
-        scheduler_pid, worktree_path, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        scheduler_pid, worktree_path, started_at, start_sha, instruction_digest
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         attemptId, jobId, ordinal, epoch, backend.constructor.name,
         // Recorded before the worker starts: the authority a worker ran under is evidence, not a
         // detail to be reconstructed afterwards from which artifacts happen to exist.
         backend.profile ?? null,
         model, process.pid, worktreePath, now(),
+        // Both recorded in the claim, before any worker runs. The digest is what makes "attempt 2 was
+        // told something different from attempt 1" a mechanical fact rather than the manager's word.
+        startFrom, instructionDigest(instructionText),
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
@@ -613,7 +637,14 @@ export class Dispatcher {
     let executorIntentId = null;
 
     try {
-      await createDetachedWorktree(project.repo_path, worktreePath, job.base_sha);
+      // Created from startFrom, measured against job.base_sha. Identical for every direct attempt
+      // and for a first managed attempt; they diverge only when a revision builds on a candidate.
+      await createDetachedWorktree(project.repo_path, worktreePath, startFrom);
+      // Written before the worker runs, so the exact text it received survives independently of
+      // whatever the worker does with it.
+      const instructionPath = path.join(artifactDir, "instruction.txt");
+      fs.writeFileSync(instructionPath, instructionText);
+      this.db.prepare("UPDATE attempts SET instruction_artifact = ? WHERE id = ?").run(instructionPath, attemptId);
       executorIntentId = id("executor");
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET executor_intent_id = ?, executor_pid = NULL WHERE id = ?").run(executorIntentId, attemptId);
@@ -626,7 +657,11 @@ export class Dispatcher {
       let backendError = null;
       try {
         backendResult = await backend.run({
-          attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
+          attemptId, worktreePath, artifactDir, model, mode: job.mode,
+          // Two distinct inputs. `instruction` is what this worker must do; `goal` is the human's
+          // immutable objective, available for framing and never a substitute for the instruction.
+          instruction: instructionText,
+          goal: job.goal,
           onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
         });
       } catch (error) {
@@ -639,6 +674,20 @@ export class Dispatcher {
       // The attempt's OWN backend reads its usage: each executor writes a different artifact in a
       // different format, so the default would misread another executor's evidence as absent.
       this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult, backend });
+
+      // What the worker SAYS it did, captured whether or not the attempt goes on to succeed.
+      //
+      // Testimony, never evidence: the captured tree is what actually changed. It is recorded anyway
+      // because the disagreement between the two is frequently the whole finding -- a worker
+      // reporting a fix it did not make is the failure mode semantic review exists to catch, and a
+      // reviewer that only ever saw the diff could not notice the claim was false.
+      const finalText = backendResult ? readFinalText(backendResult, artifactDir) : null;
+      if (finalText) {
+        const reportPath = path.join(artifactDir, "worker-report.txt");
+        fs.writeFileSync(reportPath, finalText);
+        this.db.prepare("UPDATE attempts SET result_text_artifact = ? WHERE id = ?").run(reportPath, attemptId);
+      }
+
       if (backendError) {
         // A Harness configuration failure -- a profile that will not compose, a fence the loader
         // refuses -- will recur on every attempt, so the router stops choosing it. This attempt

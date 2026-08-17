@@ -129,20 +129,23 @@ export function wireModel(model) {
 // The line that belongs in BOTH prompts is the one about acceptance. A worker may use the machine
 // freely; what it may not do is treat its own claims as the verdict. That is the invariant, and it
 // is stated to the worker rather than left implicit.
-export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+export function workerPrompt({ instruction, goal, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+  // The instruction is what this worker must do. `goal` is the human objective and is accepted only
+  // as the direct-mode fallback the dispatcher passes explicitly; it must never replace a brief.
+  const task = instruction ?? goal;
   const capabilities = capabilityProfile(profile);
   const acceptance = "Do not treat your own claims as acceptance: delegate-wave validates the result "
     + "afterwards and decides independently what is integrated.";
 
   if (mode === "read") {
     return "Investigate this task without modifying files. Return concise findings with exact file "
-      + `paths and evidence.\n\nTask: ${goal}`;
+      + `paths and evidence.\n\nTask: ${task}`;
   }
 
   if (capabilities.fenced) {
     return "Implement this bounded task in the current worktree. Do not commit, push, modify Git "
       + "metadata, or access files outside this worktree. Shell access is intentionally disabled; "
-      + `edit only the necessary files. ${acceptance}\n\nTask: ${goal}`;
+      + `edit only the necessary files. ${acceptance}\n\nTask: ${task}`;
   }
 
   return "Implement this task, working from the current attempt worktree. Use the machine and "
@@ -151,7 +154,7 @@ export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE 
     + "yours to use as well -- status, diff, log, blame, bisect, temporary branches, local commits. "
     + "Do not push. Your Git history is workspace activity, not integration: delegate-wave captures "
     + `the resulting tree relative to the base commit and builds its own candidate. ${acceptance}`
-    + `\n\nTask: ${goal}`;
+    + `\n\nTask: ${task}`;
 }
 
 // Builds the profile patch for one attempt.
@@ -319,7 +322,7 @@ export class HarnessBackend {
     }
   }
 
-  async run({ attemptId, worktreePath, goal, model, artifactDir, mode, onSpawn }) {
+  async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, onSpawn }) {
     if (!model) throw new Error("HarnessBackend requires an explicit model; the dispatcher must resolve one");
     if (!fs.existsSync(this.entry)) {
       throw new Error(`Harness is not installed at ${this.entry}; expected ${HARNESS_PACKAGE}@${HARNESS_VERSION}`);

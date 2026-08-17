@@ -432,9 +432,20 @@ CREATE TABLE IF NOT EXISTS manager_turns (
   response_digest TEXT,
   -- The parsed decision, small enough to live inline and the thing every later turn reads back.
   action TEXT,
+  -- What this turn is a judgment ABOUT. Set for REVIEW; null for PLAN and SYNTHESIS.
+  --
+  -- This is the durable binding that makes "the reviewed candidate is the validated candidate is the
+  -- candidate offered for integration" a checkable fact rather than an inference. The tempting
+  -- alternative -- trusting that the candidate SHA appeared somewhere in the prompt artifact -- makes
+  -- the authoritative link a property of prose that a future orchestration bug can silently break,
+  -- validating attempt A while reviewing artifacts from attempt B. A foreign key cannot drift.
+  subject_attempt_id TEXT REFERENCES attempts(id),
   started_at TEXT NOT NULL,
   finished_at TEXT,
-  UNIQUE(manager_run_id, ordinal)
+  UNIQUE(manager_run_id, ordinal),
+  -- A review with no subject could never satisfy the acceptance gate, so it is refused at write time
+  -- rather than discovered as an unexplained refusal later.
+  CHECK (phase != 'REVIEW' OR state IN ('INTENDED', 'RUNNING') OR subject_attempt_id IS NOT NULL)
 );
 
 -- One immutable usage observation per manager turn.

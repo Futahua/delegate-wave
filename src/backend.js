@@ -72,15 +72,17 @@ export class OpenCodeBackend {
     this.timeoutMs = timeoutMs;
   }
 
-  async run({ attemptId, worktreePath, goal, model, artifactDir, mode, onSpawn }) {
+  async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, onSpawn }) {
+    // The instruction is what this worker must do; goal is the objective, never a substitute.
+    const task = instruction ?? goal;
     fs.mkdirSync(artifactDir, { recursive: true });
     const stdoutPath = path.join(artifactDir, "opencode-events.jsonl");
     const stderrPath = path.join(artifactDir, "opencode-stderr.log");
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
     const prompt = mode === "read"
-      ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${goal}`
-      : `Implement this bounded task in the current worktree. Do not commit, push, modify Git metadata, or access files outside this worktree. Shell access is intentionally disabled; edit only the necessary files.\n\nTask: ${goal}`;
+      ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${task}`
+      : `Implement this bounded task in the current worktree. Do not commit, push, modify Git metadata, or access files outside this worktree. Shell access is intentionally disabled; edit only the necessary files.\n\nTask: ${task}`;
     const args = [...this.prefixArgs,
       "run", prompt,
       "--agent", mode === "read" ? "delegate-wave-reader" : "delegate-wave-worker",
