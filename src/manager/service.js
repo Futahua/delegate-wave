@@ -227,6 +227,24 @@ export class ManagerService {
       for (let step = 0; step < MANAGER_LIMITS.maxTurns * 3; step += 1) {
         run = this.getRun(jobId);
         if (["ACCEPTED", "AWAITING_HUMAN", "FAILED", "CANCELLED"].includes(run.status)) break;
+
+        // A cancelled root stops the manager, not merely its workers.
+        //
+        // Cancellation kills the family's live attempts, but the coordinator is a separate loop that
+        // was still holding its own plan: it would return from a cancelled exploration round, spend a
+        // scarce SYNTHESIS turn on the wreckage, and then commission an implementation for work the
+        // operator had just stopped. Checked every iteration, because cancellation can land between
+        // any two steps.
+        if (this.dispatcher.getJob(jobId).status === "CANCELLED") {
+          transaction(this.db, () => {
+            this.setRun(run.id, { status: "CANCELLED" });
+            recordEvent(this.db, {
+              kind: "MANAGER_RUN_CANCELLED", entityType: "job", entityId: jobId,
+              payload: { runId: run.id, at: run.status },
+            });
+          });
+          break;
+        }
         if (run.status === "PLANNING") await this.plan(run);
         else if (run.status === "EXPLORING") await this.explore(run);
         else if (run.status === "IMPLEMENTING") await this.implement(run);
@@ -340,17 +358,22 @@ export class ManagerService {
     return JSON.parse(fs.readFileSync(target, "utf8"));
   }
 
-  // Runs this round's investigations, then synthesizes them.
+  // Runs this round's investigations concurrently, then synthesizes them.
   //
-  // Serial on purpose. Family budget admission sums SETTLED receipts, so three children started
-  // together would each observe the same spend and could collectively exceed one ceiling. Running
-  // them one at a time proves the semantic algorithm without reopening that race; parallelism waits
-  // for atomic admission.
+  // Every child job is created BEFORE any of them starts. Two reasons: the authority split needs to
+  // know how many investigations still need to run, and creating jobs is the cheap half -- doing it
+  // up front means a crash mid-round resumes against a complete plan rather than a partial one.
+  //
+  // Allocation is deliberately boring: equal shares of what is actually available. Anything smarter
+  // -- per-question estimates, dynamic redistribution -- is a policy the experiment does not need,
+  // and every share is still checked atomically by admitAttempt(), so this is allocation rather than
+  // a second authority mechanism.
   async explore(run) {
     const job = this.dispatcher.getJob(run.job_id);
     const round = run.exploration_round;
     const plan = this.readRoundPlan(run, round);
 
+    const pending = [];
     for (const exploration of plan) {
       // Resumable by identity rather than by position: a child is found by the question it was
       // created for, so a crash between creating a child and recording anything about it resumes
@@ -371,18 +394,40 @@ export class ManagerService {
       }
       // Already finished on an earlier pass; do not pay for it again.
       if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(child.status)) continue;
+      pending.push({ exploration, child });
+    }
 
-      const instruction = renderExploration({ objective: job.goal, exploration });
-      try {
-        await this.dispatcher.runJob(child.id, { model: this.workerModel, instruction });
-      } catch (error) {
-        // A failed investigation is a fact the synthesis turn must be told, not a reason to abandon
-        // the round. It becomes an UNKNOWN report below.
+    if (pending.length) {
+      const { ceiling, rootJobId } = this.dispatcher.budgetAuthority(run.job_id);
+      let share = null;
+      if (ceiling !== null && ceiling !== undefined) {
+        const spend = this.dispatcher.familySpend(rootJobId);
+        const headroom = ceiling - spend.spent - this.dispatcher.reservedAuthority(rootJobId);
+        // A round that cannot fund its investigations is refused before any of them starts, rather
+        // than funding the first two and discovering the third has nothing left.
+        if (!(headroom > 0)) {
+          throw new ManagerStop(
+            `the family has no remaining authority for ${pending.length} investigation(s)`,
+            "BUDGET_EXCEEDED",
+          );
+        }
+        share = headroom / pending.length;
+      }
+
+      // allSettled, never all. A failed investigation is evidence the synthesis turn must be told
+      // about, not a reason to abandon its siblings -- and Promise.all would abandon them the moment
+      // one rejected, discarding work already paid for.
+      await Promise.allSettled(pending.map(({ exploration, child }) => this.dispatcher.runJob(child.id, {
+        model: this.workerModel,
+        instruction: renderExploration({ objective: job.goal, exploration }),
+        reservationRequest: share,
+      }).catch((error) => {
         recordEvent(this.db, {
           kind: "MANAGER_EXPLORATION_FAILED", entityType: "job", entityId: run.job_id,
           payload: { runId: run.id, round, childJobId: child.id, error: String(error?.message ?? error) },
         });
-      }
+        throw error;
+      })));
     }
 
     return this.synthesize(run, round, plan);

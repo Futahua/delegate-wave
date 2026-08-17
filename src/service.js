@@ -48,6 +48,13 @@ const OVERVIEW_ATTENTION_LIMIT = 20;
 const OVERVIEW_SUMMARY_LIMIT = 160;
 const OVERVIEW_BYTE_LIMIT = 3 * 1024;
 
+// The one job shape that may run alongside its siblings. All three conditions are required: an
+// internal exploration that was somehow write-mode could produce a candidate, and two candidates
+// racing for one root is exactly what serialization exists to prevent.
+const isParallelExploration = (job) => Boolean(
+  job && job.parent_job_id && job.internal_kind === "MANAGER_EXPLORATION" && job.mode === "read",
+);
+
 const lifecycleActive = (alias = "") => {
   const p = alias ? `${alias}.` : "";
   return `(${p}terminal_state IS NULL OR (${p}terminal_state = 'SUCCEEDED' AND ${p}validation_state = 'PENDING'))`;
@@ -91,6 +98,8 @@ function compactOverviewText(value) {
 
 export class Dispatcher {
   constructor({ root, backend, router = null, updateRef = updateRefCas }) {
+    // Per-repository serialization for Git operations that take a repo-wide lock.
+    this.repositoryLocks = new Map();
     this.root = root;
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
@@ -731,13 +740,7 @@ export class Dispatcher {
       //
       // The job's own family is therefore excluded here. The authoritative concurrency check is the
       // live-attempt query below, which counts actual workers rather than lifecycle labels.
-      const familyRoot = this.budgetRootJobId(jobId);
-      const runningJob = this.db.prepare(
-        "SELECT id FROM jobs WHERE status = 'RUNNING' AND id NOT IN (?, ?) LIMIT 1",
-      ).get(jobId, familyRoot);
-      if (runningJob) throw new Error(`Bootstrap scheduler already has running job ${runningJob.id}`);
-      const conflict = this.db.prepare(`SELECT id FROM attempts WHERE ${lifecycleActive()} LIMIT 1`).get();
-      if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
+      this.assertAdmissible(jobId);
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
       // Checked inside the claim transaction, so a ceiling cannot be raced by two starts.
@@ -799,7 +802,14 @@ export class Dispatcher {
     try {
       // Created from startFrom, measured against job.base_sha. Identical for every direct attempt
       // and for a first managed attempt; they diverge only when a revision builds on a candidate.
-      await createDetachedWorktree(project.repo_path, worktreePath, startFrom);
+      //
+      // Serialized per repository. `git worktree add` takes a lock under .git/worktrees, and
+      // concurrent investigations against one repository can collide on it -- which surfaced exactly
+      // once in four full-suite runs as an investigation failing for a reason that had nothing to do
+      // with its task. Only this step is serialized; the workers themselves still run together, and
+      // they are where the wall time actually goes.
+      await this.withRepositoryLock(project.repo_path, () =>
+        createDetachedWorktree(project.repo_path, worktreePath, startFrom));
       // Written before the worker runs, so the exact text it received survives independently of
       // whatever the worker does with it.
       const instructionPath = path.join(artifactDir, "instruction.txt");
@@ -1991,21 +2001,12 @@ export class Dispatcher {
     throw new Error(`Job ${jobId} has a parent chain deeper than delegation permits`);
   }
 
-  // NOT YET CONCURRENCY-SAFE, and this must be fixed before parallel exploration lands.
+  // familySpend() sums COMPLETED usage receipts only, which by itself is not safe under concurrency:
+  // simultaneous children would each observe the same headroom and collectively exceed one ceiling.
   //
-  // familySpend() sums COMPLETED usage receipts. Three exploration workers started at the same
-  // instant would each observe $0 spent, each pass assertWithinBudget against the same $0.10
-  // authority, and collectively spend three times it. Nothing reserves headroom at admission time.
-  //
-  // This is not exploitable today only because the bootstrap scheduler admits one running job at a
-  // time -- runJob() refuses to claim while any job is RUNNING or any attempt is live. The safety
-  // therefore comes from a scheduler restriction that the manager's 2-3 concurrent explorations are
-  // specifically meant to remove.
-  //
-  // Before parallel exploration: admission must reserve against the family authority atomically, in
-  // the same BEGIN IMMEDIATE that claims the attempt, with pending starts counting toward the total
-  // and the reservation settling against the real receipt afterwards. Claudexor states the property
-  // as "admission is atomic and monotonic (pending starts count toward the max)".
+  // Safety comes from admitAttempt(), which adds the authority held by live attempts to settled
+  // spend inside the transaction that claims the attempt. This function is therefore the settled
+  // half of a two-part total and must not be used alone to decide admission.
   familyJobIds(rootJobId) {
     const seen = new Set([rootJobId]);
     const queue = [rootJobId];
@@ -2066,6 +2067,57 @@ export class Dispatcher {
       );
     }
     return spend;
+  }
+
+  // Serializes Git operations that take a repository-wide lock.
+  //
+  // In-process only, and that is the right scope: it protects concurrent attempts driven by one
+  // scheduler, which is the concurrency this system creates. Two schedulers on one repository would
+  // still contend, and Git's own locking is what covers that -- this exists so the common case does
+  // not depend on losing a race gracefully.
+  withRepositoryLock(repoPath, action) {
+    const previous = this.repositoryLocks.get(repoPath) ?? Promise.resolve();
+    // Chained on settlement rather than success: a failed worktree creation must not wedge the lock
+    // for every attempt that follows it.
+    const next = previous.then(action, action);
+    this.repositoryLocks.set(repoPath, next.then(() => {}, () => {}));
+    return next;
+  }
+
+  // May this job claim an attempt right now, given what is already live?
+  //
+  // The scheduler admitted exactly one live attempt at a time. That was the right default while
+  // fencing, budget admission and cancellation all assumed a single worker -- and it is what kept
+  // the previous lane from switching concurrency on before the coordinator could handle it.
+  //
+  // It is relaxed NARROWLY, for the one shape that has been made safe:
+  //
+  //   concurrent      read-mode MANAGER_EXPLORATION children of the SAME root
+  //   serialized      everything else -- unrelated roots, root implementations, revisions,
+  //                   any write child, and integration
+  //
+  // Read investigations are the case where concurrency is both valuable and cheap to reason about:
+  // they cannot produce a candidate, cannot integrate, and are refused outright if they modify the
+  // tree, so two of them running together cannot interfere through anything but budget -- which
+  // admitAttempt() now settles atomically.
+  assertAdmissible(jobId) {
+    const job = this.getJob(jobId);
+    const root = this.budgetRootJobId(jobId);
+    const incomingParallel = isParallelExploration(job);
+    const live = this.db.prepare(`SELECT a.id, a.job_id, j.parent_job_id, j.internal_kind, j.mode
+      FROM attempts a JOIN jobs j ON j.id = a.job_id
+      WHERE ${lifecycleActive("a")}`).all();
+    for (const other of live) {
+      const compatible = incomingParallel
+        && isParallelExploration(other)
+        && this.budgetRootJobId(other.job_id) === root;
+      if (!compatible) {
+        throw new Error(
+          `Bootstrap scheduler already has live attempt ${other.id}`
+          + (incomingParallel ? " that is not a sibling investigation of the same root" : ""),
+        );
+      }
+    }
   }
 
   // Which scheduler incarnation currently owns callbacks.
