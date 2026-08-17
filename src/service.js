@@ -28,6 +28,8 @@ import {
   readRestoreMarker, clearRestoreMarker,
 } from "./recovery.js";
 
+const ROOTS_ONLY = "parent_job_id IS NULL";
+
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 
@@ -480,7 +482,34 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
   }
 
+  // --- Three sizes of the same world ------------------------------------------------------------
+  //
+  //   everyday      the ROOT job. What a person asked for.
+  //   accounting    the whole FAMILY. What it cost, and what recovery must reason about.
+  //   detailed      a root with its children, on request.
+  //
+  // A manager's exploration children are real jobs with real cost and real evidence, and they stay
+  // fully visible to doctor, reconciliation, family spend and attempt recovery. They are not work
+  // the operator asked for, so listing them on an everyday surface turns the product into its own
+  // implementation: "Investigate cancellation semantics -- Done -- $0.0014" is plumbing wearing the
+  // costume of a deliverable.
+  //
+  // Filtered at the SQL projection rather than in presentation, because these rows do not merely get
+  // displayed. They feed totals, per-project attention counts, which project looks busiest, and
+  // truncation arithmetic -- a caller that filtered only the final text would still be reading
+  // numbers that had counted them.
   listJobs(projectId = null) {
+    if (projectId) {
+      return this.db.prepare(
+        `SELECT * FROM jobs WHERE project_id = ? AND ${ROOTS_ONLY} ORDER BY created_at DESC`,
+      ).all(projectId);
+    }
+    return this.db.prepare(`SELECT * FROM jobs WHERE ${ROOTS_ONLY} ORDER BY created_at DESC`).all();
+  }
+
+  // Every job, internal children included. For recovery, forensics and accounting; never for an
+  // everyday surface.
+  listAllJobs(projectId = null) {
     if (projectId) return this.db.prepare("SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at DESC").all(projectId);
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all();
   }
@@ -496,7 +525,7 @@ export class Dispatcher {
 
   attention() {
     const jobs = this.db.prepare(`SELECT * FROM jobs
-      WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+      WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION') AND ${ROOTS_ONLY}
       ORDER BY updated_at`).all();
     const unresolvedIntegrations = this.doctor().unresolved_integrations;
     // A proposal nobody can see is a proposal nobody acts on: surface it in the normal path rather
@@ -514,7 +543,7 @@ export class Dispatcher {
     const jobTotals = this.db.prepare(`SELECT
       COALESCE(SUM(CASE WHEN status = 'NEEDS_ATTENTION' THEN 1 ELSE 0 END), 0) AS needs_attention,
       COALESCE(SUM(CASE WHEN status = 'READY_FOR_INTEGRATION' THEN 1 ELSE 0 END), 0) AS ready_for_integration
-      FROM jobs`).get();
+      FROM jobs WHERE ${ROOTS_ONLY}`).get();
     const unresolvedIntegrations = doctor.unresolved_integrations.length;
     const activeAttempts = doctor.running_attempts.length;
     const pendingProposalTotal = this.db.prepare(`SELECT COUNT(*) AS count FROM work_proposals w
@@ -524,11 +553,11 @@ export class Dispatcher {
         p.id,
         p.name,
         p.integration_branch,
-        (SELECT j.id FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_id,
-        (SELECT j.status FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_status,
-        (SELECT j.updated_at FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_updated_at,
-        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'NEEDS_ATTENTION') AS needs_attention,
-        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'READY_FOR_INTEGRATION') AS ready_for_integration
+        (SELECT j.id FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_id,
+        (SELECT j.status FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_status,
+        (SELECT j.updated_at FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_updated_at,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} AND j.status = 'NEEDS_ATTENTION') AS needs_attention,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} AND j.status = 'READY_FOR_INTEGRATION') AS ready_for_integration
       FROM projects p
       ORDER BY (needs_attention + ready_for_integration) DESC,
         COALESCE(latest_job_updated_at, p.created_at) DESC,
@@ -589,7 +618,7 @@ export class Dispatcher {
           j.updated_at AS updated_at,
           CASE WHEN j.status = 'NEEDS_ATTENTION' THEN 1 ELSE 2 END AS priority
         FROM jobs j JOIN projects p ON p.id = j.project_id
-        WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+        WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION') AND j.${ROOTS_ONLY}
       )
       ORDER BY priority, updated_at DESC, id
       LIMIT ?`)
@@ -1216,8 +1245,14 @@ export class Dispatcher {
     const money = (value) => (value === null || value === undefined ? null : Number(value.toFixed(6)));
 
     // Cost is reported with its completeness, never as a bare number that might be silently partial.
+    // Everyday cost is the FAMILY total, not the root job's own attempts.
+    //
+    // Hiding exploration children from the surface without changing this would hide their spend
+    // too: a managed root would report only what its implementation attempts cost, and the
+    // investigations that produced the brief would vanish from the operator's account entirely.
+    // A direct root's family contains only itself, so the two cases unify rather than branch.
     const jobCost = (jobId) => {
-      const spend = this.jobSpend(jobId);
+      const spend = this.familySpend(jobId);
       return {
         reference_cost_usd: money(spend.spent),
         complete: spend.complete,
@@ -1227,8 +1262,14 @@ export class Dispatcher {
 
     const working = this.db.prepare(`SELECT j.id, j.goal, p.name AS project, j.updated_at
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'RUNNING' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
-      .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
+      WHERE j.status = 'RUNNING' AND j.parent_job_id IS NULL AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      // Cost belongs here too, and only becomes true once it is the FAMILY's cost. A managed root is
+      // at its most expensive while it is working -- that is when it is buying investigations -- and
+      // "Working" with no figure is the moment an operator most wants one.
+      .map((row) => ({
+        job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at,
+        cost: jobCost(row.id),
+      }));
 
     const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
       // Written as the question a person is actually being asked. The identifier stays in the
@@ -1247,7 +1288,7 @@ export class Dispatcher {
     const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, ip.attempt_id, j.goal, p.name AS project
       FROM integration_proposals ip
       JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
-      WHERE ip.state = 'OPEN' AND p.retired_at IS NULL
+      WHERE ip.state = 'OPEN' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_records r
           WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
@@ -1286,7 +1327,8 @@ export class Dispatcher {
         (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id
          ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'NEEDS_ATTENTION' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      WHERE j.status = 'NEEDS_ATTENTION' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
+      ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
       .map((row) => {
         // What happened to the change, then what it means, then the mechanism -- never the internal
         // state name. `why` is retained because callers and the detailed tools already use it.
@@ -1307,7 +1349,7 @@ export class Dispatcher {
     // A job whose integration was rolled back is not Done: the change it describes is gone.
     const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'SUCCEEDED' AND p.retired_at IS NULL
+      WHERE j.status = 'SUCCEEDED' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_rollbacks rb
           JOIN integration_proposals ip ON ip.id = rb.proposal_id
@@ -2255,7 +2297,30 @@ export class Dispatcher {
     const attempts = this.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(jobId);
     const validations = this.db.prepare(`SELECT v.* FROM validation_runs v
       JOIN attempts a ON a.id = v.attempt_id WHERE a.job_id = ? ORDER BY v.started_at`).all(jobId);
-    return { job, attempts, validations };
+    return { job, attempts, validations, family: this.jobFamily(jobId) };
+  }
+
+  // The detailed view: a root with the work it commissioned, and what the whole thing cost.
+  //
+  // A separate projection rather than an `includeInternal` flag on listJobs, because these are
+  // different questions rather than the same question with a wider filter. "What am I working on"
+  // wants roots; "what did this job actually do" wants a root and its children. A boolean would let
+  // a caller ask the first question and receive an answer to the second.
+  //
+  // A direct job's family is simply empty, so callers do not branch on strategy.
+  jobFamily(jobId) {
+    const children = this.db.prepare(
+      "SELECT * FROM jobs WHERE parent_job_id = ? ORDER BY created_at",
+    ).all(jobId).map((child) => ({
+      id: child.id,
+      internal_kind: child.internal_kind,
+      goal: child.goal,
+      mode: child.mode,
+      status: child.status,
+      attempts: this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(child.id).count,
+      cost: this.jobSpend(child.id),
+    }));
+    return { children, aggregate_cost: this.familySpend(jobId) };
   }
 
   planDigest(commands) {
