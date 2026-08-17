@@ -17,7 +17,9 @@ import { managedPaths } from "./paths.js";
 //     written against.
 // 20: a managed root becomes integration-ready only when a REVIEW turn accepted one exact attempt,
 //     and manager_runs records which one.
-export const SCHEMA_VERSION = "20";
+// 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
+//     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
+export const SCHEMA_VERSION = "21";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -160,6 +162,15 @@ CREATE TABLE IF NOT EXISTS attempts (
   -- What the worker said it did, as an immutable artifact. The candidate is what it actually did;
   -- this is testimony, and the reviewer needs both to notice when they disagree.
   result_text_artifact TEXT,
+  -- Spending authority claimed for this attempt, in the same transaction that created it.
+  --
+  -- Authority, not a cap: a provider call cannot be preempted mid-flight, so an attempt may still
+  -- overshoot what it reserved and that is recorded as an overrun. What this guarantees is that a
+  -- family never AUTHORIZES more than its ceiling at one time, which is the property a check that
+  -- sums only settled receipts cannot provide once siblings can start together.
+  --
+  -- NULL means the family carries no ceiling, so there was no authority to divide.
+  budget_reservation_usd REAL CHECK (budget_reservation_usd IS NULL OR budget_reservation_usd > 0),
   UNIQUE(job_id, ordinal)
 );
 
@@ -723,6 +734,9 @@ function migrate(db) {
     if (!attemptColumns.includes(column)) {
       db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
     }
+  }
+  if (!attemptColumns.includes("budget_reservation_usd")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN budget_reservation_usd REAL");
   }
   const workProposalColumns = db.prepare("PRAGMA table_info(work_proposals)").all().map((column) => column.name);
   if (workProposalColumns.length) {

@@ -689,7 +689,7 @@ export class Dispatcher {
   // rewriting one from nothing, while snapshotCandidate still measures the result against the
   // AUTHORIZED base, so what is offered for integration remains one complete net change from what
   // the operator approved.
-  async runJob(jobId, { model = null, instruction = null, startSha = null } = {}) {
+  async runJob(jobId, { model = null, instruction = null, startSha = null, reservationRequest = null } = {}) {
     model = this.resolveModel(model);
     // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
     // A job may ask for a narrower worker; otherwise the system default applies.
@@ -750,13 +750,30 @@ export class Dispatcher {
       const ordinal = previousAttempts + 1;
       const attemptId = `${job.id}.${ordinal}`;
       const worktreePath = path.join(this.paths.worktrees, project.id, `attempt-${ordinal}-${job.id.slice(-8)}`);
-      const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
-      const epoch = currentEpoch + 1;
-      this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
+      // The GENERATION this attempt belongs to -- not a per-attempt sequence number.
+      //
+      // This integer used to be incremented on every claim, and acceptAttemptEvent required the
+      // attempt's value to equal the CURRENT global value. Together those meant "only the newest
+      // attempt anyone created may speak", which was true and harmless while exactly one attempt
+      // could be alive. Under concurrency it is fatal: start sibling B and sibling A's executor
+      // result, usage receipt and terminal transition are all rejected as stale, so the second
+      // exploration silently invalidates the first.
+      //
+      // The integer now carries only the meaning it always needed to: which scheduler incarnation
+      // owns callbacks. It advances on restart, takeover and reconciliation -- never per attempt --
+      // so siblings share a generation and coexist, while a callback from a scheduler that has since
+      // been superseded is still fenced out. Per-attempt identity is carried where it belongs, by
+      // the attempt id and its executor/validation intent ids.
+      const epoch = this.schedulerGeneration();
+
+      // Authority for this attempt's spend, claimed atomically with the attempt itself.
+      const reservation = this.admitAttempt({ jobId, requested: reservationRequest });
+
       this.db.prepare(`INSERT INTO attempts(
         id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
-        scheduler_pid, worktree_path, started_at, start_sha, instruction_digest
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        scheduler_pid, worktree_path, started_at, start_sha, instruction_digest,
+        budget_reservation_usd
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         attemptId, jobId, ordinal, epoch, backend.constructor.name,
         // Recorded before the worker starts: the authority a worker ran under is evidence, not a
         // detail to be reconstructed afterwards from which artifacts happen to exist.
@@ -765,9 +782,13 @@ export class Dispatcher {
         // Both recorded in the claim, before any worker runs. The digest is what makes "attempt 2 was
         // told something different from attempt 1" a mechanical fact rather than the manager's word.
         startFrom, instructionDigest(instructionText),
+        reservation,
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
-      recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch,
+        payload: { reservation_usd: reservation },
+      });
       return { epoch, ordinal, attemptId, worktreePath };
     });
     const { epoch, attemptId, worktreePath } = claim;
@@ -998,6 +1019,13 @@ export class Dispatcher {
       const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
       const terminalMatches = attempt?.terminal_state === (expected.terminalState ?? null);
       const validationMatches = expected.validationState === undefined || attempt?.validation_state === expected.validationState;
+      // `currentEpoch !== epoch` now reads as "this attempt belongs to the scheduler generation that
+      // is currently in charge", because the generation no longer advances per attempt. It used to
+      // read as "this is the newest attempt anyone created", which rejected any sibling's callback
+      // the moment a second attempt started.
+      //
+      // Per-attempt identity is carried by attemptId and by the executor/validation intent ids that
+      // every caller checks, so nothing was weakened by removing that accidental exclusivity.
       if (!attempt || attempt.scheduler_epoch !== epoch || currentEpoch !== epoch || !terminalMatches || !validationMatches) {
         throw new Error(`Stale or terminal attempt event rejected for ${attemptId}`);
       }
@@ -2040,6 +2068,93 @@ export class Dispatcher {
     return spend;
   }
 
+  // Which scheduler incarnation currently owns callbacks.
+  schedulerGeneration() {
+    return Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+  }
+
+  // Authority held by attempts that are alive right now.
+  //
+  // Counted as PENDING spend even though nothing has been billed yet, which is the whole point: a
+  // check that only sums settled receipts lets N simultaneous starts each observe the same headroom
+  // and collectively spend N times it. Claudexor states the property as admission being "atomic and
+  // monotonic (pending starts count toward the max)".
+  reservedAuthority(rootJobId, { excludeAttemptId = null } = {}) {
+    const ids = this.familyJobIds(rootJobId);
+    const rows = this.db.prepare(`SELECT a.id, a.budget_reservation_usd FROM attempts a
+      WHERE a.job_id IN (${ids.map(() => "?").join(",")}) AND ${lifecycleActive("a")}`).all(...ids);
+    return rows
+      .filter((row) => row.id !== excludeAttemptId)
+      .reduce((total, row) => total + (row.budget_reservation_usd ?? 0), 0);
+  }
+
+  // Claims spending authority for one new attempt, or refuses.
+  //
+  // MUST be called inside the same BEGIN IMMEDIATE that creates the attempt. That is what makes it
+  // atomic: two schedulers cannot both read the same headroom, because the second blocks until the
+  // first has committed its reservation and then sees it.
+  //
+  //   settled family spend + authority held by live attempts + this request  <=  ceiling
+  //
+  // A reservation is AUTHORITY, not a spend cap. delegate-wave cannot preempt a provider mid-call,
+  // so an attempt can still overshoot what it reserved; that is recorded as an overrun rather than
+  // pretended away. What the reservation guarantees is that the family never AUTHORIZES more than
+  // the ceiling at once.
+  //
+  // `requested` defaults to the entire remaining headroom, which preserves today's serial behaviour
+  // exactly: one attempt at a time may use everything that is left. Splitting that authority among
+  // concurrent children is an allocation policy, and belongs to the lane that introduces them.
+  admitAttempt({ jobId, requested = null }) {
+    const { rootJobId, ceiling } = this.budgetAuthority(jobId);
+    if (ceiling === null || ceiling === undefined) return null;
+
+    const spend = this.familySpend(rootJobId);
+    if (!spend.complete) {
+      throw new Error(
+        `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
+        + `the ${ceiling} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
+      );
+    }
+    const reserved = this.reservedAuthority(rootJobId);
+    const remaining = ceiling - spend.spent - reserved;
+    if (remaining <= 0) {
+      throw new Error(
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling`
+        + `${reserved > 0 ? ` with ${reserved.toFixed(6)} reserved by live attempts` : ""}`
+        + "; refusing to start more work",
+      );
+    }
+    const reservation = requested === null ? remaining : Number(requested);
+    if (!(reservation > 0)) throw new Error("A budget reservation must be a positive amount");
+    if (reservation > remaining + 1e-12) {
+      throw new Error(
+        `Job ${jobId} requested ${reservation.toFixed(6)} of authority but only `
+        + `${remaining.toFixed(6)} remains of its ${ceiling} family ceiling`,
+      );
+    }
+    return reservation;
+  }
+
+  // What an attempt actually spent against what it was authorized to.
+  //
+  // An overrun is not an admission failure. It is the standing fact that provider spend cannot be
+  // preempted exactly inside one call, recorded rather than reconciled away.
+  attemptOverrun(attemptId) {
+    const attempt = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
+    if (!attempt || attempt.budget_reservation_usd === null) return null;
+    const receipt = this.getAttemptUsage(attemptId);
+    if (!receipt || receipt.status !== "COMPLETE" || receipt.reference_cost_usd === null) {
+      return { attempt_id: attemptId, reserved: attempt.budget_reservation_usd, spent: null, overrun: null };
+    }
+    const overrun = receipt.reference_cost_usd - attempt.budget_reservation_usd;
+    return {
+      attempt_id: attemptId,
+      reserved: attempt.budget_reservation_usd,
+      spent: receipt.reference_cost_usd,
+      overrun: overrun > 0 ? overrun : 0,
+    };
+  }
+
   // What the ceiling turned out to mean, once the work is done and the receipts are in.
   //
   // The start gate above can only ever ask "was the budget intact BEFORE this?", so a ceiling has
@@ -2139,8 +2254,21 @@ export class Dispatcher {
     // succeeded but whose validation is still pending is running work: the job is RUNNING and a
     // validation process may be alive, so treating it as "nothing running" would make cancel useless
     // for exactly the phase most likely to hang.
-    const active = this.db.prepare(`SELECT * FROM attempts WHERE job_id = ?
-      AND ${lifecycleActive()} ORDER BY ordinal DESC LIMIT 1`).get(jobId);
+    // Searched across the whole FAMILY, not just this job.
+    //
+    // During exploration the running worker belongs to a CHILD while the root itself has no active
+    // attempt at all. A root-only query therefore found nothing, reported NOTHING_RUNNING, and left
+    // the investigation running -- cancelling a managed job did not cancel the work it was doing.
+    // That hole exists in the serial implementation already; concurrency only multiplies it.
+    //
+    // Delegation is capped at one level, so this is a two-level walk rather than a recursive engine.
+    const familyIds = this.familyJobIds(jobId);
+    const activeInFamily = this.db.prepare(`SELECT * FROM attempts
+      WHERE job_id IN (${familyIds.map(() => "?").join(",")}) AND ${lifecycleActive()}
+      ORDER BY started_at`).all(...familyIds);
+    // The root's own attempt is preferred as the intent's subject when it has one, so a direct job's
+    // records are byte-for-byte what they were before family cancellation existed.
+    const active = activeInFamily.find((attempt) => attempt.job_id === jobId) ?? activeInFamily[0] ?? null;
 
     // Record the intent before touching any process.
     const intentId = id("cancel");
@@ -2248,7 +2376,9 @@ export class Dispatcher {
           executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
           WHERE id = ?`).run(now(), active.id);
       }
-      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), jobId);
+      // The attempt's OWN job is cancelled, which for an exploration child is the child. The root is
+      // cancelled below, once every live attempt in the family has settled.
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), active.job_id);
       recordEvent(this.db, {
         kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: active.id, epoch,
         payload: { intentId, killedPid, phase: stillValidating ? "validation" : "executor" },
@@ -2256,9 +2386,74 @@ export class Dispatcher {
       return true;
     });
 
+    // Every OTHER live attempt in the family, under its own identity.
+    //
+    // Two levels of delegation means at most root + children, so this is a loop rather than a
+    // recursive engine. Each sibling is killed and marked separately because each is its own attempt
+    // with its own executor, and a single receipt covering several of them would say less than the
+    // system knows.
+    const siblings = [];
+    for (const other of activeInFamily) {
+      if (other.id === active.id) continue;
+      siblings.push(this.cancelFamilyAttempt(other, { intentId, epoch }));
+    }
+
+    // The root settles only once nothing in the family is still running.
+    if (this.familyHasLiveAttempt(jobId)) {
+      return settle("CANCELLED", `attempt ${active.id} cancelled; family still settling`, killedPid);
+    }
+    this.db.prepare(
+      "UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ? AND status NOT IN ('SUCCEEDED', 'READY_FOR_INTEGRATION')",
+    ).run(now(), jobId);
+
+    const detail = siblings.length
+      ? `attempt ${active.id} cancelled, plus ${siblings.length} sibling attempt(s)`
+      : `attempt ${active.id} cancelled`;
     return applied
-      ? settle("CANCELLED", `attempt ${active.id} cancelled`, killedPid)
+      ? settle("CANCELLED", detail, killedPid)
       : settle("ALREADY_TERMINAL", `attempt ${active.id} reached a terminal state first`, killedPid);
+  }
+
+  familyHasLiveAttempt(rootJobId) {
+    const ids = this.familyJobIds(rootJobId);
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM attempts WHERE job_id IN (${ids.map(() => "?").join(",")}) AND ${lifecycleActive()} LIMIT 1`,
+    ).get(...ids));
+  }
+
+  // Kills and marks one additional live attempt during a family cancellation.
+  cancelFamilyAttempt(attempt, { intentId, epoch }) {
+    const validating = attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING";
+    const targetPid = validating ? attempt.validation_pid : attempt.executor_pid;
+    let killedPid = null;
+    if (targetPid && ![process.pid, attempt.scheduler_pid].filter(Boolean).includes(targetPid)) {
+      try { process.kill(targetPid); killedPid = targetPid; } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    transaction(this.db, () => {
+      const current = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attempt.id);
+      if (!current || current.scheduler_epoch !== epoch) return;
+      const stillValidating = current.terminal_state === "SUCCEEDED" && current.validation_state === "PENDING";
+      if (current.terminal_state !== null && !stillValidating) return;
+      if (stillValidating) {
+        this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN',
+          validation_intent_id = NULL, validation_pid = NULL,
+          failure_signature = 'cancelled-during-validation', quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(attempt.id);
+      } else {
+        this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
+          executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(now(), attempt.id);
+      }
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
+        .run(now(), current.job_id);
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: attempt.id, epoch,
+        payload: { intentId, killedPid, family: true, phase: stillValidating ? "validation" : "executor" },
+      });
+    });
+    return { attempt_id: attempt.id, killed_pid: killedPid };
   }
 
   async failAttempt({ attemptId, jobId, epoch, project, worktreePath, executorIntentId = null, error }) {
