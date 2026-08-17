@@ -207,6 +207,22 @@ export class CodexAppServer {
     return threadId;
   }
 
+  // The same call, reporting what the server said about the resolved model rather than only the id.
+  //
+  // Returns `model: null` when nothing was reported. That null is a real answer -- "this version does
+  // not tell us what ran" -- and it must survive to the receipt rather than being backfilled with the
+  // requested model, which would record a preference as an observation.
+  async startThreadDetailed({ cwd, model, effort = null, developerInstructions = null }) {
+    const params = { cwd, ephemeral: false };
+    if (model) params.config = { model };
+    if (effort) params.config = { ...(params.config ?? {}), model_reasoning_effort: effort };
+    if (developerInstructions) params.developerInstructions = developerInstructions;
+    const result = await this.request("thread/start", params, HANDSHAKE_TIMEOUT_MS);
+    const threadId = result?.thread?.id ?? result?.threadId ?? null;
+    if (!threadId) throw new Error("thread/start returned no thread id");
+    return { threadId, model: result?.thread?.model ?? result?.model ?? null };
+  }
+
   async resumeThread({ threadId, cwd }) {
     const result = await this.request("thread/resume", { threadId, cwd }, HANDSHAKE_TIMEOUT_MS);
     return result?.thread?.id ?? threadId;

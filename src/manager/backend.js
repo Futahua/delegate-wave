@@ -48,7 +48,7 @@ export class FakeManagerBackend extends ManagerBackend {
 
   async startRun({ model = "fake-manager" } = {}) {
     this.threads += 1;
-    return { threadId: `fake-thread-${this.threads}`, model };
+    return { threadId: `fake-thread-${this.threads}`, requestedModel: model, actualModel: model };
   }
 
   async runTurn({ threadId, phase, prompt, subjectAttemptId = null }) {
@@ -114,15 +114,27 @@ export class CodexManagerBackend extends ManagerBackend {
     return this.server;
   }
 
+  // Returns what was ASKED FOR and what actually RAN, as two separate facts.
+  //
+  // `model: this.model ?? "codex-default"` was provenance theatre: "codex-default" is a
+  // configuration label describing the absence of a setting, and recording it would put a string
+  // that names no model into the column that answers "which model did this cost pay for?". When the
+  // App Server does not report a resolved model, unknown is the correct answer and null is how it is
+  // written. Manufactured provenance is worse than missing provenance, because only one of them is
+  // detectable later.
   async startRun() {
     const server = await this.server_();
-    const threadId = await server.startThread({
+    const started = await server.startThreadDetailed({
       cwd: this.workingDirectory,
       model: this.model,
       effort: this.effort,
       developerInstructions: MANAGER_SYSTEM_INSTRUCTIONS,
     });
-    return { threadId, model: this.model ?? "codex-default" };
+    return {
+      threadId: started.threadId,
+      requestedModel: this.model ?? null,
+      actualModel: started.model ?? null,
+    };
   }
 
   async resumeRun({ threadId }) {

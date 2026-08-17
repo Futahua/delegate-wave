@@ -395,7 +395,12 @@ CREATE TABLE IF NOT EXISTS manager_runs (
     'PLANNING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING',
     'ACCEPTED', 'AWAITING_HUMAN', 'FAILED', 'CANCELLED'
   )),
-  model TEXT,
+  -- What was asked for, and what the provider says actually ran. Two facts, because they can differ
+  -- and only one of them is evidence. actual_model stays NULL when the provider reports nothing:
+  -- backfilling it from the request would record a preference as an observation, and a manufactured
+  -- provenance is worse than a missing one because only the missing one is detectable later.
+  requested_model TEXT,
+  actual_model TEXT,
   -- The manager's conversation identity with its provider. One managed job is one thread, so the
   -- manager's own context is the provider's problem rather than something reassembled per turn.
   thread_id TEXT,
@@ -466,13 +471,22 @@ CREATE TABLE IF NOT EXISTS manager_usage_receipts (
   reasoning_tokens INTEGER,
   cache_read_tokens INTEGER,
   cache_write_tokens INTEGER,
+  -- The provider's own reported total, kept separately from the component split.
+  --
+  -- These are two different measurements with two different reliabilities, and collapsing them
+  -- loses the good one. Whether cachedInputTokens nests inside inputTokens is genuinely ambiguous;
+  -- the total is not ambiguous at all. Since the primary metric is strong tokens per finished task,
+  -- an unresolvable decomposition must not be allowed to destroy a figure the provider stated
+  -- exactly.
+  total_tokens INTEGER,
   source TEXT NOT NULL,
   observed_at TEXT NOT NULL,
-  -- An UNKNOWN receipt carries no numbers. A manager whose provider reported nothing has unknown
-  -- cost, not zero cost, and the difference is the entire point of measuring the scarce side.
+  -- An UNKNOWN receipt carries no numbers at all, including no total. A manager whose provider
+  -- reported nothing has unknown cost, not zero cost, and the difference is the entire point of
+  -- measuring the scarce side.
   CHECK (status != 'UNKNOWN' OR (
     input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
-    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL AND total_tokens IS NULL
   )),
   CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0))
 );
@@ -547,8 +561,19 @@ CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
 CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_rollbacks_proposal ON integration_rollbacks(proposal_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_manager_turns_run ON manager_turns(manager_run_id, ordinal);
+`;
+
+// Indexes over columns that MIGRATIONS add.
+//
+// These cannot live in SCHEMA. openDatabase() runs SCHEMA first, where CREATE TABLE IF NOT EXISTS
+// leaves an existing table at its old shape, and only then runs migrate() to add columns. An index
+// in SCHEMA naming a migrated column therefore executes against a table that does not have it yet,
+// and opening any real pre-19 database throws "no such column" before a single migration runs.
+//
+// Fresh-root tests never see this: their tables are created by SCHEMA with every column present.
+const POST_MIGRATION_INDEXES = `
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 `;
 
 export function initializeDataRoot(root) {
@@ -661,6 +686,47 @@ function migrate(db) {
   if (!attemptColumns.includes("executor_intent_id")) {
     db.exec("ALTER TABLE attempts ADD COLUMN executor_intent_id TEXT");
   }
+  // Schema 19's attempt columns.
+  //
+  // Declaring these only in the fresh SCHEMA was a real defect, not a tidiness issue: an existing
+  // installation would be stamped schema 19 by the version write at the end of this function and
+  // then fail its very next runJob() INSERT, because the columns it names do not exist. Fresh-root
+  // tests cannot see this class of bug at all -- they create the table from SCHEMA and never migrate.
+  //
+  // Left NULL for attempts that predate them, which is the truth: those attempts were given the
+  // job's goal as their instruction, but no artifact of it was written and inventing a digest for a
+  // file that never existed would fabricate provenance.
+  for (const column of ["start_sha", "instruction_artifact", "instruction_digest", "result_text_artifact"]) {
+    if (!attemptColumns.includes(column)) {
+      db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
+    }
+  }
+  const workProposalColumns = db.prepare("PRAGMA table_info(work_proposals)").all().map((column) => column.name);
+  if (workProposalColumns.length) {
+    if (!workProposalColumns.includes("expected_base_sha")) {
+      db.exec("ALTER TABLE work_proposals ADD COLUMN expected_base_sha TEXT");
+    }
+    if (!workProposalColumns.includes("strategy")) {
+      db.exec("ALTER TABLE work_proposals ADD COLUMN strategy TEXT NOT NULL DEFAULT 'direct'");
+    }
+  }
+  const managerRunColumns = db.prepare("PRAGMA table_info(manager_runs)").all().map((column) => column.name);
+  if (managerRunColumns.length) {
+    if (!managerRunColumns.includes("requested_model")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN requested_model TEXT");
+    }
+    if (!managerRunColumns.includes("actual_model")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN actual_model TEXT");
+    }
+  }
+  const managerTurnColumns = db.prepare("PRAGMA table_info(manager_turns)").all().map((column) => column.name);
+  if (managerTurnColumns.length && !managerTurnColumns.includes("subject_attempt_id")) {
+    db.exec("ALTER TABLE manager_turns ADD COLUMN subject_attempt_id TEXT REFERENCES attempts(id)");
+  }
+  const managerUsageColumns = db.prepare("PRAGMA table_info(manager_usage_receipts)").all().map((column) => column.name);
+  if (managerUsageColumns.length && !managerUsageColumns.includes("total_tokens")) {
+    db.exec("ALTER TABLE manager_usage_receipts ADD COLUMN total_tokens INTEGER");
+  }
   const proposalColumns = db.prepare("PRAGMA table_info(integration_proposals)").all().map((column) => column.name);
   if (!proposalColumns.includes("validation_plan_json")) {
     db.exec("ALTER TABLE integration_proposals ADD COLUMN validation_plan_json TEXT NOT NULL DEFAULT '[]'");
@@ -687,6 +753,8 @@ function migrate(db) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
+  // Only now that every column exists.
+  db.exec(POST_MIGRATION_INDEXES);
   db.prepare("UPDATE metadata SET value = ? WHERE key = 'schema_version'").run(SCHEMA_VERSION);
 }
 

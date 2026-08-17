@@ -259,7 +259,7 @@ test("the default profile is trusted, and an unknown one is refused", async () =
 // and the whole point of the default would be lost silently -- no error, just a weaker worker.
 test("the trusted prompt grants the tools the trusted profile actually enables", async () => {
   const { workerPrompt } = await import("../src/harness/backend.js");
-  const prompt = workerPrompt({ goal: "add a totals file", mode: "write", profile: "trusted" });
+  const prompt = workerPrompt({ instruction: "add a totals file", mode: "write", profile: "trusted" });
 
   assert.ok(!/shell access is intentionally disabled/i.test(prompt),
     "a worker holding a shell must not be told it has none");
@@ -271,7 +271,7 @@ test("the trusted prompt grants the tools the trusted profile actually enables",
 
 test("the restricted prompt still states the confinement it really has", async () => {
   const { workerPrompt } = await import("../src/harness/backend.js");
-  const prompt = workerPrompt({ goal: "add a totals file", mode: "write", profile: "restricted" });
+  const prompt = workerPrompt({ instruction: "add a totals file", mode: "write", profile: "restricted" });
   assert.match(prompt, /shell access is intentionally disabled/i);
   assert.match(prompt, /outside this worktree/i);
 });
@@ -280,7 +280,7 @@ test("the restricted prompt still states the confinement it really has", async (
 test("both write prompts tell the worker its claims are not acceptance", async () => {
   const { workerPrompt, CAPABILITY_PROFILES } = await import("../src/harness/backend.js");
   for (const profile of Object.keys(CAPABILITY_PROFILES)) {
-    const prompt = workerPrompt({ goal: "x", mode: "write", profile });
+    const prompt = workerPrompt({ instruction: "x", mode: "write", profile });
     assert.match(prompt, /not treat your own claims as acceptance/i, `${profile} states the invariant`);
   }
 });
@@ -290,7 +290,7 @@ test("both write prompts tell the worker its claims are not acceptance", async (
 // and here it would also deny a genuinely useful tool for no remaining reason.
 test("the trusted prompt permits local Git and says why history is not integration", async () => {
   const { workerPrompt } = await import("../src/harness/backend.js");
-  const prompt = workerPrompt({ goal: "x", mode: "write", profile: "trusted" });
+  const prompt = workerPrompt({ instruction: "x", mode: "write", profile: "trusted" });
   assert.match(prompt, /local commits/i, "local Git is explicitly available");
   assert.match(prompt, /not integration/i, "and explicitly not the integration object");
   assert.match(prompt, /Do not push/i, "pushing is still discouraged");
@@ -300,7 +300,7 @@ test("the trusted prompt permits local Git and says why history is not integrati
 test("read mode is unchanged by the capability profile", async () => {
   const { workerPrompt } = await import("../src/harness/backend.js");
   assert.equal(
-    workerPrompt({ goal: "x", mode: "read", profile: "trusted" }),
-    workerPrompt({ goal: "x", mode: "read", profile: "restricted" }),
+    workerPrompt({ instruction: "x", mode: "read", profile: "trusted" }),
+    workerPrompt({ instruction: "x", mode: "read", profile: "restricted" }),
   );
 });

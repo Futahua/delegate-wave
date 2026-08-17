@@ -588,7 +588,20 @@ export class Dispatcher {
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
     const project = this.getProject(job.project_id);
     const validationPlan = job.mode === "write" ? parseValidationPlan(project.validation_json) : [];
-    const instructionText = instruction ?? job.goal;
+    // Fails closed for managed work.
+    //
+    // `instruction ?? job.goal` for every strategy was the same collapse one level up: a managed
+    // attempt that lost its brief would quietly execute the human's sentence, produce a plausible
+    // candidate, and reach review with nothing in the record showing the manager's instruction never
+    // arrived. Direct mode resolves the objective as its instruction here, explicitly, because
+    // "direct" is a deliberate choice; managed mode has no default at all.
+    if (job.strategy !== "direct" && (typeof instruction !== "string" || !instruction.trim())) {
+      throw new Error(
+        `Job ${jobId} is a ${job.strategy} job and requires an explicit instruction; `
+        + "refusing to substitute the objective for a manager brief",
+      );
+    }
+    const instructionText = job.strategy === "direct" ? (instruction ?? job.goal) : instruction;
     const startFrom = startSha ?? job.base_sha;
     const claim = transaction(this.db, () => {
       const current = this.getJob(jobId);

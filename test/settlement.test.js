@@ -184,7 +184,11 @@ test("children settle against their parent's ceiling, not their own", async (t) 
   assert.equal(service.budgetAuthority(child.id).rootJobId, parent.id);
 
   await service.runJob(child.id, { model: "opencode-go/deepseek-v4-flash" });
-  await service.runJob(parent.id, { model: "opencode-go/deepseek-v4-flash" });
+  // A managed job has no default instruction: the brief must be supplied, or the run is refused.
+  await service.runJob(parent.id, {
+    model: "opencode-go/deepseek-v4-flash",
+    instruction: "Implement the objective as the manager briefed it.",
+  });
 
   // Neither run alone breaches the limit; together they do, and the family is what settles.
   const family = service.familySpend(parent.id);

@@ -129,10 +129,18 @@ export function wireModel(model) {
 // The line that belongs in BOTH prompts is the one about acceptance. A worker may use the machine
 // freely; what it may not do is treat its own claims as the verdict. That is the invariant, and it
 // is stated to the worker rather than left implicit.
-export function workerPrompt({ instruction, goal, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
-  // The instruction is what this worker must do. `goal` is the human objective and is accepted only
-  // as the direct-mode fallback the dispatcher passes explicitly; it must never replace a brief.
-  const task = instruction ?? goal;
+export function workerPrompt({ instruction, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+  // Required, with no fallback to the objective.
+  //
+  // A fallback here would be invisible exactly when it matters: a managed attempt whose brief failed
+  // to arrive would run against the human's sentence instead, produce a plausible candidate, and pass
+  // review -- with nothing in the record showing the manager's instruction never reached anyone. The
+  // dispatcher resolves direct mode's objective-as-instruction explicitly before calling, so by the
+  // time execution reaches here there is exactly one right answer.
+  if (typeof instruction !== "string" || !instruction.trim()) {
+    throw new Error("workerPrompt requires an explicit instruction; the dispatcher must resolve one");
+  }
+  const task = instruction;
   const capabilities = capabilityProfile(profile);
   const acceptance = "Do not treat your own claims as acceptance: delegate-wave validates the result "
     + "afterwards and decides independently what is integrated.";
@@ -356,7 +364,7 @@ export class HarnessBackend {
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
 
-    const prompt = workerPrompt({ goal, mode, profile: this.profile });
+    const prompt = workerPrompt({ instruction, mode, profile: this.profile });
 
     const result = await runProcess(process.execPath, [
       this.entry, "--profile", "headless", "--patch", patchPath, prompt,

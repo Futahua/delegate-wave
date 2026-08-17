@@ -73,8 +73,20 @@ export class OpenCodeBackend {
   }
 
   async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, onSpawn }) {
-    // The instruction is what this worker must do; goal is the objective, never a substitute.
-    const task = instruction ?? goal;
+    // Both dispatcher-contract checks happen before any side effect.
+    //
+    // The model check used to sit after the artifact streams were opened, so a refusal still left
+    // two empty log files behind for an attempt that never ran.
+    //
+    // Fail closed rather than omit the flag: without --model OpenCode falls back to its own ambient
+    // default provider, which is exactly the non-deterministic behaviour this dispatcher forbids.
+    if (!model) throw new Error("OpenCodeBackend requires an explicit --model; the dispatcher must resolve one");
+    // No fallback to the objective. A managed attempt whose brief failed to arrive would otherwise
+    // run against the human's sentence and leave no trace that it happened.
+    if (typeof instruction !== "string" || !instruction.trim()) {
+      throw new Error("OpenCodeBackend requires an explicit instruction; the dispatcher must resolve one");
+    }
+    const task = instruction;
     fs.mkdirSync(artifactDir, { recursive: true });
     const stdoutPath = path.join(artifactDir, "opencode-events.jsonl");
     const stderrPath = path.join(artifactDir, "opencode-stderr.log");
@@ -90,9 +102,6 @@ export class OpenCodeBackend {
       "--dir", worktreePath,
       "--title", `delegate-wave ${attemptId}`,
     ];
-    // Fail closed rather than omit the flag: without --model OpenCode falls back to its own ambient
-    // default provider, which is exactly the non-deterministic behaviour this dispatcher forbids.
-    if (!model) throw new Error("OpenCodeBackend requires an explicit --model; the dispatcher must resolve one");
     args.push("--model", model);
     if (this.attach) args.push("--attach", this.attach);
     const result = await runProcess(this.executable, args, {

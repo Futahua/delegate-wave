@@ -20,6 +20,7 @@ export function unknownManagerUsage(source = "unknown") {
     reasoning_tokens: null,
     cache_read_tokens: null,
     cache_write_tokens: null,
+    total_tokens: null,
     source,
   };
 }
@@ -71,6 +72,18 @@ const READINGS = Object.freeze([
       reasoning_tokens: u.reasoningOutputTokens,
     }),
   },
+  {
+    // The fourth corner. Cache nesting and reasoning nesting are independently unknown, so all four
+    // combinations exist; enumerating three of them silently assumed the two were correlated.
+    id: "cache-disjoint-reasoning-nested",
+    predict: (u) => u.inputTokens + u.cachedInputTokens + u.outputTokens,
+    split: (u) => ({
+      input_tokens: u.inputTokens,
+      cache_read_tokens: u.cachedInputTokens,
+      output_tokens: u.outputTokens - u.reasoningOutputTokens,
+      reasoning_tokens: u.reasoningOutputTokens,
+    }),
+  },
 ]);
 
 export function observeCodexUsage(usage, source = "codex") {
@@ -86,6 +99,11 @@ export function observeCodexUsage(usage, source = "codex") {
   const base = {
     status: USAGE_COMPLETE,
     cache_write_tokens: 0,
+    // Preserved exactly as reported, independent of whether the components can be canonicalized.
+    // The total is not ambiguous even when the split is, and the primary metric is strong tokens per
+    // finished task -- so an unresolvable decomposition must not destroy a figure the provider
+    // stated outright.
+    total_tokens: whole(usage.totalTokens) ? usage.totalTokens : null,
     source,
   };
 
@@ -123,27 +141,50 @@ export function observeCodexUsage(usage, source = "codex") {
   return { ...base, ...first, status: agree ? USAGE_COMPLETE : USAGE_PARTIAL };
 }
 
-// Totals across a manager run, carrying the same honesty forward: a run containing any UNKNOWN or
-// PARTIAL turn cannot report a complete figure, however precise the turns that did report look.
+// Totals across a manager run.
+//
+// TWO independent totals, because they have two different reliabilities and averaging that
+// distinction away would destroy the more trustworthy one.
+//
+//   total_tokens        summed from provider-reported totals. Exact whenever every turn reported
+//                       one, regardless of whether any split could be resolved. This is the primary
+//                       metric -- strong tokens per finished task.
+//   component totals    summed ONLY from COMPLETE receipts.
+//
+// The second restriction is load-bearing. A PARTIAL receipt keeps the raw figures for forensics, and
+// those figures may OVERLAP -- that is exactly why the split could not be resolved. Adding them into
+// the same accumulator as canonicalized ones would re-create the double-counting the whole reading
+// mechanism exists to prevent, one abstraction layer up, and the result would look precise.
 export function summarizeManagerUsage(receipts) {
   const totals = {
     turns: receipts.length,
+    // Provider-reported, the reliable figure.
+    total_tokens: 0,
+    total_complete: true,
+    // Canonicalized components, from COMPLETE receipts only.
     input_tokens: 0,
     output_tokens: 0,
     reasoning_tokens: 0,
     cache_read_tokens: 0,
-    complete: true,
+    components_complete: true,
+    // Turns whose split could not be canonicalized, and turns with no usage at all.
+    ambiguous_turns: 0,
     unmeasured_turns: 0,
   };
   for (const receipt of receipts) {
+    if (receipt.total_tokens === null || receipt.total_tokens === undefined) totals.total_complete = false;
+    else totals.total_tokens += receipt.total_tokens;
+
     if (receipt.status === USAGE_UNKNOWN) {
       totals.unmeasured_turns += 1;
-      totals.complete = false;
+      totals.components_complete = false;
       continue;
     }
     if (receipt.status === USAGE_PARTIAL) {
-      totals.unmeasured_turns += 1;
-      totals.complete = false;
+      // Counted, named, and deliberately NOT added to the component sums.
+      totals.ambiguous_turns += 1;
+      totals.components_complete = false;
+      continue;
     }
     totals.input_tokens += receipt.input_tokens ?? 0;
     totals.output_tokens += receipt.output_tokens ?? 0;

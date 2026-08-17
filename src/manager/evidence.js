@@ -71,25 +71,59 @@ export function buildPlanEvidence({ objective, baseSha, validationCommands, prot
 
 // The pack for a review turn, assembled entirely from one attempt id.
 //
-// `diff` is supplied by the caller because computing it requires Git, which this module deliberately
-// does not reach for -- but it is computed FROM the attempt's own recorded commit and base, so it
-// describes the same tree as everything else here.
-export function buildReviewEvidence({
-  objective, brief, attempt, validationRuns, diff, priorDecisions = [], budget = null,
+// The boundary is `attemptId`, not a bag of pre-fetched pieces. An earlier version accepted
+// `brief`, `validationRuns` and `diff` from the caller, which meant an orchestration bug could hand
+// it attempt A with attempt B's diff -- the precise mixed-evidence failure the comment above claimed
+// was impossible. Nothing crosses this boundary except identifiers, so there is nothing to mismatch.
+//
+//   attemptId -> attempt row -> job -> objective
+//                            -> validation_runs
+//                            -> instruction_artifact   (the exact brief that was sent)
+//                            -> result_text_artifact   (the worker's report)
+//                            -> result_commit + job.base_sha -> diff
+//
+// Git is reached through the injected `diffCommits` so this module stays free of process spawning,
+// but the two commits it is given come from the attempt and its job, never from a caller.
+export async function buildReviewEvidence({
+  db, repoPath, attemptId, diffCommits, priorDecisions = [], budget = null,
 }) {
-  if (!attempt?.id) throw new Error("review evidence requires the attempt it is about");
+  if (!db) throw new Error("review evidence requires the database it reads from");
+  if (!attemptId) throw new Error("review evidence requires the attempt it is about");
+
+  const attempt = db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
+  if (!attempt) throw new Error(`Unknown attempt: ${attemptId}`);
+  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(attempt.job_id);
+  if (!job) throw new Error(`Attempt ${attemptId} has no job`);
+
+  const validationRuns = db.prepare(
+    "SELECT * FROM validation_runs WHERE attempt_id = ? ORDER BY started_at",
+  ).all(attemptId);
+
+  // Read back rather than re-rendered. A re-render could differ from what was actually sent, and the
+  // manager would then be judging work against a brief nobody ever gave.
+  const briefRead = readArtifact(attempt.instruction_artifact, EVIDENCE_LIMITS.instruction, { keep: "head" });
+
+  // Computed from the attempt's own commit against its own job's authorized base. A caller cannot
+  // substitute a different range.
+  let diff = null;
+  if (attempt.result_commit && diffCommits) {
+    diff = await diffCommits(repoPath, job.base_sha, attempt.result_commit);
+  }
+
+  const objective = job.goal;
 
   const changedFiles = (() => {
     try { return JSON.parse(attempt.changed_files_json ?? "[]"); } catch { return []; }
   })();
 
+  const brief = briefRead;
+
   return {
     kind: "REVIEW",
     objective,
-    // The instruction this worker actually received, read back from its artifact rather than
-    // re-rendered. A re-render could differ from what was sent, and then the manager would be
-    // reviewing work against a brief nobody gave.
+    // The instruction this worker actually received, read back from its artifact.
     brief,
+    job_id: job.id,
     subject_attempt_id: attempt.id,
     attempt: {
       id: attempt.id,
@@ -166,7 +200,8 @@ export function renderEvidence(pack) {
   }
 
   section("The brief this worker was given");
-  lines.push(pack.brief ?? "(none recorded)");
+  if (pack.brief) clip(pack.brief, "brief");
+  else lines.push("(no instruction artifact was recorded for this attempt)");
 
   section("What actually changed");
   lines.push(`Attempt ${pack.attempt.id} (${pack.attempt.model ?? "unknown model"})`);
