@@ -683,7 +683,17 @@ export class Dispatcher {
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
         throw new Error(`Job ${jobId} cannot be claimed from ${current?.status ?? "missing"}`);
       }
-      const runningJob = this.db.prepare("SELECT id FROM jobs WHERE status = 'RUNNING' LIMIT 1").get();
+      // A managed root sits at RUNNING for the whole life of its manager run, including while its
+      // manager is thinking and no worker exists. Counting that as "a job is running" would make the
+      // root block its own next attempt and its own exploration children -- it would be the only
+      // thing preventing the work it is supervising.
+      //
+      // The job's own family is therefore excluded here. The authoritative concurrency check is the
+      // live-attempt query below, which counts actual workers rather than lifecycle labels.
+      const familyRoot = this.budgetRootJobId(jobId);
+      const runningJob = this.db.prepare(
+        "SELECT id FROM jobs WHERE status = 'RUNNING' AND id NOT IN (?, ?) LIMIT 1",
+      ).get(jobId, familyRoot);
       if (runningJob) throw new Error(`Bootstrap scheduler already has running job ${runningJob.id}`);
       const conflict = this.db.prepare(`SELECT id FROM attempts WHERE ${lifecycleActive()} LIMIT 1`).get();
       if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
@@ -885,9 +895,29 @@ export class Dispatcher {
             },
           });
         }
-        this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(
-          job.mode === "write" ? "READY_FOR_INTEGRATION" : "SUCCEEDED", now(), jobId,
-        );
+        // READY_FOR_INTEGRATION means different things for the two strategies, and only one of them
+        // is "deterministic validation passed".
+        //
+        // For direct work that is the whole story: a passing candidate is ready for a human. For a
+        // managed root it is not. The manager has not seen the candidate yet, and announcing it as
+        // integration-ready would expose a candidate for approval before the semantic review that
+        // the entire strategy exists to perform -- the operator could integrate work the manager was
+        // about to reject.
+        //
+        // So the promotion belongs to the coordinator, which owns it and grants it only after a
+        // REVIEW turn accepts one exact attempt. The root stays RUNNING here: its manager run is
+        // genuinely still in progress.
+        const managedRoot = job.strategy === "managed" && !job.parent_job_id;
+        const next = managedRoot
+          ? "RUNNING"
+          : (job.mode === "write" ? "READY_FOR_INTEGRATION" : "SUCCEEDED");
+        this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(next, now(), jobId);
+        if (managedRoot) {
+          recordEvent(this.db, {
+            kind: "CANDIDATE_AWAITING_REVIEW", entityType: "job", entityId: jobId, epoch,
+            payload: { attemptId, candidate: resultCommit },
+          });
+        }
       }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
       return this.status(jobId);
     } catch (error) {
@@ -2229,6 +2259,67 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM approval_receipts ORDER BY granted_at").all();
   }
 
+  // Direct work has exactly one passing candidate by construction: attempts stop at the first
+  // success. More than one means the lifecycle was violated, and picking among them would be an
+  // invention.
+  soleCandidate(jobId) {
+    const candidates = this.db.prepare(
+      "SELECT * FROM attempts WHERE job_id = ? AND terminal_state = 'SUCCEEDED' AND validation_state = 'PASSED' ORDER BY ordinal",
+    ).all(jobId);
+    if (candidates.length !== 1) {
+      throw new Error(`Job ${jobId} must have exactly one SUCCEEDED/PASSED candidate attempt, found ${candidates.length}`);
+    }
+    return candidates[0];
+  }
+
+  // Managed work routinely has SEVERAL passing candidates: a revision that fixes a semantic problem
+  // leaves the attempt it corrected behind as evidence, still SUCCEEDED and still PASSED. "The
+  // passed attempt" therefore stops describing anything, and the only sound answer is the one a
+  // review turn actually bound itself to.
+  //
+  // Every link is re-checked here rather than trusted, because this is the last gate before a human
+  // is asked to make something permanent:
+  //
+  //   the run accepted            status ACCEPTED with an accepted_attempt_id
+  //   a review said so            a COMPLETED REVIEW turn with action ACCEPT
+  //   about THAT attempt          its subject_attempt_id equals the accepted attempt
+  //   which belongs here          the attempt's job_id equals this job
+  //   and actually passed         SUCCEEDED, PASSED, with a result commit
+  //
+  // The foreign key proves the subject is an attempt. It does not prove it is an attempt of THIS
+  // job, which is why that is checked explicitly.
+  acceptedCandidate(jobId) {
+    const run = this.db.prepare("SELECT * FROM manager_runs WHERE job_id = ?").get(jobId);
+    if (!run) throw new Error(`Managed job ${jobId} has no manager run`);
+    if (run.status !== "ACCEPTED" || !run.accepted_attempt_id) {
+      throw new Error(
+        `Managed job ${jobId} has no accepted candidate: its manager run is ${run.status}. `
+        + "A managed candidate is offered for integration only after semantic review accepts it.",
+      );
+    }
+    const review = this.db.prepare(`SELECT * FROM manager_turns
+      WHERE manager_run_id = ? AND phase = 'REVIEW' AND state = 'COMPLETED' AND action = 'ACCEPT'
+        AND subject_attempt_id = ? ORDER BY ordinal DESC LIMIT 1`).get(run.id, run.accepted_attempt_id);
+    if (!review) {
+      throw new Error(
+        `Managed job ${jobId} names accepted attempt ${run.accepted_attempt_id} but no completed `
+        + "REVIEW turn accepted that attempt",
+      );
+    }
+    const candidate = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(run.accepted_attempt_id);
+    if (!candidate) throw new Error(`Accepted attempt ${run.accepted_attempt_id} does not exist`);
+    if (candidate.job_id !== jobId) {
+      throw new Error(`Accepted attempt ${candidate.id} belongs to job ${candidate.job_id}, not ${jobId}`);
+    }
+    if (candidate.terminal_state !== "SUCCEEDED" || candidate.validation_state !== "PASSED") {
+      throw new Error(
+        `Accepted attempt ${candidate.id} is ${candidate.terminal_state}/${candidate.validation_state}; `
+        + "semantic acceptance cannot substitute for deterministic validation",
+      );
+    }
+    return candidate;
+  }
+
   async proposeIntegration({ jobId }) {
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
@@ -2236,13 +2327,9 @@ export class Dispatcher {
     if (job.status !== "READY_FOR_INTEGRATION") {
       throw new Error(`Job ${jobId} is ${job.status}, expected READY_FOR_INTEGRATION`);
     }
-    const candidates = this.db.prepare(
-      "SELECT * FROM attempts WHERE job_id = ? AND terminal_state = 'SUCCEEDED' AND validation_state = 'PASSED' ORDER BY ordinal",
-    ).all(jobId);
-    if (candidates.length !== 1) {
-      throw new Error(`Job ${jobId} must have exactly one SUCCEEDED/PASSED candidate attempt, found ${candidates.length}`);
-    }
-    const candidate = candidates[0];
+    const candidate = job.strategy === "managed"
+      ? this.acceptedCandidate(jobId)
+      : this.soleCandidate(jobId);
     if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
     const project = this.getProject(job.project_id);
     const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);

@@ -15,7 +15,9 @@ import { managedPaths } from "./paths.js";
 //     they were given and the tree they started from; manager runs, turns and usage receipts give
 //     scarce-model activity its own ledger; work proposals bind to the repository head they were
 //     written against.
-export const SCHEMA_VERSION = "19";
+// 20: a managed root becomes integration-ready only when a REVIEW turn accepted one exact attempt,
+//     and manager_runs records which one.
+export const SCHEMA_VERSION = "20";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -426,6 +428,14 @@ CREATE TABLE IF NOT EXISTS manager_runs (
   active_child_job_id TEXT REFERENCES jobs(id),
   last_candidate_attempt_id TEXT REFERENCES attempts(id),
   -- Set when the manager escalated: the question a person actually has to answer.
+  -- The one attempt a completed ACCEPT review bound itself to.
+  --
+  -- Written in the same transaction as the ACCEPT transition, and cross-checked against the review
+  -- turn's subject_attempt_id. proposeIntegration() reads this instead of choosing among candidates:
+  -- after a revision there are two PASSED attempts and 'the passed one' stops being a description of
+  -- anything. Null until a review accepts, which is also what makes 'no worker runs after ACCEPT'
+  -- checkable.
+  accepted_attempt_id TEXT REFERENCES attempts(id),
   escalation_question TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -730,6 +740,9 @@ function migrate(db) {
     }
     if (!managerRunColumns.includes("actual_model")) {
       db.exec("ALTER TABLE manager_runs ADD COLUMN actual_model TEXT");
+    }
+    if (!managerRunColumns.includes("accepted_attempt_id")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN accepted_attempt_id TEXT REFERENCES attempts(id)");
     }
   }
   const managerTurnColumns = db.prepare("PRAGMA table_info(manager_turns)").all().map((column) => column.name);
