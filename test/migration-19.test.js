@@ -113,6 +113,13 @@ test("a schema-18 database gains every column schema 19 declares", async (t) => 
   const before = new DatabaseSync(databasePath);
   const beforeColumns = before.prepare("PRAGMA table_info(attempts)").all().map((c) => c.name);
   assert.equal(beforeColumns.includes("start_sha"), false, "the fixture must genuinely be schema 18");
+  // And it must genuinely lack the constraints, or the equivalence test below proves nothing: a
+  // fixture that already carried them would pass whether or not the rebuild ran at all.
+  const beforeJobs = before.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'",
+  ).get().sql;
+  assert.equal(beforeJobs.includes("strategy"), false);
+  assert.equal(beforeJobs.includes("max_attempts BETWEEN"), false);
   before.close();
 
   const db = openDatabase(databasePath);
@@ -129,11 +136,154 @@ test("a schema-18 database gains every column schema 19 declares", async (t) => 
   assert.ok(columns("manager_turns").includes("subject_attempt_id"));
   assert.ok(columns("manager_usage_receipts").includes("total_tokens"));
 
+  // The rebuild actually ran: the migrated table now carries constraints ALTER TABLE cannot add.
+  const afterJobs = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'",
+  ).get().sql;
+  assert.match(afterJobs, /strategy IN \('direct', 'managed'\)/);
+  assert.match(afterJobs, /max_attempts BETWEEN 1 AND 10/);
+  assert.match(afterJobs, /internal_kind IS NULL OR parent_job_id IS NOT NULL/);
+
   // The version is only honest if the objects match it.
   assert.equal(db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get().value, SCHEMA_VERSION);
 
   // Closed here rather than in an after-hook: hooks run last-registered-first, so an open handle
   // would hold the temp directory while the fixture tries to remove it.
+  db.close();
+});
+
+// The states a schema-19 database must refuse. Column presence proves none of these: a table built
+// by ALTER TABLE ADD COLUMN has the columns and none of the CHECKs, so it accepts every one.
+const FORBIDDEN = [
+  {
+    what: "jobs.strategy outside its enumeration",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, strategy, created_at, updated_at)
+          VALUES ('j1', ?, 'g', 'write', 'PENDING', 'abc', 2, 'nonsense', 't', 't')`,
+  },
+  {
+    what: "jobs.internal_kind outside its enumeration",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, parent_job_id, internal_kind, created_at, updated_at)
+          VALUES ('j2', ?, 'g', 'write', 'PENDING', 'abc', 2, 'root', 'SOMETHING_ELSE', 't', 't')`,
+  },
+  {
+    what: "an internal job with no parent",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, internal_kind, created_at, updated_at)
+          VALUES ('j3', ?, 'g', 'write', 'PENDING', 'abc', 2, 'MANAGER_EXPLORATION', 't', 't')`,
+  },
+  {
+    what: "max_attempts outside its range",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at)
+          VALUES ('j4', ?, 'g', 'write', 'PENDING', 'abc', 99, 't', 't')`,
+  },
+  {
+    what: "a non-positive maximum_cost",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost, created_at, updated_at)
+          VALUES ('j5', ?, 'g', 'write', 'PENDING', 'abc', 2, 0, 't', 't')`,
+  },
+  {
+    what: "jobs.mode outside its enumeration",
+    sql: `INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at)
+          VALUES ('j6', ?, 'g', 'sideways', 'PENDING', 'abc', 2, 't', 't')`,
+  },
+  {
+    what: "work_proposals.strategy outside its enumeration",
+    sql: `INSERT INTO work_proposals(id, project_id, goal, mode, action_digest, strategy, expires_at, idempotency_key, origin_principal, origin_channel, created_at)
+          VALUES ('p1', ?, 'g', 'write', 'd', 'nonsense', 't', 'k1', 'h', 'c', 't')`,
+  },
+  {
+    what: "work_proposals.mode outside its enumeration",
+    sql: `INSERT INTO work_proposals(id, project_id, goal, mode, action_digest, strategy, expires_at, idempotency_key, origin_principal, origin_channel, created_at)
+          VALUES ('p2', ?, 'g', 'sideways', 'd', 'direct', 't', 'k2', 'h', 'c', 't')`,
+  },
+];
+
+function refusals(db, projectId) {
+  return FORBIDDEN.map(({ what, sql }) => {
+    try {
+      db.prepare(sql).run(projectId);
+      return { what, refused: false };
+    } catch {
+      return { what, refused: true };
+    }
+  });
+}
+
+test("a migrated database refuses exactly what a fresh one refuses", async (t) => {
+  // The acceptance condition for P0-4 is behavioural, not structural. Two installations running the
+  // same version number must not disagree about which states are legal, or an orchestration bug
+  // becomes installation-specific and survives every fresh-root test in the suite.
+  const migrated = await fixture();
+  const fresh = await fixture();
+  t.after(async () => { await migrated.cleanup(); await fresh.cleanup(); });
+
+  const migratedDb = openDatabase(migrated.databasePath);
+  // A fresh root that was never downgraded to schema 18.
+  const freshRoot = path.join(fresh.root, "..", "fresh-data");
+  initializeDataRoot(freshRoot);
+  const freshDb = openDatabase(path.join(freshRoot, "state", "delegate-wave.db"));
+
+  for (const db of [migratedDb, freshDb]) {
+    db.prepare(`INSERT INTO projects(id, name, repo_path, integration_branch, created_at)
+                VALUES ('proj', 'P', ?, 'main', 't')`).run(`repo-${Math.random()}`);
+  }
+
+  const migratedResults = refusals(migratedDb, "proj");
+  const freshResults = refusals(freshDb, "proj");
+
+  for (const [index, expected] of freshResults.entries()) {
+    assert.equal(expected.refused, true, `fresh schema 19 must refuse ${expected.what}`);
+    assert.equal(
+      migratedResults[index].refused, true,
+      `migrated schema 19 accepted ${expected.what}, which fresh schema 19 refuses`,
+    );
+  }
+
+  migratedDb.close();
+  freshDb.close();
+  fs.rmSync(freshRoot, { recursive: true, force: true });
+});
+
+test("a rebuild preserves legacy rows and their references", async (t) => {
+  const { root, repo, databasePath, cleanup } = await fixture();
+  t.after(async () => { await cleanup(); });
+
+  // Seed the schema-18 database with a legacy job and proposal before migrating.
+  const old = new DatabaseSync(databasePath);
+  old.prepare(`INSERT INTO projects(id, name, repo_path, integration_branch, created_at)
+               VALUES ('proj', 'Legacy', ?, 'main', 't')`).run(repo);
+  old.prepare(`INSERT INTO jobs(id, project_id, goal, mode, status, base_sha, max_attempts, created_at, updated_at)
+               VALUES ('legacy-job', 'proj', 'old work', 'write', 'SUCCEEDED', 'deadbeef', 2, 't1', 't2')`).run();
+  old.prepare(`INSERT INTO attempts(id, job_id, ordinal, scheduler_epoch, backend, started_at)
+               VALUES ('legacy-job.1', 'legacy-job', 1, 3, 'FakeBackend', 't')`).run();
+  old.prepare(`INSERT INTO work_proposals(id, project_id, goal, mode, action_digest, expires_at, idempotency_key, origin_principal, origin_channel, created_at)
+               VALUES ('legacy-prop', 'proj', 'old proposal', 'write', 'digest', 't', 'k', 'hermes', 'mcp', 't')`).run();
+  old.close();
+
+  const db = openDatabase(databasePath);
+
+  const job = db.prepare("SELECT * FROM jobs WHERE id = 'legacy-job'").get();
+  assert.equal(job.goal, "old work", "the rebuild must not transpose columns");
+  assert.equal(job.base_sha, "deadbeef");
+  assert.equal(job.max_attempts, 2);
+  assert.equal(job.strategy, "direct", "a job that predates strategy really was direct");
+  assert.equal(job.parent_job_id, null);
+
+  const proposal = db.prepare("SELECT * FROM work_proposals WHERE id = 'legacy-prop'").get();
+  assert.equal(proposal.goal, "old proposal");
+  assert.equal(proposal.strategy, "direct");
+  assert.equal(proposal.expected_base_sha, null, "it genuinely was not bound to a head");
+
+  // The attempt still points at its job across the table swap.
+  const attempt = db.prepare("SELECT * FROM attempts WHERE id = 'legacy-job.1'").get();
+  assert.equal(attempt.job_id, "legacy-job");
+  assert.equal(db.prepare("PRAGMA foreign_key_check").all().length, 0);
+
+  // Immutability triggers survived the rebuild rather than being dropped with the old table.
+  assert.throws(
+    () => db.prepare("UPDATE work_proposals SET goal = 'edited' WHERE id = 'legacy-prop'").run(),
+    /immutable/,
+  );
+
   db.close();
 });
 

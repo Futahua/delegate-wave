@@ -17,6 +17,71 @@ import { managedPaths } from "./paths.js";
 //     written against.
 export const SCHEMA_VERSION = "19";
 
+// Column bodies shared by table creation and table REBUILD.
+//
+// `ALTER TABLE ADD COLUMN` cannot add a table-level CHECK, so migrating an old database by adding
+// columns produces a table that accepts states the fresh one rejects. Two installations then run
+// the same version number with different invariants, and every fresh-root test passes on both.
+//
+// The only durable fix is one source of DDL text. These constants are interpolated into `CREATE
+// TABLE IF NOT EXISTS <name>` for a new database and into `CREATE TABLE <name>_rebuilt` for an old
+// one, so "fresh equals migrated" is a property of the code rather than a claim in a test.
+const JOBS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  goal TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+  status TEXT NOT NULL CHECK (status IN (
+    'PENDING', 'RUNNING', 'READY_FOR_INTEGRATION', 'SUCCEEDED',
+    'FAILED', 'CANCELLED', 'NEEDS_ATTENTION'
+  )),
+  base_sha TEXT NOT NULL,
+  max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
+  -- A recorded ceiling in reference dollars, shared by the whole job family. NULL means no ceiling;
+  -- a value gates every attempt start and settles after the work is done.
+  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
+  -- An explicit request for a narrower worker: a task run against something untrusted, or an
+  -- experiment with hidden verifiers. Null means the system default, which is broad.
+  capability_profile TEXT,
+  -- How this job reaches a candidate. 'direct' is the original path: one authorization, one worker,
+  -- the goal as its instruction. 'managed' hands the job to a strong manager that plans, delegates,
+  -- reviews and revises. Both paths use the same attempt machinery and the same integration gate;
+  -- only who writes the worker's instruction differs.
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
+  -- Set on jobs the manager created for itself. A child is real work with real cost and real
+  -- evidence -- it is deliberately NOT a private side channel -- but it belongs to its parent's
+  -- accounting rather than to the operator's queue.
+  parent_job_id TEXT REFERENCES jobs(id),
+  internal_kind TEXT CHECK (internal_kind IS NULL OR internal_kind IN ('MANAGER_EXPLORATION')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- An internal job without a parent would be invisible with nothing to be visible under.
+  CHECK (internal_kind IS NULL OR parent_job_id IS NOT NULL)
+`;
+
+const WORK_PROPOSALS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  goal TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+  action_digest TEXT NOT NULL,
+  expected_state_version TEXT,
+  -- The integration head this proposal was written against.
+  --
+  -- expected_state_version alone hashes delegate-wave's own job rows, which says nothing about the
+  -- code. A proposal reasoned about repository version A could be authorized against version B with
+  -- the state version unchanged, and authorization resolves the branch head fresh -- so the system
+  -- would report that the world matched while the only world that matters had moved.
+  expected_base_sha TEXT,
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
+  maximum_cost REAL,
+  expires_at TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  origin_principal TEXT NOT NULL,
+  origin_channel TEXT NOT NULL,
+  created_at TEXT NOT NULL
+`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
@@ -38,38 +103,7 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS jobs (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  goal TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
-  status TEXT NOT NULL CHECK (status IN (
-    'PENDING', 'RUNNING', 'READY_FOR_INTEGRATION', 'SUCCEEDED',
-    'FAILED', 'CANCELLED', 'NEEDS_ATTENTION'
-  )),
-  base_sha TEXT NOT NULL,
-  max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
-  -- A recorded ceiling in reference dollars. NULL means no ceiling; a value is enforced before each
-  -- attempt starts, and unaccounted spend blocks rather than passes.
-  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
-  -- An explicit request for a narrower worker: a task run against something untrusted, or an
-  -- experiment with hidden verifiers. Null means the system default, which is broad.
-  capability_profile TEXT,
-  -- How this job reaches a candidate. 'direct' is the original path: one authorization, one worker,
-  -- the goal as its instruction. 'managed' hands the job to a strong manager that plans, delegates,
-  -- reviews and revises. Both paths use the same attempt machinery and the same integration gate;
-  -- only who writes the worker's instruction differs.
-  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
-  -- Set on jobs the manager created for itself. A child is real work with real cost and real
-  -- evidence -- it is deliberately NOT a private side channel -- but it belongs to its parent's
-  -- accounting rather than to the operator's queue.
-  parent_job_id TEXT REFERENCES jobs(id),
-  internal_kind TEXT CHECK (internal_kind IS NULL OR internal_kind IN ('MANAGER_EXPLORATION')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  -- An internal job without a parent would be invisible with nothing to be visible under.
-  CHECK (internal_kind IS NULL OR parent_job_id IS NOT NULL)
-);
+CREATE TABLE IF NOT EXISTS jobs (${JOBS_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY,
@@ -223,28 +257,7 @@ CREATE TABLE IF NOT EXISTS control_request_results (
 
 -- Bounded work proposed in ordinary language by a non-operator principal. A proposal is a request,
 -- never authority: only an operator-authorized transition turns one into a job.
-CREATE TABLE IF NOT EXISTS work_proposals (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  goal TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
-  action_digest TEXT NOT NULL,
-  expected_state_version TEXT,
-  -- The integration head this proposal was written against.
-  --
-  -- expected_state_version alone hashes delegate-wave's own job rows, which says nothing about the
-  -- code. A proposal reasoned about repository version A could be authorized against version B with
-  -- the state version unchanged, and authorization resolves the branch head fresh -- so the system
-  -- would report that the world matched while the only world that matters had moved.
-  expected_base_sha TEXT,
-  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
-  maximum_cost REAL,
-  expires_at TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL UNIQUE,
-  origin_principal TEXT NOT NULL,
-  origin_channel TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS work_proposals (${WORK_PROPOSALS_COLUMNS});
 
 -- Terminal decisions on a work proposal. Separate table so proposals stay immutable and every
 -- decision keeps its own authorizing identity.
@@ -755,7 +768,104 @@ function migrate(db) {
   }
   // Only now that every column exists.
   db.exec(POST_MIGRATION_INDEXES);
+  // And only now that every table enforces what the fresh schema enforces.
+  rebuildConstrainedTables(db);
   db.prepare("UPDATE metadata SET value = ? WHERE key = 'schema_version'").run(SCHEMA_VERSION);
+}
+
+// Brings tables whose CHECK constraints were added by ALTER TABLE up to the canonical definition.
+//
+// A migrated database that merely has the right COLUMNS is not the same database as a fresh one. It
+// accepts `strategy = 'nonsense'`, an internal job with no parent, and every other state the fresh
+// CHECKs reject -- so an orchestration bug becomes installation-specific and survives every
+// fresh-root test. The schema version must not be stamped until this is untrue.
+//
+// SQLite's documented table-rebuild procedure, followed exactly:
+//
+//   PRAGMA foreign_keys = OFF        (must be outside a transaction, or it is a silent no-op)
+//   BEGIN
+//     create the replacement from the SAME DDL text the fresh schema uses
+//     copy every row
+//     drop the original, rename the replacement
+//     recreate indexes and triggers, which the drop removed
+//     PRAGMA foreign_key_check       (rollback on any row)
+//   COMMIT
+//   PRAGMA foreign_keys = ON
+function rebuildConstrainedTables(db) {
+  const definition = (name) => db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(name)?.sql ?? "";
+
+  const pending = [];
+  // Detected from the stored DDL rather than from the schema version: a database part-way through an
+  // interrupted upgrade must be judged on what it actually contains.
+  if (definition("jobs") && !definition("jobs").includes("strategy IN ('direct', 'managed')")) {
+    pending.push({
+      name: "jobs",
+      columns: JOBS_COLUMNS,
+      // Named explicitly rather than SELECT *: column order after successive ALTER TABLE ADD COLUMN
+      // is not the order of the canonical definition, and a positional copy would silently transpose
+      // values into the wrong columns.
+      copy: `id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+             capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at`,
+      after: [
+        "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id)",
+      ],
+    });
+  }
+  if (definition("work_proposals") && !definition("work_proposals").includes("strategy IN ('direct', 'managed')")) {
+    pending.push({
+      name: "work_proposals",
+      columns: WORK_PROPOSALS_COLUMNS,
+      copy: `id, project_id, goal, mode, action_digest, expected_state_version, expected_base_sha,
+             strategy, maximum_cost, expires_at, idempotency_key, origin_principal, origin_channel,
+             created_at`,
+      after: [
+        "CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at)",
+        `CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
+         BEFORE UPDATE ON work_proposals
+         BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END`,
+        `CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_delete
+         BEFORE DELETE ON work_proposals
+         BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END`,
+      ],
+    });
+  }
+  if (pending.length === 0) return;
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const table of pending) {
+        const temporary = `${table.name}_rebuilt`;
+        db.exec(`DROP TABLE IF EXISTS ${temporary}`);
+        db.exec(`CREATE TABLE ${temporary} (${table.columns})`);
+        db.exec(`INSERT INTO ${temporary} (${table.copy}) SELECT ${table.copy} FROM ${table.name}`);
+        db.exec(`DROP TABLE ${table.name}`);
+        db.exec(`ALTER TABLE ${temporary} RENAME TO ${table.name}`);
+        for (const statement of table.after) db.exec(statement);
+      }
+      // Every reference must still resolve. A rebuild that orphaned an attempt or a proposal decision
+      // has corrupted operational truth, and committing it would be worse than never migrating.
+      const violations = db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length) {
+        throw new Error(
+          `Refusing to migrate: rebuilding ${pending.map((t) => t.name).join(", ")} left `
+          + `${violations.length} broken foreign key reference(s)`,
+        );
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    // Restored on every path, including the failure path: leaving a live connection with foreign
+    // keys disabled would silently relax every constraint for the rest of the process.
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }
 
 export function transaction(db, action) {

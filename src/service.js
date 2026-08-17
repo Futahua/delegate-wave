@@ -314,6 +314,38 @@ export class Dispatcher {
 
   // The human gate. Turns one exact proposal into one job, under operator identity, and refuses
   // anything the proposal did not already bound.
+  // Refuses to spend money on work whose authorized world has already moved.
+  //
+  // Authorization observes the branch at one instant; time passes before a worker starts. This is
+  // the cheap guard that closes that window at the moment it begins to matter -- when real cost is
+  // about to be incurred -- rather than pretending the authorization transaction held a lock on a
+  // Git ref it cannot lock.
+  //
+  //   proposal created against A
+  //     -> authorization observes branch == A
+  //     -> before the first paid attempt, branch must still be A
+  //     -> worker starts on A
+  //     -> later movement is ordinary concurrency, and integration CAS still protects Git truth
+  //
+  // Only for the FIRST attempt of a ROOT job. A retry is already committed to its job's base, and a
+  // manager's exploration child inherits a base its parent established; re-checking either would
+  // abandon work mid-flight over movement that no longer changes what is being built.
+  async assertAuthorizedBaseIntact(job, project) {
+    if (job.parent_job_id) return null;
+    const previousAttempts = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?",
+    ).get(job.id).count;
+    if (previousAttempts > 0) return null;
+    const head = await resolveRevision(project.repo_path, project.integration_branch);
+    if (head !== job.base_sha) {
+      throw new Error(
+        `Job ${job.id} was authorized against ${job.base_sha.slice(0, 12)} but ${project.integration_branch} `
+        + `is now at ${head.slice(0, 12)}; refusing to start paid work against a different base`,
+      );
+    }
+    return head;
+  }
+
   // `currentBaseSha` is the branch head resolved at authorization time. Compared for exact equality
   // against the head the proposal was written against: a proposal is a statement about one world,
   // and authorizing it against a different one silently substitutes work nobody proposed.
@@ -377,8 +409,16 @@ export class Dispatcher {
         if (proposal.decision.decision === "AUTHORIZED") return this.getWorkProposal(proposalId);
         throw new Error(`Work proposal ${proposalId} was already rejected`);
       }
-      // Re-checked inside the transaction against the SAME head that was resolved above, so a branch
-      // that moved between the two checks cannot slip through the second one.
+      // Re-checked inside the transaction against the SAME head resolved above.
+      //
+      // Deliberately NOT a second Git observation, and this check does not detect branch movement.
+      // It guards against the proposal ROW changing between the two calls -- a concurrent decision,
+      // an edited digest. SQLite cannot lock an externally mutable Git ref, and pretending otherwise
+      // would be a comforting comment rather than an invariant.
+      //
+      // So authorization is an observation at one instant: the branch was at `baseSha` when it was
+      // read. The window between that read and the worker starting is closed separately, by
+      // assertAuthorizedBaseIntact() before the first paid attempt.
       this.assertAuthorizable(proposal, { currentBaseSha: baseSha });
 
       // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
@@ -636,6 +676,8 @@ export class Dispatcher {
     }
     const instructionText = job.strategy === "direct" ? (instruction ?? job.goal) : instruction;
     const startFrom = startSha ?? job.base_sha;
+    // Checked before the claim, because the claim is the point of no return for spending.
+    await this.assertAuthorizedBaseIntact(job, project);
     const claim = transaction(this.db, () => {
       const current = this.getJob(jobId);
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
