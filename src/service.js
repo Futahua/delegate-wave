@@ -23,6 +23,7 @@ import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js
 import { readFinalText } from "./manager/runtime.js";
 import { instructionDigest } from "./manager/contracts.js";
 import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
+import { assessExperimentalCondition, deriveProvenanceStatus } from "./provenance.js";
 import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
   readRestoreMarker, clearRestoreMarker,
@@ -845,6 +846,14 @@ export class Dispatcher {
       // different format, so the default would misread another executor's evidence as absent.
       this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult, backend });
 
+      // Identity evidence, recorded separately from cost evidence and for the same reason: they fail
+      // independently. A run can have perfect token accounting and unverifiable model identity, or
+      // verified identity and no usable cost, and neither receipt may stand in for the other.
+      this.recordRuntimeProvenance({
+        attemptId, model, backend, selection, backendResult,
+        requestedProfile: backend.profile ?? requestedProfile ?? null,
+      });
+
       // What the worker SAYS it did, captured whether or not the attempt goes on to succeed.
       //
       // Testimony, never evidence: the captured tree is what actually changed. It is recorded anyway
@@ -1121,6 +1130,67 @@ export class Dispatcher {
   // Eligibility is attempts that reached EXECUTOR_INTENDED. An attempt that failed during worktree
   // setup never invoked a backend and consumed no provider usage, so requiring evidence from it
   // would report a gap that cannot exist.
+  // Writes one immutable identity receipt for an attempt.
+  //
+  // A backend contributes only what it can actually prove. Whatever it does not report stays NULL,
+  // and NULL means unknown -- never "the same as what we asked for". Substituting the request for an
+  // observation is how a measurement quietly starts confirming its own configuration.
+  recordRuntimeProvenance({ attemptId, model, backend, selection, backendResult, requestedProfile }) {
+    const reported = backendResult?.provenance ?? {};
+    const record = {
+      attempt_id: attemptId,
+      requested_model: model ?? null,
+      requested_effort: backend?.reasoningEffort ?? null,
+      requested_executor: selection?.selected ?? backend?.constructor?.name ?? null,
+      requested_capability_profile: requestedProfile,
+      applied_model: reported.appliedModel ?? null,
+      applied_effort: reported.appliedEffort ?? null,
+      applied_executor: reported.appliedExecutor ?? selection?.selected ?? backend?.constructor?.name ?? null,
+      applied_capability_profile: reported.appliedCapabilityProfile ?? null,
+      applied_source: reported.appliedSource ?? null,
+      observed_model: reported.observedModel ?? null,
+      observed_effort: reported.observedEffort ?? null,
+      observed_source: reported.observedSource ?? null,
+    };
+    const { status, detail } = deriveProvenanceStatus(record);
+    try {
+      this.db.prepare(`INSERT OR REPLACE INTO attempt_runtime_provenance(
+        attempt_id, requested_model, requested_effort, requested_executor, requested_capability_profile,
+        applied_model, applied_effort, applied_executor, applied_capability_profile, applied_source,
+        observed_model, observed_effort, observed_source, status, detail, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        record.attempt_id, record.requested_model, record.requested_effort,
+        record.requested_executor, record.requested_capability_profile,
+        record.applied_model, record.applied_effort, record.applied_executor,
+        record.applied_capability_profile, record.applied_source,
+        record.observed_model, record.observed_effort, record.observed_source,
+        status, detail, now(),
+      );
+    } catch (error) {
+      // A capture failure leaves a durable gap rather than a fabricated receipt. An experiment
+      // reading this attempt finds nothing and must treat it as an invalid sample, which is the
+      // correct answer: we do not know what ran.
+      recordEvent(this.db, {
+        kind: "PROVENANCE_CAPTURE_FAILED", entityType: "attempt", entityId: attemptId,
+        payload: { error: String(error?.message ?? error) },
+      });
+    }
+    return { ...record, status, detail };
+  }
+
+  getRuntimeProvenance(attemptId) {
+    return this.db.prepare("SELECT * FROM attempt_runtime_provenance WHERE attempt_id = ?").get(attemptId) ?? null;
+  }
+
+  // Is this attempt a valid SAMPLE of an experimental condition?
+  //
+  // Reads only runtime evidence. Nothing about validation, the candidate, or a manager's acceptance
+  // reaches this decision, because provenance assessed after seeing the outcome would become another
+  // post-outcome selection channel.
+  assessExperimentalCondition(attemptId, expected = {}) {
+    return assessExperimentalCondition(this.getRuntimeProvenance(attemptId), expected);
+  }
+
   usageCoverage({ jobIds = null } = {}) {
     const eligible = jobIds?.length
       ? this.db.prepare(`SELECT DISTINCT a.id FROM attempts a

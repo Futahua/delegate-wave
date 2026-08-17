@@ -393,6 +393,21 @@ export class HarnessBackend {
       ...result, stdoutPath, stderrPath,
       sessionLogPath: this.sessionLogPath(artifactDir),
       capabilityProfile: this.profile,
+      // The strongest LOCAL provenance available: delegate-wave builds this patch itself, so the
+      // wire model, reasoning effort and capability profile it composed are mechanically known
+      // rather than assumed. `harness-profile-patch` names that evidence.
+      //
+      // Every field is APPLIED, never observed. The session log is parsed for usage and for the
+      // turn/end marker and reports no model identity, so nothing here may claim what DeepSeek
+      // actually served -- observed_* stays null and the receipt reads UNVERIFIED, which is the
+      // honest description of a local executor whose provider reports no identity.
+      provenance: {
+        appliedModel: wireModel(model),
+        appliedEffort: this.reasoningEffort,
+        appliedExecutor: "harness",
+        appliedCapabilityProfile: this.profile,
+        appliedSource: fs.existsSync(patchPath) ? "harness-profile-patch" : null,
+      },
     };
   }
 }

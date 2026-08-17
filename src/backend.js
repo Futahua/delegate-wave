@@ -116,7 +116,18 @@ export class OpenCodeBackend {
       new Promise((resolve) => stdoutStream.end(resolve)),
       new Promise((resolve) => stderrStream.end(resolve)),
     ]);
-    return { ...result, stdoutPath, stderrPath };
+    return {
+      ...result, stdoutPath, stderrPath,
+      // What can honestly be claimed here: delegate-wave launched OpenCode with this exact --model,
+      // and that argv is mechanical evidence. Nothing in this path observes what the provider then
+      // served, and this backend has no reasoning-effort parameter at all -- so effort stays null
+      // rather than inheriting the value the Harness path happens to use.
+      provenance: {
+        appliedModel: model,
+        appliedExecutor: "opencode",
+        appliedSource: "opencode-argv",
+      },
+    };
   }
 }
 

@@ -17,9 +17,11 @@ import { managedPaths } from "./paths.js";
 //     written against.
 // 20: a managed root becomes integration-ready only when a REVIEW turn accepted one exact attempt,
 //     and manager_runs records which one.
+// 22: attempt_runtime_provenance separates what was requested, what the executor can prove it
+//     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "21";
+export const SCHEMA_VERSION = "22";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -524,6 +526,52 @@ CREATE TABLE IF NOT EXISTS manager_usage_receipts (
   )),
   CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0))
 );
+
+-- What delegate-wave asked for, what the executor can prove it launched, and what the runtime
+-- independently reported. Three levels, deliberately not two.
+--
+-- A configuration proves what delegate-wave asked the executor to do; only runtime evidence may
+-- claim what actually ran, and absence remains unknown. Collapsing "applied" into "actual" is the
+-- error Orca issue #10846 describes from the other side: a requested effort that silently vanishes
+-- from the launch args, with no way for the caller to tell it launched at the default.
+--
+-- Deliberately a separate receipt rather than new meanings for attempts.model and
+-- attempts.capability_profile. Those record what was REQUESTED at claim time and have always meant
+-- that; redefining them would rewrite the meaning of every historical row.
+--
+-- Orthogonal to attempt_usage_receipts. Cost evidence and identity evidence fail independently: a
+-- run can have perfect token accounting and unverifiable model identity, or verified identity and no
+-- usable cost. Neither receipt may stand in for the other's health.
+CREATE TABLE IF NOT EXISTS attempt_runtime_provenance (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  requested_model TEXT,
+  requested_effort TEXT,
+  requested_executor TEXT,
+  requested_capability_profile TEXT,
+  -- What the local executor can mechanically prove it composed or launched: a dumped Harness
+  -- configuration, the argv a CLI was invoked with. Strong evidence that intent reached the runtime;
+  -- no evidence whatsoever about what a remote provider then served.
+  applied_model TEXT,
+  applied_effort TEXT,
+  applied_executor TEXT,
+  applied_capability_profile TEXT,
+  applied_source TEXT,
+  -- What the runtime or provider independently reported back. NULL means unknown, never "the same as
+  -- what we asked for".
+  observed_model TEXT,
+  observed_effort TEXT,
+  observed_source TEXT,
+  status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'PARTIAL', 'UNVERIFIED', 'CONTRADICTED')),
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_runtime_provenance_immutable_update
+BEFORE UPDATE ON attempt_runtime_provenance
+BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_runtime_provenance_immutable_delete
+BEFORE DELETE ON attempt_runtime_provenance
+BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_update
 BEFORE UPDATE ON manager_usage_receipts
