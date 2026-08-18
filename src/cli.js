@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import path from "node:path";
 import { ControlClient } from "./control/client.js";
 
 function parseArgs(argv) {
@@ -108,6 +109,51 @@ async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   if (!positional[0] || options.help) { help(); return; }
   if (positional[0] === "serve") { await serve(); return; }
+
+  // Drives a managed job with the real Codex manager.
+  //
+  // Deliberately a separate command rather than a Control API route. Advancing a
+  // managed job spends scarce quota and can run cheap workers, and the Control
+  // API is what the Papers relay reaches -- putting this behind a route would
+  // hand that authority to a surface that is meant to observe and decide, not to
+  // commission strong-model work.
+  if (positional[0] === "manage") {
+    const jobId = positional[1];
+    if (!jobId) throw new Error("usage: delegate-wave manage <jobId> [--model <id>] [--effort <level>]");
+    const [{ Dispatcher }, { ManagerService }, { CodexManagerBackend }, { dataRoot }] = await Promise.all([
+      import("./service.js"), import("./manager/service.js"),
+      import("./manager/backend.js"), import("./paths.js"),
+    ]);
+    const { BackendRouter } = await import("./harness/select.js");
+    const { initializeDataRoot } = await import("./db.js");
+    const root = dataRoot();
+    initializeDataRoot(root);
+    // Same construction the served runtime uses: the router decides per attempt
+    // from the resolved model, never inside one.
+    const router = new BackendRouter({
+      apiKey: process.env.DELEGATE_WAVE_EXECUTOR_API_KEY || null,
+      prefer: process.env.DELEGATE_WAVE_BACKEND || "harness",
+    });
+    const dispatcher = new Dispatcher({ root, backend: null, router });
+    // A NEUTRAL working directory. The manager reasons from evidence packs
+    // delegate-wave assembles, never by exploring the repository itself -- that
+    // is what the cheap investigations are for, and pointing the most expensive
+    // model at a codebase is the substitution this design exists to prevent.
+    const workingDirectory = path.join(root, "tmp", "manager");
+    const manager = new CodexManagerBackend({
+      model: options.model ?? null,
+      effort: options.effort ?? "high",
+      workingDirectory,
+    });
+    const service = new ManagerService({ dispatcher, backend: manager, workerModel: options.workerModel ?? null });
+    try {
+      print(await service.advance(jobId));
+    } finally {
+      await manager.close();
+      dispatcher.close();
+    }
+    return;
+  }
   if (positional[0] === "supervisor") {
     const { WindowsSupervisor } = await import("./supervisor.js");
     const supervisor = new WindowsSupervisor();
