@@ -24,6 +24,8 @@
 //   item/completed        (notif)  carries item.type === "agentMessage" and its text
 //   thread/tokenUsage/updated      carries tokenUsage.last, this turn's own usage
 //   error                 (notif)  transport-level failure
+import fs from "node:fs";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
@@ -33,6 +35,10 @@ export const CODEX_CLIENT_INFO = Object.freeze({ name: "delegate-wave", version:
 // wall time, and a timeout that fired mid-reasoning would throw away a call already paid for.
 const DEFAULT_TURN_TIMEOUT_MS = 20 * 60_000;
 const HANDSHAKE_TIMEOUT_MS = 60_000;
+
+// Statuses that mean the turn is OVER. "inProgress" is acceptance, not completion, and treating it
+// as terminal settles the turn before any item or usage notification has arrived.
+const TERMINAL_TURN_STATUS = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 export class CodexAppServer {
   constructor({
@@ -91,9 +97,35 @@ export class CodexAppServer {
     }
   }
 
+  // Resolves what can actually be spawned on this platform.
+  //
+  // `codex` on Windows is an npm shim: a PowerShell script and a .cmd, neither
+  // of which spawn without a shell -- bare spawn gives ENOENT, and the .cmd
+  // gives EINVAL because Node refuses to run batch files without `shell: true`.
+  // Using a shell to work around that would put the manager's launch behind
+  // command-line parsing, so the real Node entry is located instead and run with
+  // this process's own interpreter.
+  resolveLaunch() {
+    if (this.executable !== "codex" || process.platform !== "win32") {
+      return { command: this.executable, args: this.args };
+    }
+    const candidates = [
+      process.env.CODEX_JS_ENTRY,
+      process.env.APPDATA && path.join(process.env.APPDATA, "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) return { command: process.execPath, args: [candidate, ...this.args] };
+    }
+    throw new Error(
+      "The codex CLI could not be resolved to a runnable entry on Windows. "
+      + "Set CODEX_JS_ENTRY to the path of @openai/codex/bin/codex.js.",
+    );
+  }
+
   async start() {
     if (this.child) return;
-    this.child = spawn(this.executable, this.args, {
+    const launch = this.resolveLaunch();
+    this.child = spawn(launch.command, launch.args, {
       cwd: this.cwd,
       // The manager's environment is granted, not inherited wholesale. delegate-wave's own control
       // credentials must never reach it: a manager holding an operator token could approve its own
@@ -126,6 +158,12 @@ export class CodexAppServer {
     this.child.on("error", (error) => {
       this.closed = true;
       this.exitReason = `app-server could not start: ${error.message}`;
+      // Fail the handshake NOW rather than letting it sit until the timeout. A
+      // process that never launched produced a 60-second wait and then reported
+      // "initialize timed out", which describes a slow server rather than a
+      // missing one and sends the reader looking in the wrong place entirely.
+      for (const [, entry] of this.pending) entry.reject(new Error(this.exitReason));
+      this.pending.clear();
     });
 
     await this.request("initialize", { clientInfo: CODEX_CLIENT_INFO }, HANDSHAKE_TIMEOUT_MS);
@@ -313,9 +351,14 @@ export class CodexAppServer {
         throw Object.assign(error, { uncertain: Boolean(error.timedOut) });
       }
 
-      // Some versions answer turn/start with the completed turn inline. That IS a terminal signal,
-      // so take it rather than waiting for a notification that will never come.
-      if (response?.turn?.status) {
+      // Some versions answer turn/start with the completed turn inline, which IS terminal and must
+      // be taken rather than waited on. But codex-cli 0.125.0 answers with `status: "inProgress"` --
+      // that is the ACCEPTANCE, carrying no items and no usage.
+      //
+      // Accepting any status here reintroduced the exact bug this method exists to prevent, one
+      // level down: the turn settled instantly with text null, before a single notification arrived,
+      // and every manager turn failed as "no agent message". Only a genuinely terminal status counts.
+      if (TERMINAL_TURN_STATUS.has(response?.turn?.status)) {
         collected.status = response.turn.status;
         collected.turnId = response.turn.id ?? collected.turnId;
         if (response.turn.error) collected.error = response.turn.error?.message ?? "turn failed";
