@@ -354,3 +354,88 @@ test("an OpenCode worker's report is captured, not silently discarded", async (t
   })}\n`);
   assert.match(readFinalText({}, temp), /Harness findings here/);
 });
+
+test("an OpenCode-shaped investigation reaches SYNTHESIS as a real report", async (t) => {
+  // The whole seam, not the parser alone. The 77,613-token failure ran through
+  //
+  //   real worker result -> runJob -> readFinalText -> result_text_artifact
+  //     -> collectReports -> evidence pack -> SYNTHESIS prompt
+  //
+  // and the unit test that shipped with the fix only covered the third arrow.
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-oc-"));
+  const root = path.join(temp, "data");
+  const repo = path.join(temp, "repo");
+  fs.mkdirSync(repo);
+  await command("git", ["init", "-b", "main"], repo);
+  await command("git", ["config", "user.name", "Test"], repo);
+  await command("git", ["config", "user.email", "test@example.invalid"], repo);
+  fs.writeFileSync(path.join(repo, "input.txt"), "before\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["commit", "-m", "initial"], repo);
+  initializeDataRoot(root);
+
+  // Writes exactly what OpenCode writes: an events JSONL whose answer is a
+  // `type: "text"` record with the payload under `part`, returned via stdoutPath.
+  const openCodeWorker = new FakeBackend(async ({ artifactDir, mode, worktreePath }) => {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    const events = path.join(artifactDir, "opencode-events.jsonl");
+    fs.writeFileSync(events, [
+      JSON.stringify({ type: "step_start", part: {} }),
+      JSON.stringify({ type: "tool_use", part: { tool: "read" } }),
+      JSON.stringify({ type: "text", part: { text: "TOTALS-LIVE-IN src/export.js:42 and are filtered afterwards." } }),
+      JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.0001 } }),
+    ].join("\n"));
+    if (mode !== "read") fs.writeFileSync(path.join(worktreePath, "out.txt"), "done\n");
+    return { exitCode: 0, stdout: "ok", stderr: "", stdoutPath: events };
+  });
+
+  const dispatcher = new Dispatcher({ root, backend: openCodeWorker });
+  const service = new ManagerService({
+    dispatcher,
+    backend: new FakeManagerBackend([
+      { action: "EXPLORE", reason: "need facts", explorations: [{ question: "where are totals computed?", deliver: ["files"] }] },
+      { action: "IMPLEMENT", reason: "now informed", brief: BRIEF() },
+      { action: "ACCEPT", reason: "done" },
+    ]),
+    workerModel: "opencode-go/deepseek-v4-flash",
+  });
+  t.after(async () => {
+    dispatcher.close();
+    const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+    for (const worktree of listed.stdout.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter((worktree) => path.resolve(worktree) !== path.resolve(repo))) {
+      await runProcess("git", ["-C", repo, "worktree", "unlock", worktree]);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    }
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+
+  const project = await dispatcher.addProject({ name: "OpenCodeReport", repoPath: repo, validation: [] });
+  const job = await dispatcher.createJob({
+    projectId: project.id, goal: "add a totals file", strategy: "managed", maxAttempts: 2,
+  });
+  await service.advance(job.id);
+
+  // 1. The report became durable evidence attached to the child's own attempt.
+  const child = dispatcher.db.prepare(
+    "SELECT * FROM jobs WHERE parent_job_id = ? AND internal_kind = 'MANAGER_EXPLORATION'",
+  ).get(job.id);
+  assert.ok(child, "the investigation was commissioned");
+  const attempt = dispatcher.db.prepare(
+    "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+  ).get(child.id);
+  assert.equal(attempt.terminal_state, "SUCCEEDED");
+  assert.ok(attempt.result_text_artifact, "result_text_artifact must be recorded, not left null");
+  assert.match(fs.readFileSync(attempt.result_text_artifact, "utf8"), /TOTALS-LIVE-IN/);
+
+  // 2. And it reached the manager as a PRESENT report rather than as UNKNOWN.
+  const run = service.getRun(job.id);
+  const synthesis = service.turns(run.id).find((turn) => turn.phase === "SYNTHESIS");
+  assert.ok(synthesis, "synthesis ran");
+  const prompt = fs.readFileSync(synthesis.prompt_artifact, "utf8");
+  assert.match(prompt, /TOTALS-LIVE-IN src\/export\.js:42/);
+  assert.doesNotMatch(prompt, /produced no usable report/);
+  assert.doesNotMatch(prompt, /this question was not answered/);
+});
