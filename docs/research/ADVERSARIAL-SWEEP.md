@@ -115,9 +115,67 @@ was actually broken and the green result meant nothing. **Every mutation must as
 applied** before its result is interpreted — a mutation that silently no-ops manufactures false
 confidence in exactly the direction the sweep is trying to remove.
 
-## Waves C4, E and loaded runs
+## Wave C4 — terminal truth
 
-Pending.
+| # | Invariant | Mutation | Red | Finding |
+|---|---|---|---|---|
+| C4 | A manager turn acquires one terminal truth exactly once | restore `INSERT OR REPLACE` **and** drop the state predicate | **yes** | **C4** |
+
+Two defects, the weaker hiding the stronger. `finishTurn()` wrote the usage receipt with
+`INSERT OR REPLACE`, so the immutability triggers never protected it — the same root cause as
+finding #0. Stating that exposed the real problem: the `UPDATE` on `manager_turns` had **no state
+predicate**, so even a protected receipt would not have stopped a second call rewriting a COMPLETED
+turn's response, digest and action — turning a recorded ACCEPT into a REVISE against the same scarce
+call, carrying the first call's usage.
+
+Closed with one shape: terminalize only from `INTENDED`/`RUNNING`, require exactly one changed row,
+plain `INSERT`, one transaction.
+
+## Wave E — the fixtures themselves
+
+Attacking the tests, not production. A fixture that cannot enter the state it claims to test is
+indistinguishable from a passing one.
+
+| Fixture | Precondition required | Status |
+|---|---|---|
+| migration | old database demonstrably lacks the new invariant | **added** — now also asserts pre-22 (no `budget_reservation_usd`, no `attempt_runtime_provenance`), not merely pre-19 |
+| branch drift | `HEAD_after !== expected_base_sha` | **added** |
+| restore | the tracked branch demonstrably moved before restoring | **added** to the retired-branch case; the mixed case already had it |
+| candidate identity | `accepted_attempt !== later_passed_attempt` | already present |
+| cross-thread transport | distinct threads, distinct turns, answers identify their own thread | already present |
+| family concurrency | connection B genuinely sees connection A's live reservation | already present |
+
+The migration fixture is hand-written, so it does not follow the schema forward on its own: without
+the pre-22 assertions a later version's columns could quietly become part of the "old" database and
+the migration under test would have nothing left to do.
+
+## Loaded stability
+
+Five consecutive bare `node --test` whole-suite runs, 454 tests each, 453 passing, 0 failing. Not
+isolated files: the `.git/worktrees` contention bug appeared only under a full run and passed in
+isolation, so global Git/SQLite/process interference is part of the system under test rather than
+noise around it.
+
+## Method corrections earned during the sweep
+
+Two, both from the sweep catching itself.
+
+**A mutation must assert that it applied.** D2 first read as a finding and was not — the replacement
+string had failed to match, nothing was broken, and the green result meant nothing. A mutation that
+silently no-ops manufactures confidence in exactly the direction the sweep exists to remove.
+
+**Commit the fix before mutating against it.** Restoring a mutation with `git checkout -- <file>`
+reverts to HEAD, which destroys an uncommitted fix in the same file. This happened once, and was
+caught only because the *next* mutation reported that it had not applied. Fixes are now committed
+first, so restoration cannot lose them.
+
+## Remaining before merge
+
+```text
+ledger + PR description update      once, now
+one real managed Codex task         end to end, after the deterministic sweep is closed
+final merge audit
+```
 
 ```text
 B  recoverability and durable truth   migration 18->22, fresh-vs-migrated, reboot/reconcile,

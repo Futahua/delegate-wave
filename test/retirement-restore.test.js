@@ -137,7 +137,13 @@ test("a retired repository's branch is not moved back", async (t) => {
   fs.writeFileSync(path.join(repo, "input.txt"), "their work\n");
   await command("git", ["add", "."], repo);
   await command("git", ["commit", "-m", "their own commit"], repo);
+  await command("git", ["branch", "-f", "integration", "main"], repo);
   const moved = await command("git", ["rev-parse", "integration"], repo);
+  // The dangerous state, asserted: the tracked branch really did move away from what the backup
+  // recorded. Without this the test would pass trivially -- "the branch is where we left it" is not
+  // evidence that restore declined to move it.
+  const recorded = manifestOf(backup.backup).repositories[0].integration_head;
+  assert.notEqual(moved, recorded, "the retired repository's branch must actually have moved");
 
   service.close();
   const restored = await restoreBackup({ root, backupDirectory: backup.backup });

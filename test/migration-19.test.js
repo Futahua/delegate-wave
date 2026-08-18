@@ -125,6 +125,18 @@ test("a schema-18 database gains every column schema 19 declares", async (t) => 
   ).get().sql;
   assert.equal(beforeJobs.includes("strategy"), false);
   assert.equal(beforeJobs.includes("max_attempts BETWEEN"), false);
+  // And demonstrably pre-22, not merely pre-19. The fixture is hand-written, so it does not follow
+  // the schema forward on its own: without this, a later version's columns could quietly become
+  // part of the "old" database and the migration under test would have nothing to do.
+  const beforeAttempts = before.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'",
+  ).get().sql;
+  assert.equal(beforeAttempts.includes("budget_reservation_usd"), false, "fixture must predate reservations");
+  assert.equal(
+    before.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'attempt_runtime_provenance'").get().count,
+    0,
+    "fixture must predate the provenance receipt",
+  );
   before.close();
 
   const db = openDatabase(databasePath);

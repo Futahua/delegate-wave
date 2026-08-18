@@ -78,6 +78,12 @@ test("authorization refuses a proposal whose branch has moved", async (t) => {
   await command("git", ["add", "."], repo);
   await command("git", ["commit", "-m", "someone else committed"], repo);
 
+  // The dangerous state, asserted rather than assumed: the branch really did move away from the head
+  // this proposal was written against. Without this the test could pass on a rejection that came
+  // from somewhere else entirely while the base check sat dead.
+  const moved = await command("git", ["rev-parse", "HEAD"], repo);
+  assert.notEqual(moved, proposal.expected_base_sha, "the branch must actually have moved");
+
   assert.equal(
     service.projectStateVersion(project.id),
     proposal.expected_state_version,
