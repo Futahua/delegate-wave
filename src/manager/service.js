@@ -178,19 +178,44 @@ export class ManagerService {
     return { decision, turnId };
   }
 
+  // A manager turn acquires one terminal truth exactly once.
+  //
+  // Two defects lived here, and the weaker one hid the stronger. The receipt was written with
+  // INSERT OR REPLACE: SQLite resolves a primary-key collision by deleting the conflicting row and
+  // inserting the replacement, and delete triggers fire for that only when recursive_triggers is
+  // enabled -- which this connection does not enable. So the immutability triggers on
+  // manager_usage_receipts could never protect this path.
+  //
+  // The stronger defect is that the UPDATE had no state predicate. Even with a protected receipt, a
+  // second call could rewrite a COMPLETED turn's response, digest and action -- turning a recorded
+  // ACCEPT into a REVISE against the same scarce call. The TURN must be write-once, not merely its
+  // usage row.
+  //
+  // Both are fixed by one shape: terminalize only from a live state, require exactly one row to
+  // change, and insert the receipt plainly. A second attempt changes nothing and the whole
+  // transaction rolls back, so no half-rewrite survives.
   finishTurn(turnId, run, state, { usage = null, responsePath = null, action = null, error = null } = {}) {
-    transaction(this.db, () => {
-      this.db.prepare(`UPDATE manager_turns
+    return transaction(this.db, () => {
+      const changed = this.db.prepare(`UPDATE manager_turns
         SET state = ?, response_artifact = ?, response_digest = ?, action = ?, finished_at = ?
-        WHERE id = ?`).run(
+        WHERE id = ? AND state IN ('INTENDED', 'RUNNING')`).run(
         state, responsePath,
         responsePath && fs.existsSync(responsePath)
           ? crypto.createHash("sha256").update(fs.readFileSync(responsePath)).digest("hex")
           : null,
         action, now(), turnId,
-      );
+      ).changes;
+
+      if (changed !== 1) {
+        // Already terminal. The first account stands and this one is refused rather than merged.
+        throw new ManagerStop(
+          `manager turn ${turnId} is already terminal and cannot be finished again`,
+          "TURN_ALREADY_TERMINAL",
+        );
+      }
+
       if (usage) {
-        this.db.prepare(`INSERT OR REPLACE INTO manager_usage_receipts(
+        this.db.prepare(`INSERT INTO manager_usage_receipts(
           manager_turn_id, status, input_tokens, output_tokens, reasoning_tokens,
           cache_read_tokens, cache_write_tokens, total_tokens, source, observed_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -202,6 +227,7 @@ export class ManagerService {
         kind: `MANAGER_TURN_${state}`, entityType: "job", entityId: run.job_id,
         payload: { turnId, action, error },
       });
+      return true;
     });
   }
 

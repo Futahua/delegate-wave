@@ -354,6 +354,68 @@ test("a candidate whose diff cannot be established cannot be ACCEPTed", async (t
   assert.ok(realGit);
 });
 
+test("a manager turn acquires one terminal truth exactly once", async (t) => {
+  // Sweep C4. Two defects, the weaker hiding the stronger.
+  //
+  // The receipt was written with INSERT OR REPLACE. SQLite resolves a primary-key collision by
+  // deleting the conflicting row and inserting the replacement, and delete triggers fire for that
+  // only when recursive_triggers is enabled -- which this connection does not enable. So the
+  // immutability triggers on manager_usage_receipts never protected this path.
+  //
+  // The stronger defect: the UPDATE had no state predicate, so even a protected receipt would not
+  // have stopped a second call rewriting a COMPLETED turn's response and action -- turning a
+  // recorded ACCEPT into a REVISE against the same scarce call. The TURN must be write-once, not
+  // merely its usage row.
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    {
+      action: "ACCEPT",
+      reason: "this solves it",
+      usage: { inputTokens: 1000, cachedInputTokens: 0, outputTokens: 300, reasoningOutputTokens: 0, totalTokens: 1300 },
+    },
+  ]);
+  await service.advance(job.id);
+
+  const run = service.getRun(job.id);
+  const review = service.turns(run.id).find((turn) => turn.phase === "REVIEW");
+  assert.equal(review.state, "COMPLETED");
+  assert.equal(review.action, "ACCEPT", "the dangerous state is real: a terminal turn exists");
+  const firstDigest = review.response_digest;
+  const firstReceipt = dispatcher.db.prepare(
+    "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
+  ).get(review.id);
+  assert.ok(firstReceipt, "and it carries a usage receipt");
+
+  // A second terminalization of the SAME turn, with a different decision and different usage --
+  // exactly what a duplicated callback or a resumed loop would attempt.
+  const second = path.join(path.dirname(review.prompt_artifact), "forged-response.txt");
+  fs.writeFileSync(second, JSON.stringify({ action: "REVISE", reason: "actually no" }));
+  assert.throws(
+    () => service.finishTurn(review.id, run, "COMPLETED", {
+      action: "REVISE",
+      responsePath: second,
+      usage: {
+        status: "COMPLETE", input_tokens: 9999, output_tokens: 9999, reasoning_tokens: 0,
+        cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 19998, source: "forged",
+      },
+    }),
+    /already terminal/,
+  );
+
+  // The first account survives intact, and nothing from the second reached the database.
+  const after = service.turns(run.id).find((turn) => turn.id === review.id);
+  assert.equal(after.action, "ACCEPT");
+  assert.equal(after.response_digest, firstDigest);
+  const receipts = dispatcher.db.prepare(
+    "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
+  ).all(review.id);
+  assert.equal(receipts.length, 1, "no second receipt was inserted");
+  assert.equal(receipts[0].source, firstReceipt.source);
+  assert.notEqual(receipts[0].input_tokens, 9999);
+  // The rollback is whole: a failed terminalization leaves no partial rewrite behind.
+  assert.equal(receipts[0].total_tokens, firstReceipt.total_tokens);
+});
+
 test("ACCEPT is refused when deterministic validation did not pass", async (t) => {
   // A failing worker, then a manager that accepts anyway. Semantic acceptance cannot substitute for
   // mechanical truth, so the run halts rather than promoting.
