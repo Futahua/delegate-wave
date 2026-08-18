@@ -286,8 +286,20 @@ function lastAssistantText(text) {
 
 function assistantTextOf(record) {
   const type = record?.type ?? record?.event ?? null;
-  if (type && !/assistant|message|agentMessage/i.test(String(type))) return null;
-  const data = record?.data ?? record?.properties ?? record;
+  // Two executors, two shapes, and the second one cost a whole managed run.
+  //
+  // Harness writes `assistant/message` with the text under `data`. OpenCode
+  // writes `type: "text"` with the text under `part`. The original filter only
+  // recognised names containing assistant/message, so every OpenCode report was
+  // discarded, result_text_artifact was never written, and the manager saw
+  // UNKNOWN for eight consecutive investigations that had all succeeded and had
+  // all produced good answers.
+  //
+  // Matching on shape as well as name, because the next executor will have a
+  // third spelling and the failure mode is silent: a dropped report is
+  // indistinguishable from a worker that said nothing.
+  if (type && !/assistant|message|agentMessage|^text$/i.test(String(type))) return null;
+  const data = record?.part ?? record?.data ?? record?.properties ?? record;
   const direct = data?.text ?? data?.message ?? null;
   if (typeof direct === "string" && direct.trim()) return direct.trim();
   const content = data?.content ?? data?.parts ?? null;

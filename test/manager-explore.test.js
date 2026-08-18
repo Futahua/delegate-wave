@@ -319,3 +319,38 @@ test("an exploration round is durable before its work is bought", async (t) => {
     .get(children[0].id).count;
   assert.equal(after, before, "a completed investigation is never re-run");
 });
+
+test("an OpenCode worker's report is captured, not silently discarded", async (t) => {
+  // The defect that made a whole managed run useless. Harness writes
+  // `assistant/message` with text under `data`; OpenCode writes `type: "text"`
+  // with text under `part`. The reader recognised only the first, so eight
+  // investigations succeeded, produced good answers with file:line citations,
+  // and the manager saw UNKNOWN for every one -- then escalated asking for the
+  // file contents it had already been told.
+  //
+  // A dropped report is indistinguishable from a worker that said nothing, which
+  // is why this needs a test rather than vigilance.
+  const { readFinalText } = await import("../src/manager/runtime.js");
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-report-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+
+  const openCode = path.join(temp, "opencode-events.jsonl");
+  fs.writeFileSync(openCode, [
+    JSON.stringify({ type: "step_start", part: {} }),
+    JSON.stringify({ type: "tool_use", part: { tool: "read" } }),
+    JSON.stringify({ type: "text", part: { text: "Findings: totals are computed in src/export.js:42." } }),
+    JSON.stringify({ type: "step_finish", part: { tokens: { input: 1, output: 1 } } }),
+  ].join("\n"));
+  assert.match(
+    readFinalText({ stdoutPath: openCode }, temp),
+    /totals are computed in src\/export\.js:42/,
+  );
+
+  // The Harness shape still reads, so the fix widened rather than replaced.
+  const sessions = path.join(temp, "sessions", "ws", "s1");
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.writeFileSync(path.join(sessions, "session.jsonl"), `${JSON.stringify({
+    type: "assistant/message", data: { text: "Harness findings here." },
+  })}\n`);
+  assert.match(readFinalText({}, temp), /Harness findings here/);
+});
