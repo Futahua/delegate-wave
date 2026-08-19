@@ -134,7 +134,7 @@ export class OpenCodeBackend {
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
     const prompt = mode === "read"
       ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${task}`
-      : `Implement this bounded task in the current worktree. You may run commands: installing dependencies, building, and running tests are expected where the task needs them. Do not commit, push, or modify Git metadata -- delegate-wave captures the candidate from the resulting files itself, so committing is neither required nor honoured. Do not touch files outside this worktree.\n\nTask: ${task}`;
+      : `Implement this bounded task in the current worktree.\n\nWrite code early and often. Make your first edit within the first few actions, then build the rest incrementally, checking as you go. Do not survey the whole repository before writing anything: the task below already carries what investigation established, and re-deriving it costs the budget you need for the work. An attempt that reads everything and writes nothing has failed, however well it understood the problem.\n\nYou may run commands: installing dependencies, building, and running tests are expected where the task needs them. Do not commit, push, or modify Git metadata -- delegate-wave captures the candidate from the resulting files itself, so committing is neither required nor honoured. Do not touch files outside this worktree.\n\nTask: ${task}`;
     const args = [...this.prefixArgs,
       "run", prompt,
       "--agent", mode === "read" ? "delegate-wave-reader" : "delegate-wave-worker",

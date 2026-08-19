@@ -153,3 +153,18 @@ test("the manager is told which actions each turn accepts", () => {
   assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /use RETHINK, which carries "explorations" for exactly this/);
   assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /Refusing to judge on evidence you consider insufficient is correct/);
 });
+
+test("the implementation worker is told to write before it surveys", () => {
+  // Runs 6 and 8 lost four attempts the same way: the worker read thirteen to fifteen files,
+  // reasoned to exactly its 32,000-token cap in a single step, emitted zero output tokens, and
+  // wrote nothing. In run 8 it had a shell and used it well -- four bash calls including npm ci --
+  // and still never made an edit. Understanding the problem completely and producing nothing is a
+  // failure, and the prompt now says so.
+  const source = readFileSync(new URL("../src/backend.js", import.meta.url), "utf8");
+  const prompt = /Implement this bounded task[^`]*/.exec(source)?.[0] ?? "";
+  assert.match(prompt, /Write code early and often/);
+  assert.match(prompt, /first edit within the first few actions/);
+  assert.match(prompt, /Do not survey the whole repository before writing anything/);
+  // And the reason, so the instruction is not merely a style preference it can reason away.
+  assert.match(prompt, /reads everything and writes nothing has failed/);
+});
