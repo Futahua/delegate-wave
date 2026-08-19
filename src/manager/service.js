@@ -104,6 +104,24 @@ export class ManagerService {
   //   UNCERTAIN  accepted, then lost. Quota may be gone and the answer may exist. A second call
   //              would pay twice to ask a question that may already be answered, so the run stops
   //              and a person decides.
+  // One rate-limit sample, stored exactly as the provider gave it.
+  //
+  // Swallows everything. This is measurement, and a manager turn must not fail because the account
+  // endpoint was slow, absent, or unsupported by the backend in use.
+  async recordRateLimits(turnId, boundary) {
+    let raw = null;
+    try {
+      if (typeof this.backend?.rateLimits === "function") raw = await this.backend.rateLimits();
+    } catch { /* the sample is lost; the turn is not */ }
+    try {
+      this.db.prepare(`INSERT OR IGNORE INTO manager_rate_limit_snapshots(
+        id, manager_turn_id, boundary, raw_json, observed_at
+      ) VALUES (?, ?, ?, ?, ?)`).run(
+        id("mrl"), turnId, boundary, raw === null ? null : JSON.stringify(raw), now(),
+      );
+    } catch { /* never let telemetry fail the work it measures */ }
+  }
+
   async runTurn(run, { phase, prompt, subjectAttemptId = null }) {
     const existing = this.turns(run.id);
     if (existing.length >= run.max_turns) {
@@ -134,12 +152,21 @@ export class ManagerService {
       });
     });
 
+    // Sampled either side of the call, so one turn's consumption is a difference rather than an
+    // estimate. Recorded even when it comes back null: an account that exposes nothing is a fact
+    // about the measurement, and a missing row would be indistinguishable from a turn nobody
+    // sampled. Never allowed to disturb the turn -- telemetry that can fail the work it measures is
+    // worse than no telemetry.
+    await this.recordRateLimits(turnId, "BEFORE");
+
     let result;
     try {
       result = await this.backend.runTurn({
         threadId: run.thread_id, phase, prompt, subjectAttemptId,
       });
     } catch (error) {
+      // A failed turn still consumed allowance, so the AFTER sample is taken on this path too.
+      await this.recordRateLimits(turnId, "AFTER");
       const uncertain = error?.uncertain === true;
       this.finishTurn(turnId, run, uncertain ? "UNCERTAIN" : "FAILED", { error: String(error?.message ?? error) });
       throw new ManagerStop(
@@ -149,6 +176,8 @@ export class ManagerService {
         uncertain ? "UNCERTAIN" : "TURN_FAILED",
       );
     }
+
+    await this.recordRateLimits(turnId, "AFTER");
 
     const usage = observeManagerUsage(this.backend, result);
     const responsePath = path.join(artifactDir, `turn-${ordinal}-response.txt`);

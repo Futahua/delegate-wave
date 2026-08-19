@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "23";
+export const SCHEMA_VERSION = "24";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -415,6 +415,38 @@ BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_delete
 BEFORE DELETE ON integration_rollbacks
 BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
+
+-- The scarce resource in its own units, sampled either side of every manager turn.
+--
+-- Token counts are an accounting of what was sent and generated. They are NOT known to be what a
+-- plan-authenticated subscription actually charges: billing categories and quota accounting need
+-- not coincide, and cache reads were 73% of dogfood run 5's strong total, so the difference is not
+-- a rounding error. Optimising "fewest tokens" while the plan meters something else would tune the
+-- wrong quantity confidently.
+--
+-- The provider's ORIGINAL response is stored verbatim. Any normalisation delegate-wave applies is a
+-- reading of that response and can be redone later; a percentage computed today cannot be
+-- un-computed when the shape turns out to mean something else.
+--
+-- Evidence only. Nothing enforces a quota from these rows: this exists to answer what one manager
+-- turn consumes, which must be known before anything is built to limit it.
+CREATE TABLE IF NOT EXISTS manager_rate_limit_snapshots (
+  id TEXT PRIMARY KEY,
+  manager_turn_id TEXT NOT NULL REFERENCES manager_turns(id),
+  boundary TEXT NOT NULL CHECK (boundary IN ('BEFORE', 'AFTER')),
+  -- NULL when the account exposes no rate-limit information at all, which is itself worth recording:
+  -- absence must be visible rather than inferred from a missing row.
+  raw_json TEXT,
+  observed_at TEXT NOT NULL,
+  UNIQUE (manager_turn_id, boundary)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_rate_limits_immutable_update
+BEFORE UPDATE ON manager_rate_limit_snapshots
+BEGIN SELECT RAISE(ABORT, 'manager_rate_limit_snapshots is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_rate_limits_immutable_delete
+BEFORE DELETE ON manager_rate_limit_snapshots
+BEGIN SELECT RAISE(ABORT, 'manager_rate_limit_snapshots is immutable'); END;
 
 CREATE TABLE IF NOT EXISTS attempt_usage_receipts (${ATTEMPT_USAGE_RECEIPTS_COLUMNS});
 
