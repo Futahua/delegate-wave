@@ -12,7 +12,13 @@ export const USAGE_UNKNOWN = "UNKNOWN";
 // This is not "we found no usage" -- that is UNKNOWN, and it must stay blocking, because an executor
 // that reached a provider and then lost its accounting really did spend money. This status means
 // something stronger and narrower: the process died during its own local initialization, so a
-// billable call could not have been made. Zero here is measured, not assumed.
+// billable call could not have been made. Zero here is DERIVED from that positive evidence, not
+// assumed from an absence -- and it is not measured either: nothing observed provider usage, because
+// no provider was reached. The three ledger meanings must stay disjoint:
+//
+//   COMPLETE / PARTIAL    provider-side usage evidence exists
+//   UNKNOWN               provider contact may have happened; cost cannot be established
+//   NO_PROVIDER_CONTACT   local evidence proves execution stopped before provider contact; cost $0
 //
 // Only an executor adapter may assert this, and only from a signature it recognises. Empty logs, a
 // null exit code, and generic process failure are all insufficient -- each is equally consistent with
@@ -262,7 +268,7 @@ export function assertValidObservation(observed) {
       fail("reported_cost_usd set under UNKNOWN");
     }
   } else if (observed.status === USAGE_NO_PROVIDER_CONTACT) {
-    // Every number is a measured zero. NULL would make this indistinguishable from UNKNOWN in the
+    // Every number is a derived zero. NULL would make this indistinguishable from UNKNOWN in the
     // stored row, and any nonzero figure would contradict the claim the status is making.
     for (const field of TOKEN_FIELDS) {
       if (observed[field] !== 0) fail(`${field} must be 0 under NO_PROVIDER_CONTACT`);

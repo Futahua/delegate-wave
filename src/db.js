@@ -66,7 +66,7 @@ const ATTEMPT_USAGE_RECEIPTS_COLUMNS = `
     AND cache_read_tokens >= 0 AND cache_write_tokens >= 0
     AND provider_steps >= 1
   )),
-  -- NO_PROVIDER_CONTACT is the one status whose numbers are all MEASURED zeroes. Writing NULL would
+  -- NO_PROVIDER_CONTACT is the one status whose numbers are all DERIVED zeroes. Writing NULL would
   -- make the row indistinguishable from UNKNOWN, and any nonzero figure would contradict the claim.
   -- reported_* stays NULL because the executor reported nothing -- it died first -- while the zero
   -- reference cost is delegate-wave's own determination and is what keeps the family accountable.
@@ -388,7 +388,9 @@ BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
 --   NO_PROVIDER_CONTACT
 --             the executor is positively known to have failed during local initialization, before a
 --             provider request was possible. Distinct from UNKNOWN in the one way that matters to
---             the budget: the zero is measured, so it does not make family spend unestablishable.
+--             the budget: the zero is DERIVED from positive local evidence rather than observed
+--             from provider usage, so it does not make family spend unestablishable. Nothing here
+--             measured a provider; the proof is that no provider was reached.
 -- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
 -- failed work appears free in cost per validated candidate.
 -- A rollback is a first-class terminal outcome, not an event footnote. Current integration state is

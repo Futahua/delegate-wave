@@ -81,7 +81,7 @@ assert it, from a signature in its own startup path; a nonzero exit, an empty
 log, and a null exit code are each insufficient, and all three together are still
 insufficient, because that is exactly what a worker that spent money and then
 crashed before flushing looks like. The observation carries mandatory verbatim
-evidence. Every number on the row is a measured zero rather than NULL — which is
+evidence. Every number on the row is a derived zero rather than NULL — which is
 what distinguishes it from UNKNOWN in the stored record — while `reported_*`
 stays NULL, because the executor reported nothing and the zero is delegate-wave's
 own finding.
