@@ -18,7 +18,7 @@ import {
   resolveRevision,
   updateRefCas,
 } from "./git.js";
-import { runShell } from "./process.js";
+import { assertNotShellComposed, runCommand, runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { readFinalText } from "./manager/runtime.js";
 import { instructionDigest } from "./manager/contracts.js";
@@ -75,6 +75,7 @@ function parseValidationPlan(value) {
   if (!Array.isArray(parsed) || parsed.some((command) => typeof command !== "string" || !command.trim())) {
     throw new Error("Stored validation plan must be an array of non-empty command strings");
   }
+  for (const command of parsed) assertNotShellComposed(command);
   return parsed;
 }
 
@@ -123,6 +124,9 @@ export class Dispatcher {
   close() { this.db.close(); }
 
   async addProject({ name, repoPath, branch = "HEAD", validation = [], protectedPaths = [] }) {
+    // Checked here rather than only at run time, so a plan that can never execute is rejected while
+    // someone is looking at it -- not mid-run, against a candidate it would then appear to condemn.
+    for (const command of validation) assertNotShellComposed(command);
     const resolvedPath = path.resolve(repoPath);
     await assertRepository(resolvedPath);
     const integrationBranch = branch === "HEAD"
@@ -1298,25 +1302,48 @@ export class Dispatcher {
       this.db.prepare("UPDATE attempts SET validation_intent_id = ?, validation_pid = NULL WHERE id = ?").run(validationId, attemptId);
       recordEvent(this.db, { kind: "VALIDATION_INTENDED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, command } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
-    const result = await runShell(command, {
+    // One command, no shell. Sequencing belongs to the plan, so no operator can be misparsed into
+    // silence by whichever interpreter this machine happens to ship.
+    const result = await runCommand(command, {
       cwd: worktreePath,
       timeoutMs: 15 * 60_000,
       onSpawn: (pid) => this.recordValidationPid(attemptId, epoch, validationId, pid),
     });
+    const outcome = !result.ran ? "CHECK_DID_NOT_RUN"
+      : result.exitCode === 0 ? "PASSED"
+      : "CHECK_FAILED";
     const outputPath = path.join(artifactDir, `${validationId}.log`);
-    fs.writeFileSync(outputPath, `${result.stdout}\n${result.stderr}`, { flag: "wx" });
+    fs.writeFileSync(
+      outputPath,
+      result.ran ? `${result.stdout}\n${result.stderr}` : `the check did not run: ${result.reason}`,
+      { flag: "wx" },
+    );
     this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
       if (attempt.validation_intent_id !== validationId) {
         throw new Error(`Stale validation result rejected for ${attemptId}`);
       }
       this.db.prepare(`INSERT INTO validation_runs(
-        id, attempt_id, command, exit_code, output_path, started_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-        validationId, attemptId, command, result.exitCode, outputPath, startedAt, now(),
+        id, attempt_id, command, exit_code, outcome, did_not_run_reason,
+        output_path, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        validationId, attemptId, command, result.ran ? result.exitCode : null,
+        outcome, result.ran ? null : result.reason, outputPath, startedAt, now(),
       );
       this.db.prepare("UPDATE attempts SET validation_intent_id = NULL, validation_pid = NULL WHERE id = ?").run(attemptId);
-      recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
+      recordEvent(this.db, {
+        kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch,
+        payload: { command, exitCode: result.ran ? result.exitCode : null, outcome },
+      });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
+    // A verifier that never started produced NO evidence about this candidate, so it must not read
+    // as the candidate failing. Marked as its own kind of error, and deliberately not recorded as a
+    // validation verdict: the attempt's validation_state stays NOT_RUN, which is already the exact
+    // word for what happened.
+    if (!result.ran) {
+      const error = new Error(`validation could not be executed: ${result.reason} -- ${command}`);
+      error.validationDidNotRun = true;
+      throw error;
+    }
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
   }
 
@@ -2641,8 +2668,13 @@ export class Dispatcher {
           executor_intent_id = NULL, executor_pid = NULL, failure_signature = ?,
           quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), signature, attemptId);
       } else if (attempt.terminal_state === 'SUCCEEDED' && attempt.validation_state === 'PENDING') {
-        this.db.prepare(`UPDATE attempts SET validation_state = 'FAILED',
-          failure_signature = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(signature, attemptId);
+        // A check that could not be executed produced no evidence about this candidate. The attempt
+        // still fails -- an unverifiable candidate cannot be offered -- but it fails as a system
+        // fault, and the candidate is left unjudged rather than recorded as having failed its tests.
+        this.db.prepare(`UPDATE attempts SET validation_state = ?,
+          failure_signature = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(
+          error?.validationDidNotRun ? 'NOT_RUN' : 'FAILED', signature, attemptId,
+        );
       } else return false;
       const count = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       const job = this.getJob(jobId);

@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "24";
+export const SCHEMA_VERSION = "25";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -80,6 +80,35 @@ const ATTEMPT_USAGE_RECEIPTS_COLUMNS = `
   CHECK (reported_cost_usd IS NULL OR reported_cost_usd >= 0),
   CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
   CHECK (malformed_events >= 0)`;
+
+// One deterministic check, and whether it actually happened.
+//
+// `outcome` exists because "the tests failed" and "the tests never ran" were previously the same
+// row. In dogfood run 5 the stored plan was a single shell string joined with `&&`, handed to
+// Windows PowerShell 5.1 where `&&` is a parse error; the interpreter exited nonzero without
+// running anything, and two candidates were recorded as having failed validation. The manager
+// reviewed that evidence faithfully and asked for revisions that could not have helped.
+//
+// A verifier that did not execute produces no evidence about the candidate at all, and must never
+// be readable as evidence against it.
+const VALIDATION_RUNS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  command TEXT NOT NULL,
+  -- NULL exactly when the command never started, so there was no exit status to observe.
+  exit_code INTEGER,
+  outcome TEXT NOT NULL DEFAULT 'CHECK_FAILED' CHECK (outcome IN (
+    'PASSED', 'CHECK_FAILED', 'CHECK_DID_NOT_RUN'
+  )),
+  -- Why it could not start, when it could not. Free text from the runner, recorded verbatim.
+  did_not_run_reason TEXT,
+  output_path TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL,
+  CHECK (outcome != 'CHECK_DID_NOT_RUN' OR (exit_code IS NULL AND did_not_run_reason IS NOT NULL)),
+  CHECK (outcome = 'CHECK_DID_NOT_RUN' OR (exit_code IS NOT NULL AND did_not_run_reason IS NULL)),
+  CHECK (outcome != 'PASSED' OR exit_code = 0)
+`;
 
 const JOBS_COLUMNS = `
   id TEXT PRIMARY KEY,
@@ -225,15 +254,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   UNIQUE(job_id, ordinal)
 );
 
-CREATE TABLE IF NOT EXISTS validation_runs (
-  id TEXT PRIMARY KEY,
-  attempt_id TEXT NOT NULL REFERENCES attempts(id),
-  command TEXT NOT NULL,
-  exit_code INTEGER NOT NULL,
-  output_path TEXT NOT NULL,
-  started_at TEXT NOT NULL,
-  finished_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS validation_runs (${VALIDATION_RUNS_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -981,6 +1002,25 @@ function rebuildConstrainedTables(db) {
       ],
     });
   }
+  if (definition("validation_runs") && !definition("validation_runs").includes("CHECK_DID_NOT_RUN")) {
+    pending.push({
+      name: "validation_runs",
+      columns: VALIDATION_RUNS_COLUMNS,
+      // Historical rows are migrated on their own terms: every existing row DID run, because the
+      // old schema could not represent anything else, so outcome derives from the exit code it
+      // recorded. That is a faithful reading of what those rows meant, not a reinterpretation --
+      // including run 5's, which genuinely did execute an interpreter that then refused the line.
+      copy: null,
+      insert: `INSERT INTO validation_runs_rebuilt
+                 (id, attempt_id, command, exit_code, outcome, did_not_run_reason,
+                  output_path, started_at, finished_at)
+               SELECT id, attempt_id, command, exit_code,
+                      CASE WHEN exit_code = 0 THEN 'PASSED' ELSE 'CHECK_FAILED' END,
+                      NULL, output_path, started_at, finished_at
+               FROM validation_runs`,
+      after: [],
+    });
+  }
   if (pending.length === 0) return;
 
   db.exec("PRAGMA foreign_keys = OFF");
@@ -991,7 +1031,8 @@ function rebuildConstrainedTables(db) {
         const temporary = `${table.name}_rebuilt`;
         db.exec(`DROP TABLE IF EXISTS ${temporary}`);
         db.exec(`CREATE TABLE ${temporary} (${table.columns})`);
-        db.exec(`INSERT INTO ${temporary} (${table.copy}) SELECT ${table.copy} FROM ${table.name}`);
+        db.exec(table.insert
+          ?? `INSERT INTO ${temporary} (${table.copy}) SELECT ${table.copy} FROM ${table.name}`);
         db.exec(`DROP TABLE ${table.name}`);
         db.exec(`ALTER TABLE ${temporary} RENAME TO ${table.name}`);
         for (const statement of table.after) db.exec(statement);
