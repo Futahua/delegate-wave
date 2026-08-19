@@ -890,6 +890,12 @@ export class Dispatcher {
 
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
+      // A clean exit is necessary and NOT sufficient. Where a backend can read its own protocol, its
+      // reading of whether the agent turn completed outranks the exit code, because an executor that
+      // died at the provider and then exited 0 is otherwise indistinguishable from one that worked.
+      if (backendResult.outcome && backendResult.outcome.state !== "SUCCEEDED") {
+        throw new Error(`worker did not complete: ${backendResult.outcome.reason}`);
+      }
 
       // ONE snapshot of what the attempt actually produced, taken through a delegate-wave-owned
       // temporary index rather than the worker's.

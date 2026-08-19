@@ -138,6 +138,8 @@ export class OpenCodeBackend {
       // Set only when this adapter recognises one of ITS OWN local-initialization failures. Null
       // otherwise, which leaves the conservative UNKNOWN path in force.
       preProviderFailure: classifyPreProviderFailure({ result, stdoutPath, stderrPath }),
+      // What the TRANSCRIPT says happened, which is not what the exit code says.
+      outcome: assessOpenCodeTranscript(stdoutPath),
       // What can honestly be claimed here: delegate-wave launched OpenCode with this exact --model,
       // and that argv is mechanical evidence. Nothing in this path observes what the provider then
       // served, and this backend has no reasoning-effort parameter at all -- so effort stays null
@@ -149,6 +151,61 @@ export class OpenCodeBackend {
       },
     };
   }
+}
+
+// Whether the agent's turn actually completed, read from OpenCode's own event protocol.
+//
+// The exit code cannot answer this. During dogfood run 5 two investigations hit a provider 400 --
+// [unsupported_tool_schema], non-retryable -- emitted an `error` event, produced no answer, and
+// OpenCode still exited 0. delegate-wave recorded both as SUCCEEDED. The manager then spent strong
+// turns reasoning around evidence that did not exist, which is the expensive part: a false worker
+// success costs more than an honest failure, because the failure would have been retried cheaply.
+//
+// The protocol distinguishes these cleanly. Every step carries a finish reason; "stop" means the
+// model concluded its turn, while "tool-calls" is a mid-turn continuation. The failing runs in run 5
+// had six and ten `tool-calls` steps and no `stop` at all, then an error.
+//
+// Success is NOT tied to a report existing. A worker may legitimately finish with no useful text,
+// and conflating "said something" with "completed" would fail honest runs. It is tied to
+// protocol-level terminal evidence and nothing else.
+//
+// Ambiguity resolves to failure in every direction: an unreadable transcript, an empty one, or one
+// that simply stops mid-turn is never reported as success.
+const TERMINAL_FINISH_REASONS = new Set(["stop"]);
+
+export function assessOpenCodeTranscript(stdoutPath) {
+  let text = null;
+  try { text = fs.readFileSync(stdoutPath, "utf8"); } catch {
+    return { state: "FAILED", reason: "the executor transcript could not be read" };
+  }
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return { state: "FAILED", reason: "the executor produced an empty transcript" };
+
+  let terminal = false;
+  let malformed = 0;
+  const reasons = new Set();
+  for (const line of lines) {
+    let record = null;
+    try { record = JSON.parse(line); } catch { malformed += 1; continue; }
+    const type = record?.type ?? record?.event ?? null;
+    if (type === "error") {
+      const error = record.error ?? {};
+      const detail = error.data?.message ?? error.message ?? error.name ?? "unspecified";
+      return { state: "FAILED", reason: `the executor reported an error: ${String(detail).slice(0, 300)}` };
+    }
+    if (type === "step_finish") {
+      const reason = record?.part?.reason ?? record?.data?.reason ?? null;
+      if (reason) reasons.add(String(reason));
+      if (TERMINAL_FINISH_REASONS.has(String(reason))) terminal = true;
+    }
+  }
+  if (terminal) return { state: "SUCCEEDED", reason: "the agent turn finished normally" };
+  return {
+    state: "FAILED",
+    reason: "the transcript carries no terminal completion: "
+      + (reasons.size ? `the turn only ever finished steps with reason ${[...reasons].join(", ")}` : "no step ever finished")
+      + (malformed ? `, and ${malformed} line(s) were unparseable` : ""),
+  };
 }
 
 // Where this attempt's private OpenCode state database lives, or null to leave the executor on its
