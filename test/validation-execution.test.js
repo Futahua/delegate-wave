@@ -152,3 +152,37 @@ test("resolveExecutable finds Windows batch shims", () => {
   assert.ok(path.isAbsolute(npm));
   if (process.platform === "win32") assert.match(npm, /\.(cmd|bat|exe)$/i);
 });
+
+test("a batch shim at a path containing spaces still runs", async () => {
+  // Dogfood run 7 died here. npm resolves to "C:\Program Files\nodejs\npm.CMD"; cmd re-parses
+  // everything after /c, split on the first space, and reported
+  //
+  //   'C:\Program' is not recognized as an internal or external command
+  //
+  // so `npm ci` was recorded CHECK_FAILED -- a truthful record of a command that was invoked wrong.
+  // The distinction the previous commit added worked exactly as designed and still could not save a
+  // candidate from a broken invocation, because the invocation itself was the defect.
+  if (process.platform !== "win32") return;
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave path with spaces-"));
+  const shim = path.join(base, "echo tool.cmd");
+  fs.writeFileSync(shim, "@echo off\r\necho ARG=%1\r\nexit /b 0\r\n");
+
+  const result = await runCommand(`"${shim}" hello`, { cwd: base });
+  assert.equal(result.ran, true, "a quoted path with spaces must reach cmd intact");
+  assert.equal(result.exitCode, 0);
+  // %1 carries the quoting cmd was handed, so the argument arrives as "hello" rather than hello.
+  // What matters is that the shim executed and received the argument, not how cmd renders it.
+  assert.match(result.stdout, /ARG="?hello"?/);
+  assert.doesNotMatch(result.stdout, /is not recognized/);
+
+  // And the real thing, which is what actually broke.
+  const npm = await runCommand("npm --version", { cwd: process.cwd() });
+  if (npm.ran) {
+    assert.equal(npm.exitCode, 0, `npm must run through its shim: ${npm.stderr}`);
+    assert.doesNotMatch(npm.stderr, /is not recognized as an internal or external command/);
+    assert.match(npm.stdout, /\d+\.\d+\.\d+/);
+  }
+
+  fs.rmSync(base, { recursive: true, force: true });
+});

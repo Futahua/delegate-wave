@@ -131,6 +131,16 @@ export function resolveExecutable(name, { platform = process.platform, env = pro
   return null;
 }
 
+// Quotes one argument for cmd's re-parse.
+//
+// Always quoted, not only when a space is present: a bare argument is also cmd's opportunity to see
+// its own metacharacters. Embedded quotes are escaped so an argument cannot close its own quoting
+// and let the remainder be read as command text. This narrows the surface cmd gets to interpret; it
+// does not eliminate it, because a batch file necessarily goes through cmd at all.
+function quoteForCmd(value) {
+  return `"${String(value).replace(/"/g, '\\"')}"`;
+}
+
 // Runs ONE command from an explicit argument vector. No shell, so no operator is ever interpreted.
 //
 // Returns `ran: false` when the command could not be started at all. That is a different fact from a
@@ -154,12 +164,26 @@ export async function runCommand(command, options = {}) {
 
   const isBatch = /\.(cmd|bat)$/i.test(resolved);
   // /d skips AutoRun, so a machine-local registry setting cannot inject work into a validation run.
+  //
+  // The quoting is not decoration. cmd re-parses everything after /c, so an unquoted program path
+  // splits on its first space: npm resolves to "C:\Program Files\nodejs\npm.CMD", and dogfood run 7
+  // died on `'C:\Program' is not recognized as an internal or external command`. Under /s, cmd strips
+  // one outer pair of quotes from the whole payload and treats the rest literally, so the payload is
+  // wrapped once more than looks necessary -- ""C:\path with spaces\npm.CMD" arg" -- and handed over
+  // verbatim so Node does not re-escape what cmd is about to re-parse.
   const spawned = isBatch
-    ? { file: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", resolved, ...argv.slice(1)] }
+    ? {
+      file: process.env.ComSpec ?? "cmd.exe",
+      args: ["/d", "/s", "/c", `"${quoteForCmd(resolved)} ${argv.slice(1).map(quoteForCmd).join(" ")}"`],
+      verbatim: true,
+    }
     : { file: resolved, args: argv.slice(1) };
 
   try {
-    const result = await runProcess(spawned.file, spawned.args, options);
+    const result = await runProcess(spawned.file, spawned.args, {
+      ...options,
+      ...(spawned.verbatim ? { windowsVerbatimArguments: true } : {}),
+    });
     return { ...result, ran: true, reason: null };
   } catch (error) {
     return {
@@ -171,13 +195,19 @@ export async function runCommand(command, options = {}) {
 }
 
 export function runProcess(command, args, options = {}) {
-  const { cwd, env, timeoutMs = 10 * 60_000, onSpawn, onStdout, onStderr } = options;
+  const {
+    cwd, env, timeoutMs = 10 * 60_000, onSpawn, onStdout, onStderr,
+    // Hands the argument string to the child exactly as written. Needed only for cmd.exe, which
+    // re-parses its own /c payload and must receive the quoting it expects rather than Node's.
+    windowsVerbatimArguments = false,
+  } = options;
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       env: childEnvironment(env),
       windowsHide: true,
       shell: false,
+      ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
