@@ -140,3 +140,16 @@ test("the worker's prompt agrees with the policy it runs under", () => {
   // Git stays delegate-wave's, regardless of what the worker is able to run.
   assert.match(prompt, /Do not commit, push, or modify Git metadata/);
 });
+
+test("the manager is told which actions each turn accepts", () => {
+  // Run 7 ended here, and the manager's reasoning was right: it saw a truncated diff and a failed
+  // npm ci, said "I cannot accept or revise based on a partial diff", and asked for more evidence.
+  // Correct instinct, unavailable action -- a REVIEW turn refuses EXPLORE, and nothing had ever told
+  // it so. A manager punished for a rule it was never given is a documentation defect, not a
+  // reasoning one.
+  assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /ACCEPT, REVISE, RETHINK, ESCALATE\s+--\s+and NOT EXPLORE/);
+  assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /EXPLORE, IMPLEMENT, ESCALATE/);
+  // And the route it should have taken, named where the refusal is explained.
+  assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /use RETHINK, which carries "explorations" for exactly this/);
+  assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /Refusing to judge on evidence you consider insufficient is correct/);
+});

@@ -214,6 +214,19 @@ lint success may appear in acceptance criteria as conditions that must end up tr
 steps for the worker unless the envelope says it can run them. Never conclude that the worker ran
 validation, or that a validation result describes something the worker did.
 
+Which actions a turn accepts depends on what it is. Answering with one the turn cannot accept ends
+the run, so this is worth reading twice:
+
+  planning a job, or synthesising after investigation
+      EXPLORE, IMPLEMENT, ESCALATE
+  reviewing a candidate you were shown
+      ACCEPT, REVISE, RETHINK, ESCALATE  --  and NOT EXPLORE
+
+When reviewing, you may still need facts before you can judge. EXPLORE is not how you ask for them:
+use RETHINK, which carries "explorations" for exactly this, or ESCALATE if a person must decide.
+Refusing to judge on evidence you consider insufficient is correct; naming an action the turn cannot
+accept throws that judgment away.
+
 Constraints that are enforced, not advisory:
   - at most 3 explorations per round, each with a non-empty "question"
   - "acceptance" must be non-empty: a brief without it is a goal with extra words, and the review
