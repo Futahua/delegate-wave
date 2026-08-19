@@ -26,7 +26,7 @@ const INLINE_POLICY = {
       },
     },
     "delegate-wave-worker": {
-      description: "Bounded implementation worker confined to one disposable attempt worktree",
+      description: "Implementation worker with build tooling, confined to one disposable worktree",
       mode: "primary",
       steps: 24,
       permission: {
@@ -36,7 +36,21 @@ const INLINE_POLICY = {
         grep: "allow",
         list: "allow",
         lsp: "deny",
-        bash: "deny",
+        // An implementation worker without a shell cannot install dependencies, compile, run tests,
+        // or regenerate build output -- and this project's objective requires committed build
+        // artifacts, which no amount of hand-editing can honestly reproduce. In dogfood run 6 both
+        // attempts asked for a shell, were refused, and burned their entire budget failing.
+        //
+        // Withholding it never protected anything that mattered. delegate-wave's guarantees do not
+        // rest on worker containment: the candidate is captured through delegate-wave's own Git
+        // index rather than the worker's, validation runs independently afterwards, and no change
+        // integrates without a human. What the worker CLAIMS is still worth nothing; what it can
+        // REACH was never the control. This matches the Harness path, whose default profile is
+        // 'trusted' for the same stated reason.
+        //
+        // The reader keeps its denial. An investigation has nothing to build, and the frozen
+        // executor comparison depends on it not reaching verifiers outside its worktree.
+        bash: "allow",
         external_directory: "deny",
         task: "deny",
         skill: "deny",
@@ -120,7 +134,7 @@ export class OpenCodeBackend {
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
     const prompt = mode === "read"
       ? `Investigate this task without modifying files. Return concise findings with exact file paths and evidence.\n\nTask: ${task}`
-      : `Implement this bounded task in the current worktree. Do not commit, push, modify Git metadata, or access files outside this worktree. Shell access is intentionally disabled; edit only the necessary files.\n\nTask: ${task}`;
+      : `Implement this bounded task in the current worktree. You may run commands: installing dependencies, building, and running tests are expected where the task needs them. Do not commit, push, or modify Git metadata -- delegate-wave captures the candidate from the resulting files itself, so committing is neither required nor honoured. Do not touch files outside this worktree.\n\nTask: ${task}`;
     const args = [...this.prefixArgs,
       "run", prompt,
       "--agent", mode === "read" ? "delegate-wave-reader" : "delegate-wave-worker",

@@ -13,6 +13,7 @@
 // chose another.
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { openCodeCapabilities } from "../src/backend.js";
 import { buildPlanEvidence, renderEvidence } from "../src/manager/evidence.js";
 import { MANAGER_SYSTEM_INSTRUCTIONS } from "../src/manager/backend.js";
@@ -26,9 +27,15 @@ const pack = (extra = {}) => buildPlanEvidence({
 });
 
 test("the evidence states what the worker can and cannot do", () => {
-  const rendered = renderEvidence(pack({ workerCapabilities: openCodeCapabilities("write") }));
+  // A fabricated envelope, deliberately not the live one. This asserts how a restriction is
+  // RENDERED; tying it to whatever the current policy happens to be would make the test flip
+  // whenever the policy does, which is exactly the coupling the envelope exists to remove.
+  const rendered = renderEvidence(pack({
+    workerCapabilities: {
+      read_files: true, edit_files: true, shell: false, run_build: false, run_tests: false, git: false,
+    },
+  }));
 
-  // Present as a capability envelope, with the denials named.
   assert.match(rendered, /Worker capability envelope/);
   assert.match(rendered, /CAN\s+edit_files/);
   assert.match(rendered, /CANNOT\s+shell/);
@@ -94,10 +101,42 @@ test("the envelope is derived from the policy in force, not hand-written", () =>
   const read = openCodeCapabilities("read");
   assert.equal(write.edit_files, true);
   assert.equal(read.edit_files, false, "the reader is read-only, and the envelope must say so");
-  assert.equal(write.shell, false);
-  // Everything requiring a shell under this executor follows the shell, rather than being asserted
-  // independently and drifting away from it.
-  assert.equal(write.run_build, write.shell);
-  assert.equal(write.run_tests, write.shell);
-  assert.equal(write.git, write.shell);
+  // Asserted as a RELATIONSHIP, not as today's value. Whether the shell is granted is a policy
+  // decision that may change; that everything requiring one follows it is the invariant, and it is
+  // what stops the envelope drifting into a lie when the policy is next edited.
+  for (const derived of ["run_build", "run_tests", "git"]) {
+    assert.equal(write[derived], write.shell,
+      `${derived} needs a shell under this executor and must track it`);
+    assert.equal(read[derived], read.shell, `${derived} must track the shell in read mode too`);
+  }
+});
+
+test("the implementation worker can build; the investigator still cannot", () => {
+  // Withholding a shell never protected anything that mattered. delegate-wave's guarantees rest on
+  // capturing the candidate through its OWN Git index, validating independently afterwards, and
+  // requiring a human before anything integrates -- not on what the worker could reach. What the
+  // worker CLAIMS is still worth nothing; what it can REACH was never the control.
+  const write = openCodeCapabilities("write");
+  assert.equal(write.shell, true, "an implementation worker that cannot build cannot do its job");
+  assert.equal(write.run_build, true);
+  assert.equal(write.run_tests, true);
+
+  // The reader keeps its denial: an investigation has nothing to build, and the frozen executor
+  // comparison depends on it not reaching verifiers outside its worktree.
+  const read = openCodeCapabilities("read");
+  assert.equal(read.shell, false, "investigation stays contained");
+  assert.equal(read.edit_files, false);
+});
+
+test("the worker's prompt agrees with the policy it runs under", () => {
+  // A prompt saying "shell access is intentionally disabled" while the policy allows bash is a
+  // contradiction the model resolves by guessing -- and in run 6 the guess cost two attempts.
+  const source = readFileSync(new URL("../src/backend.js", import.meta.url), "utf8");
+  const prompt = /Implement this bounded task[^`]*/.exec(source)?.[0] ?? "";
+  assert.ok(prompt, "the write-mode prompt is still findable");
+  assert.equal(openCodeCapabilities("write").shell, true);
+  assert.doesNotMatch(prompt, /[Ss]hell access is intentionally disabled/);
+  assert.match(prompt, /You may run commands/);
+  // Git stays delegate-wave's, regardless of what the worker is able to run.
+  assert.match(prompt, /Do not commit, push, or modify Git metadata/);
 });
