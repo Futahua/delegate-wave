@@ -32,10 +32,20 @@ brief already establishes, and states that reading everything and writing nothin
 is a failed attempt. Not a context-size fix: the cap being hit is a per-step
 reasoning limit, and enlarging anything would have bought a longer survey.
 
-Run 8 also produced the first observable quota measurement. `usedPercent` moved
-**98 → 99** across the run, so roughly 95k strong tokens ≈ one percentage point
-of a 7-day window — on the order of 100 managed runs per week. First-order only:
-the crossing could have landed anywhere inside the run.
+Run 8 also produced the first observable quota crossing: `usedPercent` moved
+**98 → 99** across a 94,941-token run.
+
+That is all it establishes. It does NOT estimate 94,941 tokens per percentage
+point. With integer quantization the underlying figure could have sat at 98.99%
+and crossed after almost no consumption, or at 98.01% and crossed after nearly a
+full point -- and if the reported value is rounded rather than floored, the
+uncertainty is wider still. A single boundary crossing cannot support a
+runs-per-week capacity figure, and the earlier "on the order of 100 managed runs
+per week" was an inference the evidence does not carry.
+
+What is established: **run 8 crossed one observable 1%-resolution quota
+boundary.** Estimating capacity needs several crossings with total strong usage
+accumulated between them.
 
 ## Run 9 — every stage works
 
@@ -46,12 +56,18 @@ files: `src/App.tsx`, `src/app.css`, `src/components/{Bits,Composer,DetailPane,R
 `src/fixtures.ts`, `src/main.tsx`, `src/normalize.ts`, `test/app.test.tsx`,
 `test/normalize.test.ts`.
 
-**Validation executed in full for the first time:**
+**The production validation pipeline executed correctly through its first genuine
+failure:**
 
 ```
 [PASSED]       exit=0   npm ci
 [CHECK_FAILED] exit=2   npm run build
 ```
+
+The plan's remaining two checks -- `git diff --exit-code -- public` and `npm test`
+-- were never reached, because the plan stops at the first failure. Two of four
+ran. That is enough to verify `afeba64` on the production path and is not the
+same claim as the whole plan having executed.
 
 `npm ci` passing is `bfa5519` verified in production — the shim path with a space
 now reaches cmd intact. The build failure is real, not an invocation defect:
@@ -119,9 +135,9 @@ cache floor.
 
 Quota stayed at 99% throughout, having crossed during run 8.
 
-## What is left
+## Status
 
-Nothing in the loop. The chain now runs end to end:
+The architecture is proven. The chain runs end to end:
 
 ```
 strong plan -> cheap investigation -> evidence -> implementation
@@ -130,7 +146,21 @@ strong plan -> cheap investigation -> evidence -> implementation
 
 Every defect found in runs 3–9 was a truthfulness or contract defect in
 delegate-wave's own execution layer, and every one was surfaced by the system
-reporting honestly rather than by inspection. What remains is optimization:
-raising the revision cap now that it demonstrably binds on good work, bounding
-manager context, deciding a quota brake from the rate-limit evidence, and fencing
-the worker filesystem if isolation is ever needed for its own sake.
+reporting honestly rather than by inspection.
+
+What has been demonstrated is the SAFE-ESCALATION path: the manager refusing to
+accept work that deterministic evidence does not support. The successful managed
+path -- a candidate that goes green and reaches ACCEPT -- has not yet run,
+because run 9 stopped at the revision limit rather than at a judgment.
+
+**Core completion:** one run with `maxAttempts: 3`, giving the existing
+`maxRevisionRounds: 2` its full two revisions. Run 9 is the first valid evidence
+for that change: a real candidate existed and the manager had a concrete second
+correction to make.
+
+**Optimization, afterwards:** manager-context compaction, especially REVIEW
+payloads; quota-aware admission once several boundary crossings exist; cheaper
+failure and retry policy; revision-limit defaults.
+
+**Optional hardening:** a real filesystem fence for shell-enabled workers,
+`cmd.exe` argument edge cases, UI and API polish.

@@ -26,7 +26,19 @@ const INLINE_POLICY = {
       },
     },
     "delegate-wave-worker": {
-      description: "Implementation worker with build tooling, confined to one disposable worktree",
+      // Deliberately NOT "confined". Dogfood run 9 proved otherwise: a worker listed the host
+      // application's repository from bash and ran wc -l on three of its files, getting real
+      // output. Granting bash removes the confinement that the edit and external_directory
+      // permissions appear to provide, because those are TOOL permissions and a subprocess is not
+      // a tool call.
+      //
+      // The weak boundary is acceptable under this system's trust model -- these workers are
+      // extensions of their operator, and the Harness path has a real fence for the cases where
+      // isolation is the point. A description claiming a guarantee that does not hold is not
+      // acceptable, because the next person designing an experiment around isolation would believe
+      // it.
+      description: "Implementation worker with build tooling; instructed to work within a disposable "
+        + "worktree, but shell access is not filesystem-confined",
       mode: "primary",
       steps: 24,
       permission: {
