@@ -72,7 +72,7 @@ export class OpenCodeBackend {
     this.timeoutMs = timeoutMs;
   }
 
-  async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, onSpawn }) {
+  async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, scratchDir, onSpawn }) {
     // Both dispatcher-contract checks happen before any side effect.
     //
     // The model check used to sit after the artifact streams were opened, so a refusal still left
@@ -90,6 +90,9 @@ export class OpenCodeBackend {
     fs.mkdirSync(artifactDir, { recursive: true });
     const stdoutPath = path.join(artifactDir, "opencode-events.jsonl");
     const stderrPath = path.join(artifactDir, "opencode-stderr.log");
+    // Absent scratchDir the executor falls back to its shared per-user database, which is correct
+    // for a single ad-hoc run and unsafe for concurrent ones.
+    const openCodeDatabase = resolveOpenCodeDatabase(scratchDir);
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
     const prompt = mode === "read"
@@ -107,7 +110,21 @@ export class OpenCodeBackend {
     const result = await runProcess(this.executable, args, {
       cwd: worktreePath,
       timeoutMs: this.timeoutMs,
-      env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(INLINE_POLICY) },
+      env: {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify(INLINE_POLICY),
+        // One state database per attempt.
+        //
+        // OpenCode otherwise keeps a single per-user SQLite database, and delegate-wave's whole
+        // shape is to fan out several workers at once. On 2026-08-19 three workers launched 8ms
+        // apart and two died on PRAGMA journal_mode = WAL before reaching a provider -- the
+        // contention grows with the database, and the shared one had reached 717MB.
+        //
+        // Isolation rather than serialization: throttling launches would trade away the parallelism
+        // that makes cheap workers worth having, to work around state that was never meant to be
+        // shared. OpenCode resolves this variable only when it is absolute or ":memory:", so the
+        // path is resolved here rather than passed through as given.
+        ...(openCodeDatabase ? { OPENCODE_DB: openCodeDatabase } : {}),
+      },
       onSpawn,
       onStdout: (text) => stdoutStream.write(text),
       onStderr: (text) => stderrStream.write(text),
@@ -132,6 +149,19 @@ export class OpenCodeBackend {
       },
     };
   }
+}
+
+// Where this attempt's private OpenCode state database lives, or null to leave the executor on its
+// shared per-user default.
+//
+// OpenCode honours OPENCODE_DB only when the value is absolute or ":memory:", so a relative path
+// would be silently ignored and every worker would quietly land back on the shared database -- the
+// failure this exists to prevent, reintroduced with no visible symptom until two workers collide.
+export function resolveOpenCodeDatabase(scratchDir) {
+  if (!scratchDir) return null;
+  const resolved = path.resolve(scratchDir);
+  fs.mkdirSync(resolved, { recursive: true });
+  return path.join(resolved, "opencode-state.db");
 }
 
 // Recognises failures that happened before OpenCode could have issued a provider request.

@@ -829,6 +829,11 @@ export class Dispatcher {
       try {
         backendResult = await backend.run({
           attemptId, worktreePath, artifactDir, model, mode: job.mode,
+          // Private, disposable working space for the executor's own machinery. Deliberately NOT
+          // the artifact directory -- artifacts are retained evidence, and an executor's state
+          // database is neither evidence nor small -- and emphatically not the worktree, where it
+          // would show up in the candidate diff.
+          scratchDir: path.join(this.paths.tmp, "executor", attemptId),
           // Two distinct inputs. `instruction` is what this worker must do; `goal` is the human's
           // immutable objective, available for framing and never a substitute for the instruction.
           instruction: instructionText,

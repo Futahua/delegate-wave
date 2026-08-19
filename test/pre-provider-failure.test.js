@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { initializeDataRoot } from "../src/db.js";
-import { FakeBackend, classifyPreProviderFailure } from "../src/backend.js";
+import { FakeBackend, classifyPreProviderFailure, resolveOpenCodeDatabase } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { runProcess } from "../src/process.js";
 
@@ -156,4 +156,26 @@ test("the classifier refuses every weaker kind of evidence", () => {
   assert.equal(classifyPreProviderFailure({ result: { exitCode: 1 }, stdoutPath, stderrPath }), null);
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("each attempt gets its own OpenCode state database", () => {
+  // The collision this prevents is silent: OpenCode ignores a relative OPENCODE_DB and falls back
+  // to the shared per-user database, so a path bug reintroduces the shared-state race with no
+  // symptom until two workers happen to start close enough together.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-db-"));
+  const first = resolveOpenCodeDatabase(path.join(base, "executor", "job_a.1"));
+  const second = resolveOpenCodeDatabase(path.join(base, "executor", "job_b.1"));
+
+  assert.ok(path.isAbsolute(first), "OpenCode ignores OPENCODE_DB unless it is absolute");
+  assert.notEqual(first, second, "two attempts must not share a state database");
+  assert.ok(fs.existsSync(path.dirname(first)), "the directory must exist before the executor starts");
+  // Not the worktree and not the artifact directory: one would enter the candidate diff, the other
+  // would bloat retained evidence with the executor's own machinery.
+  assert.doesNotMatch(first, /worktree/i);
+  assert.doesNotMatch(first, /artifacts/i);
+
+  // No scratch directory means no override, leaving a single ad-hoc run on its normal default.
+  assert.equal(resolveOpenCodeDatabase(null), null);
+
+  fs.rmSync(base, { recursive: true, force: true });
 });
