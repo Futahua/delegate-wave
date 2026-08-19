@@ -118,6 +118,9 @@ export class OpenCodeBackend {
     ]);
     return {
       ...result, stdoutPath, stderrPath,
+      // Set only when this adapter recognises one of ITS OWN local-initialization failures. Null
+      // otherwise, which leaves the conservative UNKNOWN path in force.
+      preProviderFailure: classifyPreProviderFailure({ result, stdoutPath, stderrPath }),
       // What can honestly be claimed here: delegate-wave launched OpenCode with this exact --model,
       // and that argv is mechanical evidence. Nothing in this path observes what the provider then
       // served, and this backend has no reasoning-effort parameter at all -- so effort stays null
@@ -129,6 +132,50 @@ export class OpenCodeBackend {
       },
     };
   }
+}
+
+// Recognises failures that happened before OpenCode could have issued a provider request.
+//
+// The bar is deliberately high, because the consequence of a false positive is recording real spend
+// as zero. Three independent conditions must hold together:
+//
+//   1. the process did not exit cleanly;
+//   2. its event stream is EMPTY -- not merely missing a usage record, but zero bytes, so no step,
+//      no message and no tool call was ever emitted;
+//   3. stderr carries a signature this adapter knows belongs to OpenCode's local startup.
+//
+// Condition 3 is what makes the claim positive rather than inferred. OpenCode opens a SQLite state
+// database as one of its first acts; when that open fails the process aborts inside its own
+// initialization, with no network stack engaged and no provider reachable. On 2026-08-19 three
+// workers launched 8ms apart contended for one shared 717MB database and two of them died exactly
+// here -- see docs/research/DOGFOOD-RUN-4.md.
+//
+// Conditions 1 and 2 alone are NOT sufficient and must never be used on their own: a worker that
+// bought tokens and then crashed before flushing its log satisfies both.
+const PRE_PROVIDER_SIGNATURES = [
+  // Local SQLite state database could not be opened or configured.
+  { pattern: /Failed to run the query 'PRAGMA /i, reason: "OpenCode failed to initialize its local SQLite state database" },
+  { pattern: /unable to open database file/i, reason: "OpenCode could not open its local state database file" },
+];
+
+export function classifyPreProviderFailure({ result, stdoutPath, stderrPath }) {
+  if (result?.exitCode === 0) return null;
+  // An empty event stream, established by size rather than by parse: a file that failed to parse may
+  // still describe provider work.
+  let events = null;
+  try { events = fs.statSync(stdoutPath); } catch { return null; }
+  if (events.size !== 0) return null;
+
+  let stderr = "";
+  try { stderr = fs.readFileSync(stderrPath, "utf8"); } catch { return null; }
+  const matched = PRE_PROVIDER_SIGNATURES.find(({ pattern }) => pattern.test(stderr));
+  if (!matched) return null;
+
+  return {
+    evidence: `${matched.reason}. stderr: ${stderr.trim().replace(/s+/g, " ").slice(0, 400)}`,
+    artifact: stderrPath,
+    format: "opencode-stderr",
+  };
 }
 
 function defaultOpenCodeLaunch() {

@@ -22,7 +22,7 @@ import { runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { readFinalText } from "./manager/runtime.js";
 import { instructionDigest } from "./manager/contracts.js";
-import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
+import { finalizeUsageReceipt, noProviderContactObservation, observeOpenCodeArtifact } from "./usage.js";
 import { assessExperimentalCondition, deriveProvenanceStatus } from "./provenance.js";
 import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
@@ -1084,7 +1084,18 @@ export class Dispatcher {
       // A backend that reports usage directly is preferred over artifact scraping. Either way it
       // supplies only a neutral observation; pricing is applied centrally by the finalizer, so no
       // executor computes delegate-wave's comparator.
-      const observation = backendResult?.usage
+      // A backend may assert that its executor died before a provider request was possible. That
+      // claim is the executor adapter's to make and nobody else's: only the adapter knows which
+      // failure signatures belong to its own local initialization. delegate-wave does not infer it
+      // from an empty log or a null exit code, because a worker that spent money and then crashed
+      // while writing its report looks identical from here.
+      const observation = backendResult?.preProviderFailure
+        ? noProviderContactObservation({
+          evidence: backendResult.preProviderFailure.evidence,
+          artifact: backendResult.preProviderFailure.artifact ?? null,
+          format: backendResult.preProviderFailure.format ?? "none",
+        })
+        : backendResult?.usage
         ?? (typeof backend?.observeUsage === "function"
           ? backend.observeUsage({ attemptId, artifactDir, backendResult })
           : observeOpenCodeArtifact(artifactDir ? path.join(artifactDir, "opencode-events.jsonl") : null));
@@ -2063,7 +2074,13 @@ export class Dispatcher {
       // already closes, one status along. Whatever was observed is still added to `spent`, because
       // it was really consumed; it just cannot make the accounting complete.
       if (row.reference_cost_usd !== null) spent += row.reference_cost_usd;
-      if (row.status === "COMPLETE" && row.reference_cost_usd !== null) priced += 1;
+      // NO_PROVIDER_CONTACT counts as priced at zero. Not a softening of the rule above: that rule
+      // exists because unmeasured spend must not pass as measured, and this status is the one case
+      // where zero IS the measurement. Treating it as unaccounted would let a worker that crashed
+      // while opening its own database permanently freeze a family's budget -- which is precisely
+      // what it did on 2026-08-19, to a run that had already bought 81,495 strong-manager tokens.
+      if ((row.status === "COMPLETE" || row.status === "NO_PROVIDER_CONTACT")
+        && row.reference_cost_usd !== null) priced += 1;
     }
     // Every attempt that ran without producing a complete priced receipt is unaccounted spend.
     const unpriced = Math.max(0, attempts - priced);

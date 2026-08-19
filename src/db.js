@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "22";
+export const SCHEMA_VERSION = "23";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -32,6 +32,55 @@ export const SCHEMA_VERSION = "22";
 // The only durable fix is one source of DDL text. These constants are interpolated into `CREATE
 // TABLE IF NOT EXISTS <name>` for a new database and into `CREATE TABLE <name>_rebuilt` for an old
 // one, so "fresh equals migrated" is a property of the code rather than a claim in a test.
+const ATTEMPT_USAGE_RECEIPTS_COLUMNS = `
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN', 'NO_PROVIDER_CONTACT')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  provider_steps INTEGER NOT NULL,
+  reported_cost_usd REAL,
+  reported_cost_source TEXT,
+  reference_cost_usd REAL,
+  pricing_basis_id TEXT,
+  source_backend TEXT NOT NULL,
+  source_artifact TEXT,
+  source_format TEXT NOT NULL,
+  malformed_events INTEGER NOT NULL DEFAULT 0,
+  observed_at TEXT NOT NULL,
+  -- An UNKNOWN receipt carries no numbers at all: no tokens, no steps, and no cost of either kind.
+  -- malformed_events may still be nonzero, because an unreadable artifact is itself evidence that
+  -- malformed accounting existed even though no usable usage did.
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+    AND provider_steps = 0
+    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
+    AND reference_cost_usd IS NULL AND pricing_basis_id IS NULL
+  )),
+  -- A COMPLETE or PARTIAL receipt observed at least one usable step and every token dimension.
+  CHECK (status IN ('UNKNOWN', 'NO_PROVIDER_CONTACT') OR (
+    input_tokens >= 0 AND output_tokens >= 0 AND reasoning_tokens >= 0
+    AND cache_read_tokens >= 0 AND cache_write_tokens >= 0
+    AND provider_steps >= 1
+  )),
+  -- NO_PROVIDER_CONTACT is the one status whose numbers are all MEASURED zeroes. Writing NULL would
+  -- make the row indistinguishable from UNKNOWN, and any nonzero figure would contradict the claim.
+  -- reported_* stays NULL because the executor reported nothing -- it died first -- while the zero
+  -- reference cost is delegate-wave's own determination and is what keeps the family accountable.
+  CHECK (status != 'NO_PROVIDER_CONTACT' OR (
+    input_tokens = 0 AND output_tokens = 0 AND reasoning_tokens = 0
+    AND cache_read_tokens = 0 AND cache_write_tokens = 0
+    AND provider_steps = 0
+    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
+    AND reference_cost_usd = 0 AND pricing_basis_id IS NULL
+  )),
+  CHECK (reported_cost_usd IS NULL OR reported_cost_usd >= 0),
+  CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
+  CHECK (malformed_events >= 0)`;
+
 const JOBS_COLUMNS = `
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
@@ -336,6 +385,10 @@ BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
 --   COMPLETE  a full accounting receipt was observed (including an explicit zero-usage receipt)
 --   PARTIAL   some usage was observed but the accounting is known to be incomplete
 --   UNKNOWN   no usage receipt was observed at all
+--   NO_PROVIDER_CONTACT
+--             the executor is positively known to have failed during local initialization, before a
+--             provider request was possible. Distinct from UNKNOWN in the one way that matters to
+--             the budget: the zero is measured, so it does not make family spend unestablishable.
 -- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
 -- failed work appears free in cost per validated candidate.
 -- A rollback is a first-class terminal outcome, not an event footnote. Current integration state is
@@ -361,44 +414,7 @@ CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_delete
 BEFORE DELETE ON integration_rollbacks
 BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
 
-CREATE TABLE IF NOT EXISTS attempt_usage_receipts (
-  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
-  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
-  input_tokens INTEGER,
-  output_tokens INTEGER,
-  reasoning_tokens INTEGER,
-  cache_read_tokens INTEGER,
-  cache_write_tokens INTEGER,
-  provider_steps INTEGER NOT NULL,
-  reported_cost_usd REAL,
-  reported_cost_source TEXT,
-  reference_cost_usd REAL,
-  pricing_basis_id TEXT,
-  source_backend TEXT NOT NULL,
-  source_artifact TEXT,
-  source_format TEXT NOT NULL,
-  malformed_events INTEGER NOT NULL DEFAULT 0,
-  observed_at TEXT NOT NULL,
-  -- An UNKNOWN receipt carries no numbers at all: no tokens, no steps, and no cost of either kind.
-  -- malformed_events may still be nonzero, because an unreadable artifact is itself evidence that
-  -- malformed accounting existed even though no usable usage did.
-  CHECK (status != 'UNKNOWN' OR (
-    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
-    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
-    AND provider_steps = 0
-    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
-    AND reference_cost_usd IS NULL AND pricing_basis_id IS NULL
-  )),
-  -- A COMPLETE or PARTIAL receipt observed at least one usable step and every token dimension.
-  CHECK (status = 'UNKNOWN' OR (
-    input_tokens >= 0 AND output_tokens >= 0 AND reasoning_tokens >= 0
-    AND cache_read_tokens >= 0 AND cache_write_tokens >= 0
-    AND provider_steps >= 1
-  )),
-  CHECK (reported_cost_usd IS NULL OR reported_cost_usd >= 0),
-  CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
-  CHECK (malformed_events >= 0)
-);
+CREATE TABLE IF NOT EXISTS attempt_usage_receipts (${ATTEMPT_USAGE_RECEIPTS_COLUMNS});
 
 CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_update
 BEFORE UPDATE ON attempt_usage_receipts
@@ -906,6 +922,28 @@ function rebuildConstrainedTables(db) {
         `CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_delete
          BEFORE DELETE ON work_proposals
          BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END`,
+      ],
+    });
+  }
+  if (definition("attempt_usage_receipts")
+    && !definition("attempt_usage_receipts").includes("NO_PROVIDER_CONTACT")) {
+    pending.push({
+      name: "attempt_usage_receipts",
+      columns: ATTEMPT_USAGE_RECEIPTS_COLUMNS,
+      // Positional copies transpose after ALTER TABLE, so every column is named. Historical rows
+      // migrate unchanged: a receipt written as UNKNOWN under the old semantics stays UNKNOWN,
+      // because it was a correct observation of what was knowable at the time.
+      copy: `attempt_id, status, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+             cache_write_tokens, provider_steps, reported_cost_usd, reported_cost_source,
+             reference_cost_usd, pricing_basis_id, source_backend, source_artifact, source_format,
+             malformed_events, observed_at`,
+      after: [
+        `CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_update
+         BEFORE UPDATE ON attempt_usage_receipts
+         BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END`,
+        `CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
+         BEFORE DELETE ON attempt_usage_receipts
+         BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END`,
       ],
     });
   }
