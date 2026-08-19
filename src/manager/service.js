@@ -122,6 +122,23 @@ export class ManagerService {
     } catch { /* never let telemetry fail the work it measures */ }
   }
 
+  // What the worker chosen for this job will be able to do.
+  //
+  // Asked of the backend that will actually run, rather than assumed, because capability is a
+  // property of the selected executor and profile. Null when the backend cannot say -- rendered to
+  // the manager as UNKNOWN, which is safe, instead of as a capable worker, which is not.
+  workerCapabilities(job) {
+    try {
+      const selection = this.dispatcher.selectBackend(
+        this.dispatcher.resolveModel(this.workerModel),
+        job.capability_profile ?? undefined,
+      );
+      const backend = selection?.backend ?? selection;
+      if (typeof backend?.capabilities !== "function") return null;
+      return backend.capabilities({ mode: "write", profile: job.capability_profile ?? undefined });
+    } catch { return null; }
+  }
+
   async runTurn(run, { phase, prompt, subjectAttemptId = null }) {
     const existing = this.turns(run.id);
     if (existing.length >= run.max_turns) {
@@ -339,6 +356,7 @@ export class ManagerService {
       baseSha: job.base_sha,
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
+      workerCapabilities: this.workerCapabilities(job),
     });
     const { decision } = await this.runTurn(run, { phase: "PLAN", prompt: renderEvidence(pack) });
 
@@ -538,6 +556,9 @@ export class ManagerService {
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       explorations: reports,
+      // The envelope for the work being PLANNED, which is implementation. Investigation children run
+      // read-only, but the manager is deciding what to build, not what to read.
+      workerCapabilities: this.workerCapabilities(job),
     });
 
     // SYNTHESIS rather than a second PLAN. The turn ledger exists to say what scarce budget was

@@ -95,13 +95,24 @@ function readArtifact(artifactPath, limit, options) {
 // repository, because the manager does not explore it directly -- that is what cheap workers are for,
 // and pointing the most expensive model at a codebase is the substitution this architecture exists to
 // prevent.
-export function buildPlanEvidence({ objective, baseSha, validationCommands, protectedPaths, explorations = [] }) {
+export function buildPlanEvidence({
+  objective, baseSha, validationCommands, protectedPaths, explorations = [], workerCapabilities = null,
+}) {
   return {
     kind: "PLAN",
     objective,
     base_sha: baseSha,
     validation_commands: validationCommands ?? [],
     protected_paths: protectedPaths ?? [],
+    // What the worker selected for this job can actually DO.
+    //
+    // Travels as evidence rather than as a rule in the standing instructions, because it is not an
+    // invariant of delegate-wave: the Harness 'trusted' profile has a shell and the OpenCode reader
+    // does not, and a manager taught one executor's limits would be confidently wrong the moment the
+    // router picked another.
+    worker_capabilities: workerCapabilities,
+    // Who executes the deterministic checks. Not the worker.
+    validation_owner: "delegate-wave",
     // Present only after an exploration round; empty on the first turn.
     //
     // The report's STATE travels with it. An investigation that failed, was never run, or whose
@@ -271,6 +282,34 @@ export async function buildReviewEvidence({
 //
 // Plain text rather than JSON: the manager reads this, and a wall of escaped JSON spends tokens on
 // syntax. The RESPONSE is strict JSON, because that one is parsed.
+// The worker's capability envelope, stated as what it can and cannot be asked to do.
+//
+// Absence is explicit. A missing envelope means delegate-wave could not establish one, and the
+// manager must be told that rather than left to assume a capable worker -- assuming capability is
+// exactly the failure this section exists to prevent.
+function renderCapabilities(lines, capabilities) {
+  lines.push("", "Worker capability envelope for this job:");
+  if (!capabilities) {
+    lines.push(
+      "  UNKNOWN -- delegate-wave could not establish what this worker can do. Assign only work that "
+      + "any worker could perform: editing files in the worktree. Do not assume a shell.",
+    );
+    return;
+  }
+  for (const [name, allowed] of Object.entries(capabilities)) {
+    lines.push(`  ${allowed ? "CAN" : "CANNOT"}  ${name}`);
+  }
+  const denied = Object.entries(capabilities).filter(([, allowed]) => !allowed).map(([name]) => name);
+  if (denied.length) {
+    lines.push(
+      "",
+      `Do not write instructions or acceptance steps that require: ${denied.join(", ")}. `
+      + "A worker asked to do what it cannot do will spend its entire budget failing, and produce "
+      + "nothing at all.",
+    );
+  }
+}
+
 export function renderEvidence(pack) {
   const lines = [];
   const section = (title) => { lines.push("", `## ${title}`, ""); };
@@ -292,9 +331,28 @@ export function renderEvidence(pack) {
   if (pack.kind === "PLAN") {
     section("Ground rules");
     lines.push(`Base commit: ${pack.base_sha}`);
-    lines.push(pack.validation_commands.length
-      ? `Deterministic checks that will run: ${pack.validation_commands.join(" && ")}`
-      : "No deterministic checks are configured for this project.");
+    // Rendered as a LIST, never joined with "&&".
+    //
+    // Joining them produced a shell command line that nothing anywhere ever runs, and the manager
+    // reasonably read it as one. In dogfood run 5 it concluded "the harness used an invalid
+    // PowerShell command with && before npm ran" and spent two revisions on a build the worker was
+    // never able to attempt. delegate-wave runs each command separately, with no shell.
+    if (pack.validation_commands.length) {
+      lines.push(
+        `Deterministic checks that delegate-wave will run after the worker finishes, each as its own `
+        + `command with no shell:`,
+      );
+      for (const command of pack.validation_commands) lines.push(`  - ${command}`);
+      lines.push(
+        "",
+        "These are NOT instructions for the worker and the worker does not run them. They may appear "
+        + "in acceptance criteria as things that must end up true, but never as steps for the worker "
+        + "to perform.",
+      );
+    } else {
+      lines.push("No deterministic checks are configured for this project.");
+    }
+    renderCapabilities(lines, pack.worker_capabilities);
     if (pack.protected_paths.length) {
       lines.push(`Paths a worker may not touch: ${pack.protected_paths.join(", ")}`);
     }

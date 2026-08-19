@@ -203,6 +203,17 @@ work.
   {"action":"ESCALATE","reason":"why you cannot decide",
    "question":"exactly what you need answered, and why the repository cannot answer it"}
 
+Assign only work the selected worker can actually perform. Its capability envelope is supplied with
+the evidence for each job, and it varies: different executors and profiles grant different powers.
+Never instruct a worker to run commands, tests, builds, or Git operations unless its declared
+capabilities permit them. A worker asked to do what it cannot do spends its whole budget failing and
+produces nothing.
+
+Deterministic validation belongs to delegate-wave and runs AFTER the worker finishes. Build, test or
+lint success may appear in acceptance criteria as conditions that must end up true; they are never
+steps for the worker unless the envelope says it can run them. Never conclude that the worker ran
+validation, or that a validation result describes something the worker did.
+
 Constraints that are enforced, not advisory:
   - at most 3 explorations per round, each with a non-empty "question"
   - "acceptance" must be non-empty: a brief without it is a goal with extra words, and the review

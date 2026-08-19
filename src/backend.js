@@ -58,6 +58,27 @@ export class FakeBackend {
   }
 }
 
+// What a worker running under one of these agents can be asked to do.
+//
+// Derived from the policy actually in force, not written out by hand, so the envelope cannot drift
+// away from the permissions it describes. A hand-maintained copy would eventually lie, and a lying
+// capability envelope is worse than none: the manager would trust it.
+export function openCodeCapabilities(mode) {
+  const agent = INLINE_POLICY.agent[mode === "read" ? "delegate-wave-reader" : "delegate-wave-worker"];
+  const allowed = (name) => agent.permission[name] === "allow";
+  return {
+    read_files: allowed("read"),
+    edit_files: allowed("edit"),
+    shell: allowed("bash"),
+    // Everything below needs a shell under this executor, so they follow it rather than being
+    // asserted separately.
+    run_build: allowed("bash"),
+    run_tests: allowed("bash"),
+    git: allowed("bash"),
+    network: allowed("webfetch") || allowed("websearch"),
+  };
+}
+
 export class OpenCodeBackend {
   constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000, launchResolver = defaultOpenCodeLaunch } = {}) {
     if (executable) {
@@ -71,6 +92,8 @@ export class OpenCodeBackend {
     this.attach = attach;
     this.timeoutMs = timeoutMs;
   }
+
+  capabilities({ mode } = {}) { return openCodeCapabilities(mode); }
 
   async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, scratchDir, onSpawn }) {
     // Both dispatcher-contract checks happen before any side effect.
