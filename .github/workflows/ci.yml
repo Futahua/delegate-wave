@@ -1,0 +1,23 @@
+# Turns the suite's local result into evidence anyone can reproduce.
+#
+# Deliberately minimal: one platform, one Node version, install and test. The suite is
+# self-contained -- no network, no API keys, fake backends throughout -- so a stock runner is
+# enough, and anything more elaborate would be machinery this branch has not yet needed.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # package.json requires >=24: the durable layer is built on node:sqlite's DatabaseSync.
+          node-version: '24'
+      - run: npm ci
+      - run: npm test
