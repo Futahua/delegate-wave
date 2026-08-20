@@ -256,6 +256,11 @@ Rules that matter:
 // usage never arrived consumed real quota, and recording zero would make the scarce side look free.
 export function observeManagerUsage(backend, result) {
   if (!result?.usage) return unknownManagerUsage(backend?.name ?? "unknown");
+  // A backend that already speaks the receipt shape is passed through. Only Codex's wire format
+  // needs translating, and running an OpenCode observation through the Codex reader would fail its
+  // required-field check and report a fully accounted turn as UNKNOWN -- absence manufactured out
+  // of a shape mismatch, which is exactly the error the status is supposed to prevent.
+  if (typeof result.usage.status === "string") return result.usage;
   return observeCodexUsage(result.usage, backend?.name ?? "unknown");
 }
 

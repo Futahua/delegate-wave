@@ -314,7 +314,7 @@ export function classifyPreProviderFailure({ result, stdoutPath, stderrPath }) {
   };
 }
 
-function defaultOpenCodeLaunch() {
+export function defaultOpenCodeLaunch() {
   if (process.platform !== "win32") return { executable: "opencode", prefixArgs: [] };
   const configuredEntry = process.env.OPENCODE_NODE_ENTRY;
   if (!configuredEntry && !process.env.APPDATA) {

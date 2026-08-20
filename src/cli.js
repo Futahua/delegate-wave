@@ -120,10 +120,11 @@ async function main() {
   if (positional[0] === "manage") {
     const jobId = positional[1];
     if (!jobId) throw new Error("usage: delegate-wave manage <jobId> [--model <id>] [--effort <level>]");
-    const [{ Dispatcher }, { ManagerService }, { CodexManagerBackend }, { dataRoot }] = await Promise.all([
-      import("./service.js"), import("./manager/service.js"),
-      import("./manager/backend.js"), import("./paths.js"),
-    ]);
+    const [{ Dispatcher }, { ManagerService }, { CodexManagerBackend }, { OpenCodeManagerBackend }, { dataRoot }] =
+      await Promise.all([
+        import("./service.js"), import("./manager/service.js"),
+        import("./manager/backend.js"), import("./manager/opencode-backend.js"), import("./paths.js"),
+      ]);
     const { BackendRouter } = await import("./harness/select.js");
     const { initializeDataRoot } = await import("./db.js");
     const root = dataRoot();
@@ -140,11 +141,16 @@ async function main() {
     // is what the cheap investigations are for, and pointing the most expensive
     // model at a codebase is the substitution this design exists to prevent.
     const workingDirectory = path.join(root, "tmp", "manager");
-    const manager = new CodexManagerBackend({
-      model: options.model ?? null,
-      effort: options.effort ?? "high",
-      workingDirectory,
-    });
+    // Routed from the model name, not a separate flag, so the supplier cannot disagree with the
+    // model actually requested. A provider-prefixed id is served through OpenCode; anything else is
+    // a Codex model. Both are text-only managers with no repository access; only the vendor differs.
+    const manager = String(options.model ?? "").includes("/")
+      ? new OpenCodeManagerBackend({ model: options.model, workingDirectory })
+      : new CodexManagerBackend({
+        model: options.model ?? null,
+        effort: options.effort ?? "high",
+        workingDirectory,
+      });
     const service = new ManagerService({ dispatcher, backend: manager, workerModel: options.workerModel ?? null });
     try {
       print(await service.advance(jobId));

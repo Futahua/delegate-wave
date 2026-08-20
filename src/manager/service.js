@@ -196,6 +196,15 @@ export class ManagerService {
 
     await this.recordRateLimits(turnId, "AFTER");
 
+    // A backend whose conversation identity only exists after the first message reports it here.
+    // Recorded before anything else uses the turn, so a crash cannot leave a live session that no
+    // row points at -- the next turn would silently start a second conversation and the manager
+    // would lose everything it had been told.
+    if (result.threadId && result.threadId !== run.thread_id) {
+      this.setRun(run.id, { thread_id: result.threadId });
+      run.thread_id = result.threadId;
+    }
+
     const usage = observeManagerUsage(this.backend, result);
     const responsePath = path.join(artifactDir, `turn-${ordinal}-response.txt`);
     fs.writeFileSync(responsePath, result.text ?? "");
