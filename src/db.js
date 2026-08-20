@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "27";
+export const SCHEMA_VERSION = "28";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -676,6 +676,35 @@ BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_runtime_provenance_immutable_delete
 BEFORE DELETE ON attempt_runtime_provenance
 BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
+
+-- A price derived over a receipt's tokens under a basis that did not exist when it was bought.
+--
+-- Separate from the receipt because the receipt is IMMUTABLE, and rightly so: it records what the
+-- provider said, and that observation is not revisable. A dollar figure is not part of that
+-- observation. It is a derivation over it, under a price list chosen later, and delegate-wave has
+-- already had to supersede one basis after discovering its rates were wrong -- so a price welded to
+-- an unrevisable row would have been unrepairable by construction.
+--
+-- Append-only, keyed by basis, so the same history can be priced under several bases and compared
+-- rather than overwritten. A receipt priced at observation time keeps that figure in its own row and
+-- needs nothing here.
+CREATE TABLE IF NOT EXISTS manager_receipt_pricings (
+  manager_turn_id TEXT NOT NULL REFERENCES manager_usage_receipts(manager_turn_id),
+  pricing_basis TEXT NOT NULL,
+  -- Empty rather than NULL: it is part of the key, and SQLite treats NULLs in a key as distinct,
+  -- which would let the same basis be recorded twice.
+  pricing_basis_version TEXT NOT NULL DEFAULT '',
+  reference_cost_usd REAL NOT NULL CHECK (reference_cost_usd >= 0),
+  derived_at TEXT NOT NULL,
+  PRIMARY KEY (manager_turn_id, pricing_basis, pricing_basis_version)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_manager_receipt_pricings_immutable_update
+BEFORE UPDATE ON manager_receipt_pricings
+BEGIN SELECT RAISE(ABORT, 'manager_receipt_pricings is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_manager_receipt_pricings_immutable_delete
+BEFORE DELETE ON manager_receipt_pricings
+BEGIN SELECT RAISE(ABORT, 'manager_receipt_pricings is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_update
 BEFORE UPDATE ON manager_usage_receipts

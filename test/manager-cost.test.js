@@ -18,7 +18,10 @@ import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { FakeManagerBackend } from "../src/manager/backend.js";
 import { ManagerService, summarize } from "../src/manager/service.js";
-import { PRICING_BASES, pricingBasisParts, isPriceable, referenceCostUsd } from "../src/pricing.js";
+import {
+  DEFAULT_PRICING_BASIS, MANAGER_PRICING_BASIS, PRICING_BASES,
+  pricingBasisParts, isPriceable, referenceCostUsd,
+} from "../src/pricing.js";
 import { runProcess } from "../src/process.js";
 
 test("a basis id splits into the family and the revision that produced a figure", () => {
@@ -147,7 +150,8 @@ function receiptsFor(dispatcher, runId) {
 }
 
 test("an unpriced manager run reports its tokens and refuses to state a cost", async (t) => {
-  const { dispatcher, service, job, report } = await managedRun(t, "opencode-go/gpt-5.6-luna");
+  // gpt-5.5, the earlier Codex route: no basis prices it, and none is invented for it.
+  const { dispatcher, service, job, report } = await managedRun(t, "gpt-5.5");
 
   assert.ok(report.strong.total_tokens > 0, "tokens are still measured");
   assert.equal(report.strong.reference_cost_usd, null, "and the cost is honestly unknown");
@@ -166,19 +170,18 @@ test("an unpriced manager run reports its tokens and refuses to state a cost", a
 });
 
 test("a priced manager run states a cost and the basis behind it", async (t) => {
-  // Priced only because this model happens to sit in a basis; the point is the mechanism.
-  const { dispatcher, service, job, report } = await managedRun(t, "opencode-go/deepseek-v4-pro");
+  const { dispatcher, service, job, report } = await managedRun(t, "opencode-go/gpt-5.6-luna");
 
   assert.ok(report.strong.reference_cost_usd > 0);
   assert.equal(report.strong.unpriced_turns, 0);
   assert.equal(report.strong.priced_turns, report.strong.turns);
-  assert.deepEqual(report.strong.pricing_bases, ["deepseek-direct-2026-08-14-v2"]);
+  assert.deepEqual(report.strong.pricing_bases, ["opencode-go-2026-08-20-v1"]);
 
   const receipts = receiptsFor(dispatcher, service.getRun(job.id).id);
   for (const receipt of receipts) {
     assert.ok(receipt.reference_cost_usd > 0);
-    assert.equal(receipt.pricing_basis, "deepseek-direct-2026-08-14");
-    assert.equal(receipt.pricing_basis_version, "v2");
+    assert.equal(receipt.pricing_basis, "opencode-go-2026-08-20");
+    assert.equal(receipt.pricing_basis_version, "v1");
   }
   // The run total is the sum of its turns, not an independently computed figure.
   const summed = receipts.reduce((acc, receipt) => acc + receipt.reference_cost_usd, 0);
@@ -238,4 +241,123 @@ test("the database refuses a cost with no basis, and a basis with no cost", (t) 
   // A turn the provider never accounted for cannot have a token-derived cost.
   assert.throws(insert(0.5, "some-basis", "v1", "UNKNOWN"), /CHECK/);
   assert.throws(insert(-1, "some-basis", "v1"), /CHECK/);
+});
+
+test("the OpenCode Go basis prices Luna at its published rates", () => {
+  // Exactly the arithmetic the published table implies, checked independently of the module's
+  // internal accumulation order.
+  const usage = {
+    input_tokens: 100_000, cache_read_tokens: 50_000, cache_write_tokens: 20_000,
+    output_tokens: 3_000, reasoning_tokens: 1_000, total_tokens: 174_000,
+  };
+  const priced = referenceCostUsd(usage, {
+    model: "opencode-go/gpt-5.6-luna", basisId: MANAGER_PRICING_BASIS,
+  });
+  const expected = (100_000 * 0.20 + 50_000 * 0.02 + 20_000 * 0.25 + 4_000 * 1.20) / 1e6;
+  assert.ok(Math.abs(priced.reference_cost_usd - expected) < 1e-12);
+  assert.equal(priced.pricing_basis_id, "opencode-go-2026-08-20-v1");
+});
+
+test("Luna is not smuggled into the DeepSeek basis", () => {
+  // The same model under a route's published rates and under a direct-API tariff are two different
+  // claims. Merging them would make the arithmetic right and the provenance false.
+  assert.equal(PRICING_BASES["deepseek-direct-2026-08-14-v2"].models["gpt-5.6-luna"], undefined);
+  assert.equal(isPriceable("opencode-go/gpt-5.6-luna", "deepseek-direct-2026-08-14-v2"), false);
+  // And the worker side keeps pricing where its ceiling was calibrated.
+  assert.notEqual(MANAGER_PRICING_BASIS, DEFAULT_PRICING_BASIS);
+  assert.equal(isPriceable("opencode-go/deepseek-v4-flash", DEFAULT_PRICING_BASIS), true);
+});
+
+test("an observation that could cross the published tier boundary prices as NULL", () => {
+  const under = {
+    input_tokens: 271_000, cache_read_tokens: 0, cache_write_tokens: 0,
+    output_tokens: 500, reasoning_tokens: 0, total_tokens: 271_500,
+  };
+  assert.ok(referenceCostUsd(under, { model: "gpt-5.6-luna", basisId: MANAGER_PRICING_BASIS })
+    .reference_cost_usd > 0, "unambiguously inside the band on any reading");
+
+  // OpenCode publishes a second tier above 272K but does not state which count the threshold is
+  // measured against, so above it the answer depends on an unestablished definition.
+  const over = { ...under, input_tokens: 300_000, total_tokens: 300_500 };
+  assert.equal(referenceCostUsd(over, { model: "gpt-5.6-luna", basisId: MANAGER_PRICING_BASIS })
+    .reference_cost_usd, null);
+
+  // Compared against the largest count the receipt supports: a small stated total cannot bring an
+  // observation back inside the band when its own parts exceed it.
+  const inconsistent = { ...under, input_tokens: 300_000, total_tokens: 1_000 };
+  assert.equal(referenceCostUsd(inconsistent, { model: "gpt-5.6-luna", basisId: MANAGER_PRICING_BASIS })
+    .reference_cost_usd, null);
+});
+
+test("repricing derives a cost for history no basis could price at the time", async (t) => {
+  // The real scenario, staged honestly: a manager route the MANAGER basis does not cover, priced
+  // later under a basis that does. Receipts are immutable, so this cannot be faked by editing them.
+  const { dispatcher, service, job } = await managedRun(t, "opencode-go/deepseek-v4-flash");
+  const runId = service.getRun(job.id).id;
+  const before = receiptsFor(dispatcher, runId);
+  assert.ok(before.length > 0);
+  assert.equal(before.every((r) => r.reference_cost_usd === null), true,
+    "the OpenCode Go basis does not price this model, so nothing was stated");
+
+  // Dry by default: seeing what would change is not the same decision as changing it.
+  const dry = service.repriceReceipts({ basisId: DEFAULT_PRICING_BASIS });
+  assert.equal(dry.applied, false);
+  assert.ok(dry.priced.length > 0);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM manager_receipt_pricings").get().c, 0,
+    "a dry run writes nothing");
+
+  const applied = service.repriceReceipts({ apply: true, basisId: DEFAULT_PRICING_BASIS });
+  assert.equal(applied.applied, true);
+
+  // The receipt itself is untouched -- it is an observation, not a place to put later arithmetic.
+  for (const receipt of receiptsFor(dispatcher, runId)) {
+    const raw = dispatcher.db.prepare(
+      "SELECT reference_cost_usd FROM manager_usage_receipts WHERE manager_turn_id = ?",
+    ).get(receipt.manager_turn_id);
+    assert.equal(raw.reference_cost_usd, null, "the receipt did not change");
+  }
+
+  const derived = dispatcher.db.prepare("SELECT * FROM manager_receipt_pricings").all();
+  assert.equal(derived.length, applied.priced.length);
+  for (const row of derived) {
+    assert.ok(row.reference_cost_usd > 0);
+    assert.equal(row.pricing_basis, "deepseek-direct-2026-08-14");
+    assert.equal(row.pricing_basis_version, "v2");
+  }
+
+  // And the run report now states a cost, carrying the basis that produced it.
+  const report = await service.report(job.id);
+  assert.ok(Math.abs(report.strong.reference_cost_usd - applied.totalCostUsd) < 1e-12);
+  assert.deepEqual(report.strong.pricing_bases, ["deepseek-direct-2026-08-14-v2"]);
+
+  // Idempotent: the same basis is not derived twice.
+  const again = service.repriceReceipts({ apply: true, basisId: DEFAULT_PRICING_BASIS });
+  assert.equal(again.priced.length, 0);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM manager_receipt_pricings").get().c,
+    derived.length);
+
+  const events = dispatcher.db.prepare(
+    "SELECT * FROM events WHERE kind = 'MANAGER_RECEIPTS_REPRICED' AND entity_id = ?",
+  ).all(job.id);
+  assert.equal(events.length, 1, "recorded once, when it actually changed something");
+  assert.match(JSON.parse(events[0].payload_json).note, /not provider-reported spend/);
+
+  // A derivation is evidence too: append-only, like the receipt it was derived from. Correcting a
+  // rate means adding a basis and deriving again, never editing the figure that is already there.
+  const target = derived[0].manager_turn_id;
+  assert.throws(() => dispatcher.db.prepare(
+    "UPDATE manager_receipt_pricings SET reference_cost_usd = 9 WHERE manager_turn_id = ?",
+  ).run(target), /immutable/);
+  assert.throws(() => dispatcher.db.prepare(
+    "DELETE FROM manager_receipt_pricings WHERE manager_turn_id = ?",
+  ).run(target), /immutable/);
+});
+
+test("repricing refuses a model no basis prices, and says which", async (t) => {
+  const { service } = await managedRun(t, "gpt-5.5");
+  const result = service.repriceReceipts();
+  assert.equal(result.priced.length, 0);
+  assert.ok(result.refused.length > 0);
+  assert.equal(result.refused[0].model, "gpt-5.5");
+  assert.equal(result.totalCostUsd, 0);
 });

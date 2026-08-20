@@ -26,7 +26,7 @@ import {
   MANAGER_LIMITS, instructionDigest, parseManagerDecision, renderBrief, renderExploration,
 } from "./contracts.js";
 import { buildPlanEvidence, buildReviewEvidence, renderEvidence } from "./evidence.js";
-import { pricingBasisParts, referenceCostUsd } from "../pricing.js";
+import { MANAGER_PRICING_BASIS, pricingBasisParts, referenceCostUsd } from "../pricing.js";
 import { observeManagerUsage } from "./backend.js";
 
 const now = () => new Date().toISOString();
@@ -322,7 +322,10 @@ export class ManagerService {
         // referenceCostUsd returns null for a model no basis prices, and that null is recorded
         // rather than smoothed to zero. Because the tokens are stored beside it, adding a basis
         // later prices these receipts retroactively without re-running anything.
-        const priced = referenceCostUsd(usage, { model: run.actual_model || run.requested_model });
+        const priced = referenceCostUsd(usage, {
+          model: run.actual_model || run.requested_model,
+          basisId: MANAGER_PRICING_BASIS,
+        });
         const { basis, version } = pricingBasisParts(priced.pricing_basis_id);
         this.db.prepare(`INSERT INTO manager_usage_receipts(
           manager_turn_id, status, input_tokens, output_tokens, reasoning_tokens,
@@ -900,6 +903,73 @@ export class ManagerService {
     return this.openExplorationRound(run, decision.explorations, decision.reason);
   }
 
+  // Prices receipts that were recorded before any basis could price them.
+  //
+  // Completing history rather than rewriting it. A receipt whose cost is already stated is never
+  // touched -- that figure names the basis that produced it and stays reproducible -- so this only
+  // fills NULLs, and only from tokens the provider reported at the time. The tokens are the evidence;
+  // the dollars are a derivation over them, which is exactly why storing the first made the second
+  // recoverable without re-running anything.
+  //
+  // Dry by default, like reconcile: seeing what would change is not the same decision as changing it.
+  repriceReceipts({ apply = false, basisId = MANAGER_PRICING_BASIS } = {}) {
+    const { basis, version } = pricingBasisParts(basisId);
+    const rows = this.db.prepare(`SELECT r.*, t.manager_run_id, t.phase,
+        m.job_id, m.actual_model, m.requested_model
+      FROM manager_usage_receipts r
+      JOIN manager_turns t ON t.id = r.manager_turn_id
+      JOIN manager_runs m ON m.id = t.manager_run_id
+      WHERE r.reference_cost_usd IS NULL AND r.status != 'UNKNOWN'
+        AND NOT EXISTS (SELECT 1 FROM manager_receipt_pricings p
+          WHERE p.manager_turn_id = r.manager_turn_id
+            AND p.pricing_basis = ? AND p.pricing_basis_version = ?)`)
+      .all(basis, version ?? "");
+
+    const priced = [];
+    const refused = [];
+    for (const row of rows) {
+      const model = row.actual_model || row.requested_model;
+      const result = referenceCostUsd(row, { model, basisId });
+      if (result.reference_cost_usd === null) {
+        refused.push({ turnId: row.manager_turn_id, jobId: row.job_id, model, totalTokens: row.total_tokens });
+        continue;
+      }
+      priced.push({
+        turnId: row.manager_turn_id, jobId: row.job_id, runId: row.manager_run_id, phase: row.phase,
+        model, totalTokens: row.total_tokens, cost: result.reference_cost_usd, basisId: result.pricing_basis_id,
+      });
+    }
+
+    if (apply && priced.length) {
+      transaction(this.db, () => {
+        const insert = this.db.prepare(`INSERT INTO manager_receipt_pricings(
+          manager_turn_id, pricing_basis, pricing_basis_version, reference_cost_usd, derived_at
+        ) VALUES (?, ?, ?, ?, ?)`);
+        for (const entry of priced) insert.run(entry.turnId, basis, version ?? "", entry.cost, now());
+        for (const jobId of [...new Set(priced.map((entry) => entry.jobId))]) {
+          const forJob = priced.filter((entry) => entry.jobId === jobId);
+          recordEvent(this.db, {
+            kind: "MANAGER_RECEIPTS_REPRICED", entityType: "job", entityId: jobId,
+            payload: {
+              basisId, turns: forJob.length,
+              referenceCostUsd: forJob.reduce((acc, entry) => acc + entry.cost, 0),
+              note: "reference cost derived from stored token counts under a basis added after the "
+                + "turns were bought; not provider-reported spend",
+            },
+          });
+        }
+      });
+    }
+
+    return {
+      applied: apply,
+      basisId,
+      priced,
+      refused,
+      totalCostUsd: priced.reduce((acc, entry) => acc + entry.cost, 0),
+    };
+  }
+
   // What a reboot makes of an interrupted run.
   //
   // A turn left INTENDED means the process died between recording the intent and recording the
@@ -939,9 +1009,30 @@ export class ManagerService {
     const run = this.getRun(jobId);
     if (!run) return null;
     const turns = this.turns(run.id);
-    const receipts = turns.map((turn) => this.db.prepare(
-      "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
-    ).get(turn.id)).filter(Boolean);
+    // A receipt's own figure first; otherwise the most recent derivation over its tokens.
+    //
+    // Priced-at-observation and priced-later are both legitimate answers to "what did this cost",
+    // and the receipt's own is preferred because it was computed against the model actually serving
+    // that turn. Neither is provider-reported spend, and the basis travels with the number either
+    // way so a reader can tell which is which.
+    const receipts = turns.map((turn) => {
+      const receipt = this.db.prepare(
+        "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
+      ).get(turn.id);
+      if (!receipt || receipt.reference_cost_usd !== null) return receipt;
+      const derived = this.db.prepare(
+        `SELECT * FROM manager_receipt_pricings WHERE manager_turn_id = ?
+         ORDER BY derived_at DESC LIMIT 1`,
+      ).get(turn.id);
+      return derived
+        ? {
+          ...receipt,
+          reference_cost_usd: derived.reference_cost_usd,
+          pricing_basis: derived.pricing_basis,
+          pricing_basis_version: derived.pricing_basis_version || null,
+        }
+        : receipt;
+    }).filter(Boolean);
     const family = this.dispatcher.familySpend(jobId);
     return {
       job_id: jobId,
