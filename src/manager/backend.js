@@ -86,6 +86,13 @@ export class CodexManagerBackend extends ManagerBackend {
     effort = "high",
     workingDirectory,
     turnTimeoutMs = undefined,
+    // An OpenAI-compatible route to serve the turns instead of the Codex plan.
+    //
+    // Codex already knows how to talk to one: model_providers is its own configuration surface, so a
+    // second supplier needs configuration rather than a second manager. Passed as per-invocation
+    // -c overrides and never written to ~/.codex/config.toml, because that file governs every Codex
+    // session the operator runs and delegate-wave has no business editing it.
+    provider = null,
   } = {}) {
     super();
     if (!workingDirectory) {
@@ -96,6 +103,7 @@ export class CodexManagerBackend extends ManagerBackend {
     this.effort = effort;
     this.workingDirectory = workingDirectory;
     this.turnTimeoutMs = turnTimeoutMs;
+    this.provider = provider;
     this.server = null;
   }
 
@@ -107,6 +115,7 @@ export class CodexManagerBackend extends ManagerBackend {
       this.server = new CodexAppServer({
         executable: this.executable,
         cwd: this.workingDirectory,
+        ...(this.provider ? providerLaunch(this.provider) : {}),
         ...(this.turnTimeoutMs ? { turnTimeoutMs: this.turnTimeoutMs } : {}),
       });
       await this.server.start();
@@ -166,6 +175,30 @@ export class CodexManagerBackend extends ManagerBackend {
     if (this.server) await this.server.close();
     this.server = null;
   }
+}
+
+// Turns one provider description into the app-server arguments and environment that select it.
+//
+// Everything is per-invocation. Writing a provider into ~/.codex/config.toml would change every
+// Codex session the operator runs, to serve one job of delegate-wave's -- and the key would then
+// have to live somewhere permanent too.
+export function providerLaunch({ id, name, baseUrl, envKey, wireApi = "chat", apiKey = null }) {
+  if (!id || !baseUrl || !envKey) {
+    throw new Error("a manager provider needs at least id, baseUrl and envKey");
+  }
+  const config = [
+    ["model_provider", id],
+    [`model_providers.${id}.name`, name ?? id],
+    [`model_providers.${id}.base_url`, baseUrl],
+    [`model_providers.${id}.env_key`, envKey],
+    [`model_providers.${id}.wire_api`, wireApi],
+  ];
+  return {
+    args: ["app-server", ...config.flatMap(([key, value]) => ["-c", `${key}=${JSON.stringify(value)}`])],
+    // Granted deliberately for this one child, which is the distinction the environment scrubber
+    // exists to make: a model-provider key carries no authority over delegate-wave itself.
+    env: apiKey ? { [envKey]: apiKey } : {},
+  };
 }
 
 // Standing instructions for the manager conversation. Deliberately about ROLE and OUTPUT SHAPE only;
