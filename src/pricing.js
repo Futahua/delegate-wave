@@ -55,6 +55,27 @@ export const PRICING_BASES = Object.freeze({
 
 export const DEFAULT_PRICING_BASIS = "deepseek-direct-2026-08-14-v2";
 
+// The basis id, split into the two facts a receipt records separately.
+//
+// A receipt keeps the family ("which price list") apart from the revision ("which reading of it"),
+// because those answer different questions later: comparing two runs needs the family to match,
+// while auditing a figure needs the exact revision that produced it. The id remains the single
+// source -- these are derived from it, never stored independently and allowed to drift.
+export function pricingBasisParts(basisId) {
+  if (typeof basisId !== "string" || !basisId) return { basis: null, version: null };
+  const match = /^(.*)-(v\d+)$/.exec(basisId);
+  return match ? { basis: match[1], version: match[2] } : { basis: basisId, version: null };
+}
+
+// Whether any known basis can price this model at all.
+//
+// Asked before a turn is bought rather than after, so "we cannot price the scarce side" is a fact
+// the operator can see in advance instead of discovering across a column of NULLs.
+export function isPriceable(model, basisId = DEFAULT_PRICING_BASIS) {
+  const basis = PRICING_BASES[basisId];
+  return Boolean(basis && basis.models[pricedModelName(model)]);
+}
+
 // Strips any provider/route prefix: routing identity belongs to the dispatcher, but pricing is a
 // property of the underlying model. `opencode-go/deepseek-v4-flash` and
 // `deepseek-official/deepseek-v4-flash` price identically under one basis.

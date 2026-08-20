@@ -26,6 +26,7 @@ import {
   MANAGER_LIMITS, instructionDigest, parseManagerDecision, renderBrief, renderExploration,
 } from "./contracts.js";
 import { buildPlanEvidence, buildReviewEvidence, renderEvidence } from "./evidence.js";
+import { pricingBasisParts, referenceCostUsd } from "../pricing.js";
 import { observeManagerUsage } from "./backend.js";
 
 const now = () => new Date().toISOString();
@@ -310,12 +311,27 @@ export class ManagerService {
       }
 
       if (usage) {
+        // Priced against the model that ACTUALLY answered, falling back to the one requested.
+        //
+        // The distinction is the same one the run row keeps: a provider that silently served a
+        // different model billed for that one, and pricing the request instead would produce a
+        // confident figure for work that never happened. Where the provider stated nothing,
+        // requested is the only evidence there is, and is used as such rather than treated as
+        // proof.
+        //
+        // referenceCostUsd returns null for a model no basis prices, and that null is recorded
+        // rather than smoothed to zero. Because the tokens are stored beside it, adding a basis
+        // later prices these receipts retroactively without re-running anything.
+        const priced = referenceCostUsd(usage, { model: run.actual_model || run.requested_model });
+        const { basis, version } = pricingBasisParts(priced.pricing_basis_id);
         this.db.prepare(`INSERT INTO manager_usage_receipts(
           manager_turn_id, status, input_tokens, output_tokens, reasoning_tokens,
-          cache_read_tokens, cache_write_tokens, total_tokens, source, observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          cache_read_tokens, cache_write_tokens, total_tokens, source, observed_at,
+          reference_cost_usd, pricing_basis, pricing_basis_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           turnId, usage.status, usage.input_tokens, usage.output_tokens, usage.reasoning_tokens,
           usage.cache_read_tokens, usage.cache_write_tokens, usage.total_tokens, usage.source, now(),
+          priced.reference_cost_usd, basis, version,
         );
       }
       recordEvent(this.db, {
@@ -949,12 +965,23 @@ export class ManagerService {
   }
 }
 
-function summarize(receipts) {
+// Exported so the coverage rule below can be tested on its own. Whether a partial total is
+// withheld is a claim about honesty of reporting, and it should not require staging a whole managed
+// run against two different providers to check.
+export function summarize(receipts) {
   const totals = {
     total_tokens: 0, total_complete: true,
     input_tokens: 0, output_tokens: 0, reasoning_tokens: 0,
     components_complete: true, ambiguous_turns: 0, unmeasured_turns: 0,
+    // Money, kept honest about its own coverage.
+    //
+    // reference_cost_usd stays null unless EVERY receipt priced. A partial total is the failure
+    // mode this whole ledger exists to avoid: it reads as the cost of the run while being the cost
+    // of an unstated subset, and the reader has no way to see the difference. The per-turn figures
+    // remain individually inspectable either way.
+    reference_cost_usd: null, priced_turns: 0, unpriced_turns: 0, pricing_bases: [],
   };
+  let priceable = 0;
   for (const receipt of receipts) {
     if (receipt.total_tokens === null) totals.total_complete = false;
     else totals.total_tokens += receipt.total_tokens;
@@ -964,6 +991,17 @@ function summarize(receipts) {
     totals.output_tokens += receipt.output_tokens ?? 0;
     totals.reasoning_tokens += receipt.reasoning_tokens ?? 0;
   }
+  for (const receipt of receipts) {
+    if (receipt.reference_cost_usd === null || receipt.reference_cost_usd === undefined) {
+      totals.unpriced_turns += 1;
+      continue;
+    }
+    totals.priced_turns += 1;
+    priceable += receipt.reference_cost_usd;
+    const named = [receipt.pricing_basis, receipt.pricing_basis_version].filter(Boolean).join("-");
+    if (named && !totals.pricing_bases.includes(named)) totals.pricing_bases.push(named);
+  }
+  if (receipts.length && totals.unpriced_turns === 0) totals.reference_cost_usd = priceable;
   return totals;
 }
 

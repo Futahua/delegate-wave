@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "26";
+export const SCHEMA_VERSION = "27";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -116,6 +116,56 @@ const VALIDATION_RUNS_COLUMNS = `
 // rejected and a candidate may still be repairable. Sending that to PLANNING would relabel it as
 // initial planning in the turn ledger, and -- worse -- PLAN cannot act on a candidate, so the
 // surviving work would vanish from the manager's decision surface while staying in the database.
+const MANAGER_USAGE_RECEIPTS_COLUMNS = `
+  manager_turn_id TEXT PRIMARY KEY REFERENCES manager_turns(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  -- The provider's own reported total, kept separately from the component split.
+  --
+  -- These are two different measurements with two different reliabilities, and collapsing them
+  -- loses the good one. Whether cachedInputTokens nests inside inputTokens is genuinely ambiguous;
+  -- the total is not ambiguous at all. Since the primary metric is strong tokens per finished task,
+  -- an unresolvable decomposition must not be allowed to destroy a figure the provider stated
+  -- exactly.
+  total_tokens INTEGER,
+  source TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  -- What the scarce side actually cost, in money rather than in tokens.
+  --
+  -- Three columns because there are three separable facts, and collapsing them loses the ability to
+  -- audit any of them. NULL is the honest value throughout: a turn whose model no basis prices has
+  -- UNKNOWN cost, not zero cost, and zero is the one answer that would quietly understate the whole
+  -- point of measuring the expensive component.
+  --
+  -- reference_cost_usd is tokens x a named price, never the provider's bill. The App Server reports
+  -- token counts and no dollars at all, so no observed figure exists on this route today; if one
+  -- ever does it belongs in its own column beside this, not merged into it.
+  reference_cost_usd REAL,
+  -- Which price list, and which reading of it. Split so that comparing two runs can require the
+  -- family to match while auditing one figure can name the exact revision that produced it.
+  pricing_basis TEXT,
+  pricing_basis_version TEXT,
+  -- An UNKNOWN receipt carries no numbers at all, including no total. A manager whose provider
+  -- reported nothing has unknown cost, not zero cost, and the difference is the entire point of
+  -- measuring the scarce side.
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL AND total_tokens IS NULL
+  )),
+  CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0)),
+CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
+  -- A cost without a stated basis is not reproducible, and a basis without a cost is not evidence
+  -- of anything. Either both are present or neither is.
+  CHECK ((reference_cost_usd IS NULL) = (pricing_basis IS NULL)),
+  -- A version cannot exist without the basis it versions.
+  CHECK (pricing_basis IS NOT NULL OR pricing_basis_version IS NULL),
+  -- An unmeasured turn has no tokens, so it can have no token-derived cost either.
+  CHECK (status != 'UNKNOWN' OR reference_cost_usd IS NULL)`;
+
 const MANAGER_RUNS_COLUMNS = `
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
@@ -577,33 +627,7 @@ CREATE TABLE IF NOT EXISTS manager_turns (
 -- so two executors can be compared. A subscription-plan manager has no marginal token price, and
 -- inventing one would be the same fabrication the executor receipts refuse to make. Tokens and turns
 -- are what can honestly be reported, so tokens and turns are what is stored.
-CREATE TABLE IF NOT EXISTS manager_usage_receipts (
-  manager_turn_id TEXT PRIMARY KEY REFERENCES manager_turns(id),
-  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
-  input_tokens INTEGER,
-  output_tokens INTEGER,
-  reasoning_tokens INTEGER,
-  cache_read_tokens INTEGER,
-  cache_write_tokens INTEGER,
-  -- The provider's own reported total, kept separately from the component split.
-  --
-  -- These are two different measurements with two different reliabilities, and collapsing them
-  -- loses the good one. Whether cachedInputTokens nests inside inputTokens is genuinely ambiguous;
-  -- the total is not ambiguous at all. Since the primary metric is strong tokens per finished task,
-  -- an unresolvable decomposition must not be allowed to destroy a figure the provider stated
-  -- exactly.
-  total_tokens INTEGER,
-  source TEXT NOT NULL,
-  observed_at TEXT NOT NULL,
-  -- An UNKNOWN receipt carries no numbers at all, including no total. A manager whose provider
-  -- reported nothing has unknown cost, not zero cost, and the difference is the entire point of
-  -- measuring the scarce side.
-  CHECK (status != 'UNKNOWN' OR (
-    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
-    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL AND total_tokens IS NULL
-  )),
-  CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0))
-);
+CREATE TABLE IF NOT EXISTS manager_usage_receipts (${MANAGER_USAGE_RECEIPTS_COLUMNS});
 
 -- What delegate-wave asked for, what the executor can prove it launched, and what the runtime
 -- independently reported. Three levels, deliberately not two.
@@ -1036,6 +1060,19 @@ function rebuildConstrainedTables(db) {
              revision_round, max_exploration_rounds, max_revision_rounds, max_turns,
              active_child_job_id, last_candidate_attempt_id, accepted_attempt_id,
              escalation_question, created_at, updated_at`,
+      after: [],
+    });
+  }
+  if (definition("manager_usage_receipts")
+      && !definition("manager_usage_receipts").includes("reference_cost_usd")) {
+    pending.push({
+      name: "manager_usage_receipts",
+      columns: MANAGER_USAGE_RECEIPTS_COLUMNS,
+      // Historical receipts keep their tokens and gain NULL cost, which is the truthful value: they
+      // were observed before any basis priced this model. Because the tokens survive, adding a basis
+      // later can price them retroactively without re-running anything.
+      copy: `manager_turn_id, status, input_tokens, output_tokens, reasoning_tokens,
+             cache_read_tokens, cache_write_tokens, total_tokens, source, observed_at`,
       after: [],
     });
   }
