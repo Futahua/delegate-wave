@@ -203,3 +203,76 @@ test("a pack with no prior candidate says nothing about one", () => {
   assert.doesNotMatch(rendered, /Prior candidate/);
   assert.doesNotMatch(rendered, /revision base/);
 });
+
+test("a rethink with no questions re-synthesizes and can still repair the candidate", async (t) => {
+  // The hole left by the first version of this change. RETHINK with no explorations preserved the
+  // candidate in SQLite and sent the run to PLANNING -- where the pack cannot mention a candidate
+  // and PLAN has no REVISE. The work survived the database and vanished from the decision surface.
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+    // No questions: the manager wants to re-decide on what it already knows.
+    { action: "RETHINK", reason: "I misread the acceptance criteria, no new facts needed", explorations: [] },
+    { action: "REVISE", reason: "repairable once the criteria are read correctly", brief: BRIEF({ diagnosis: "corrected" }) },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  await service.advance(job.id);
+
+  const run = service.getRun(job.id);
+  const turns = service.turns(run.id);
+  assert.deepEqual(
+    turns.map((turn) => `${turn.phase}/${turn.action}`),
+    ["PLAN/IMPLEMENT", "REVIEW/RETHINK", "SYNTHESIS/REVISE", "REVIEW/ACCEPT"],
+    "the re-decision is a SYNTHESIS turn, not a second PLAN",
+  );
+  assert.equal(run.exploration_round, 0, "no exploration round was consumed for asking nothing");
+  assert.equal(run.revision_round, 1);
+
+  // The candidate was on the decision surface, not merely in the database.
+  const synthesis = turns.find((turn) => turn.phase === "SYNTHESIS");
+  const prompt = fs.readFileSync(synthesis.prompt_artifact, "utf8");
+  assert.match(prompt, /Prior candidate \(still available as a revision base\)/);
+  assert.match(prompt, /I misread the acceptance criteria/);
+
+  const attempts = dispatcher.db.prepare(
+    "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal",
+  ).all(job.id);
+  assert.equal(attempts[1].start_sha, attempts[0].result_commit,
+    "and the repair started from the candidate it preserved");
+});
+
+test("a question-less rethink with no candidate still plans", async (t) => {
+  // The other half: with nothing to repair, a rethink genuinely is a fresh plan, and routing it to
+  // synthesis would ask the manager to re-decide about a candidate that does not exist.
+  const { service, job } = await fixture(t, [
+    { action: "RETHINK", reason: "start over before building anything", explorations: [] },
+    { action: "IMPLEMENT", reason: "now I know", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  await service.advance(job.id);
+
+  const turns = service.turns(service.getRun(job.id).id);
+  assert.deepEqual(
+    turns.map((turn) => turn.phase),
+    ["PLAN", "PLAN", "REVIEW"],
+    "with no candidate, re-deciding is planning",
+  );
+});
+
+test("the re-synthesis survives losing its thread", async (t) => {
+  // The whole point of carrying candidate state in the pack: a fresh thread given the same pack
+  // reaches the same decision. Simulated by clearing the conversation between the rethink and the
+  // turn that acts on it.
+  const { dispatcher, service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+    { action: "RETHINK", reason: "wrong criteria", explorations: [] },
+    { action: "REVISE", reason: "repair it", brief: BRIEF({ diagnosis: "corrected" }) },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  await service.advance(job.id);
+
+  const run = service.getRun(job.id);
+  const before = service.priorCandidate(run);
+  dispatcher.db.prepare("UPDATE manager_runs SET thread_id = NULL WHERE id = ?").run(run.id);
+  assert.deepEqual(service.priorCandidate(service.getRun(job.id)), before,
+    "no thread at all, same decision state");
+});

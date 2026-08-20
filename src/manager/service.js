@@ -367,6 +367,10 @@ export class ManagerService {
           break;
         }
         if (run.status === "PLANNING") await this.plan(run);
+        // No round of its own: nothing was investigated, so it re-decides on what is already known.
+        else if (run.status === "SYNTHESIZING") {
+          await this.synthesize(run, run.exploration_round, this.roundPlanOrEmpty(run, run.exploration_round));
+        }
         else if (run.status === "EXPLORING") await this.explore(run);
         else if (run.status === "IMPLEMENTING") await this.implement(run);
         else if (run.status === "REVIEWING") await this.review(run);
@@ -440,7 +444,15 @@ export class ManagerService {
         // The candidate is NOT erased here. A rethink invalidates the diagnosis, not the work: the
         // manager may decide, once it knows more, that the existing candidate is repairable after
         // all. Only IMPLEMENT abandons it, and that is an explicit decision to start over.
-        this.setRun(run.id, { status: "PLANNING" });
+        //
+        // With a candidate in hand this is a RE-synthesis, not a fresh plan. Sending it to PLANNING
+        // would mislabel the turn and, worse, hand it a pack that cannot mention the candidate --
+        // PLAN has no REVISE -- so work that survived in the database would vanish from the
+        // manager's decision surface. Preserving the candidate is only half the fix; it also has to
+        // remain decidable.
+        this.setRun(run.id, {
+          status: run.last_candidate_attempt_id ? "SYNTHESIZING" : "PLANNING",
+        });
         recordEvent(this.db, {
           kind: "MANAGER_REPLAN", entityType: "job", entityId: run.job_id,
           payload: { runId: run.id, reason },
@@ -474,6 +486,15 @@ export class ManagerService {
     const target = this.roundPlanPath(run, round);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, JSON.stringify(explorations, null, 2));
+  }
+
+  // The plan for a round that may not have one.
+  //
+  // A re-synthesis after a question-less rethink has no round of its own, and reading a missing plan
+  // must not be an error there. readRoundPlan stays strict, because a round that WAS opened and lost
+  // its plan is a real fault.
+  roundPlanOrEmpty(run, round) {
+    return fs.existsSync(this.roundPlanPath(run, round)) ? this.readRoundPlan(run, round) : [];
   }
 
   readRoundPlan(run, round) {

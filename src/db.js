@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "25";
+export const SCHEMA_VERSION = "26";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -109,6 +109,49 @@ const VALIDATION_RUNS_COLUMNS = `
   CHECK (outcome = 'CHECK_DID_NOT_RUN' OR (exit_code IS NOT NULL AND did_not_run_reason IS NULL)),
   CHECK (outcome != 'PASSED' OR exit_code = 0)
 `;
+
+// SYNTHESIZING is a re-synthesis, not a fresh plan.
+//
+// A rethink that carries no questions still has something to decide: the previous diagnosis was
+// rejected and a candidate may still be repairable. Sending that to PLANNING would relabel it as
+// initial planning in the turn ledger, and -- worse -- PLAN cannot act on a candidate, so the
+// surviving work would vanish from the manager's decision surface while staying in the database.
+const MANAGER_RUNS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  status TEXT NOT NULL CHECK (status IN (
+    'PLANNING', 'SYNTHESIZING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING',
+    'ACCEPTED', 'AWAITING_HUMAN', 'FAILED', 'CANCELLED'
+  )),
+  -- What was asked for, and what the provider says actually ran. Two facts, because they can differ
+  -- and only one of them is evidence. actual_model stays NULL when the provider reports nothing:
+  -- backfilling it from the request would record a preference as an observation, and a manufactured
+  -- provenance is worse than a missing one because only the missing one is detectable later.
+  requested_model TEXT,
+  actual_model TEXT,
+  -- The manager's conversation identity with its provider. One managed job is one thread, so the
+  -- manager's own context is the provider's problem rather than something reassembled per turn.
+  thread_id TEXT,
+  exploration_round INTEGER NOT NULL DEFAULT 0,
+  revision_round INTEGER NOT NULL DEFAULT 0,
+  max_exploration_rounds INTEGER NOT NULL,
+  max_revision_rounds INTEGER NOT NULL,
+  max_turns INTEGER NOT NULL,
+  -- The child job currently carrying this run forward, if any.
+  active_child_job_id TEXT REFERENCES jobs(id),
+  last_candidate_attempt_id TEXT REFERENCES attempts(id),
+  -- Set when the manager escalated: the question a person actually has to answer.
+  -- The one attempt a completed ACCEPT review bound itself to.
+  --
+  -- Written in the same transaction as the ACCEPT transition, and cross-checked against the review
+  -- turn's subject_attempt_id. proposeIntegration() reads this instead of choosing among candidates:
+  -- after a revision there are two PASSED attempts and 'the passed one' stops being a description of
+  -- anything. Null until a review accepts, which is also what makes 'no worker runs after ACCEPT'
+  -- checkable.
+  accepted_attempt_id TEXT REFERENCES attempts(id),
+  escalation_question TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL`;
 
 const JOBS_COLUMNS = `
   id TEXT PRIMARY KEY,
@@ -487,43 +530,7 @@ BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
 -- The round counters are the bounded-authority invariant. Token accounting depends on what a
 -- provider chooses to report; a turn ceiling does not, so the scarce resource stays bounded even
 -- when its usage is UNKNOWN.
-CREATE TABLE IF NOT EXISTS manager_runs (
-  id TEXT PRIMARY KEY,
-  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
-  status TEXT NOT NULL CHECK (status IN (
-    'PLANNING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING',
-    'ACCEPTED', 'AWAITING_HUMAN', 'FAILED', 'CANCELLED'
-  )),
-  -- What was asked for, and what the provider says actually ran. Two facts, because they can differ
-  -- and only one of them is evidence. actual_model stays NULL when the provider reports nothing:
-  -- backfilling it from the request would record a preference as an observation, and a manufactured
-  -- provenance is worse than a missing one because only the missing one is detectable later.
-  requested_model TEXT,
-  actual_model TEXT,
-  -- The manager's conversation identity with its provider. One managed job is one thread, so the
-  -- manager's own context is the provider's problem rather than something reassembled per turn.
-  thread_id TEXT,
-  exploration_round INTEGER NOT NULL DEFAULT 0,
-  revision_round INTEGER NOT NULL DEFAULT 0,
-  max_exploration_rounds INTEGER NOT NULL,
-  max_revision_rounds INTEGER NOT NULL,
-  max_turns INTEGER NOT NULL,
-  -- The child job currently carrying this run forward, if any.
-  active_child_job_id TEXT REFERENCES jobs(id),
-  last_candidate_attempt_id TEXT REFERENCES attempts(id),
-  -- Set when the manager escalated: the question a person actually has to answer.
-  -- The one attempt a completed ACCEPT review bound itself to.
-  --
-  -- Written in the same transaction as the ACCEPT transition, and cross-checked against the review
-  -- turn's subject_attempt_id. proposeIntegration() reads this instead of choosing among candidates:
-  -- after a revision there are two PASSED attempts and 'the passed one' stops being a description of
-  -- anything. Null until a review accepts, which is also what makes 'no worker runs after ACCEPT'
-  -- checkable.
-  accepted_attempt_id TEXT REFERENCES attempts(id),
-  escalation_question TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS manager_runs (${MANAGER_RUNS_COLUMNS});
 
 -- One row per scarce-model call, recorded BEFORE the call is made.
 --
@@ -1018,6 +1025,17 @@ function rebuildConstrainedTables(db) {
                       CASE WHEN exit_code = 0 THEN 'PASSED' ELSE 'CHECK_FAILED' END,
                       NULL, output_path, started_at, finished_at
                FROM validation_runs`,
+      after: [],
+    });
+  }
+  if (definition("manager_runs") && !definition("manager_runs").includes("SYNTHESIZING")) {
+    pending.push({
+      name: "manager_runs",
+      columns: MANAGER_RUNS_COLUMNS,
+      copy: `id, job_id, status, requested_model, actual_model, thread_id, exploration_round,
+             revision_round, max_exploration_rounds, max_revision_rounds, max_turns,
+             active_child_job_id, last_candidate_attempt_id, accepted_attempt_id,
+             escalation_question, created_at, updated_at`,
       after: [],
     });
   }
