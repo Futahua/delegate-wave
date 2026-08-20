@@ -431,3 +431,50 @@ test("budget admission still uses the basis its ceiling was calibrated against",
   dispatcher.familyReferenceSpend(job.id, "deepseek-direct-2026-08-14-v1");
   assert.equal(dispatcher.familySpend(job.id).spent, authoritative.spent);
 });
+
+test("a manager receipt priced under one basis is not reported under another", async (t) => {
+  // The mirror of the worker-side seam, and the one that survived it. A receipt priced when the turn
+  // was bought was treated as authoritative for every basis, so asking for a report in basis B kept
+  // the manager half in basis A while the worker half honoured B -- a two-basis total with nothing
+  // in it to reveal the mixture.
+  //
+  // DeepSeek Flash falsifies this properly: Go, direct-v1 and direct-v2 can all price it, and v1 was
+  // superseded for wrong rates, so its figure genuinely differs.
+  const { dispatcher, service, job } = await managedRun(t, "opencode-go/deepseek-v4-flash");
+  const V1 = "deepseek-direct-2026-08-14-v1";
+
+  const go = await service.report(job.id, { basisId: MANAGER_PRICING_BASIS });
+  assert.ok(go.strong.reference_cost_usd > 0, "stamped under the Go basis when observed");
+  assert.deepEqual(go.strong.pricing_bases, [MANAGER_PRICING_BASIS]);
+
+  // Before any derivation exists, the report must decline rather than reuse the Go figure.
+  const beforeV1 = await service.report(job.id, { basisId: V1 });
+  assert.equal(beforeV1.strong.reference_cost_usd, null,
+    "no figure exists in this basis yet, and the one that does is in the wrong currency");
+  assert.equal(beforeV1.strong.unpriced_turns, beforeV1.strong.turns);
+
+  // Repricing must be ABLE to derive v1 even though the receipt already carries a Go price.
+  const derived = service.repriceReceipts({ apply: true, basisId: V1 });
+  assert.ok(derived.priced.length > 0, "an already-priced receipt can still gain another basis");
+
+  const afterV1 = await service.report(job.id, { basisId: V1 });
+  assert.ok(afterV1.strong.reference_cost_usd > 0);
+  assert.deepEqual(afterV1.strong.pricing_bases, [V1]);
+  assert.notEqual(afterV1.strong.reference_cost_usd, go.strong.reference_cost_usd,
+    "v1's rates differ from Go's, so an identical figure would mean the Go one was reused");
+
+  // And asking for Go again still gets the original observation-time figure, unchanged.
+  const goAgain = await service.report(job.id, { basisId: MANAGER_PRICING_BASIS });
+  assert.equal(goAgain.strong.reference_cost_usd, go.strong.reference_cost_usd);
+  assert.deepEqual(goAgain.strong.pricing_bases, [MANAGER_PRICING_BASIS]);
+
+  // Both halves of each report agree on their denomination.
+  assert.equal(afterV1.cheap.pricing_basis, V1);
+  assert.equal(goAgain.cheap.pricing_basis, MANAGER_PRICING_BASIS);
+
+  // Redundant derivation is still refused: the receipt's own basis needs nothing added.
+  const redundant = service.repriceReceipts({ apply: true, basisId: MANAGER_PRICING_BASIS });
+  assert.equal(redundant.priced.length, 0);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM manager_receipt_pricings").get().c,
+    derived.priced.length, "only the v1 derivations were ever written");
+});

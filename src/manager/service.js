@@ -919,11 +919,17 @@ export class ManagerService {
       FROM manager_usage_receipts r
       JOIN manager_turns t ON t.id = r.manager_turn_id
       JOIN manager_runs m ON m.id = t.manager_run_id
-      WHERE r.reference_cost_usd IS NULL AND r.status != 'UNKNOWN'
+      WHERE r.status != 'UNKNOWN'
+        -- Not "has no price yet": a receipt priced at observation under one basis still needs a
+        -- derivation to be reportable under another, and refusing it here is what left the manager
+        -- half permanently stuck in whichever basis happened to be in force when it was bought.
+        -- Only a receipt whose OWN basis is already the one asked for needs nothing added.
+        AND NOT (r.reference_cost_usd IS NOT NULL
+          AND r.pricing_basis = ? AND IFNULL(r.pricing_basis_version, '') = ?)
         AND NOT EXISTS (SELECT 1 FROM manager_receipt_pricings p
           WHERE p.manager_turn_id = r.manager_turn_id
             AND p.pricing_basis = ? AND p.pricing_basis_version = ?)`)
-      .all(basis, version ?? "");
+      .all(basis, version ?? "", basis, version ?? "");
 
     const priced = [];
     const refused = [];
@@ -1023,7 +1029,21 @@ export class ManagerService {
       const receipt = this.db.prepare(
         "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
       ).get(turn.id);
-      if (!receipt || receipt.reference_cost_usd !== null) return receipt;
+      if (!receipt) return receipt;
+      // A receipt's own figure counts only if it is in the basis being ASKED for.
+      //
+      // Priced-at-observation is not a privileged answer, merely an early one. Accepting it whatever
+      // basis it names would keep the manager half in the basis that happened to be in force when
+      // the turn was bought, while the worker half honoured the requested one -- the exact
+      // mixed-basis defect just removed from the cheap side, recreated on the scarce side.
+      if (receipt.reference_cost_usd !== null
+        && receipt.pricing_basis === wanted.basis
+        && (receipt.pricing_basis_version ?? "") === (wanted.version ?? "")) {
+        return receipt;
+      }
+      // Otherwise the figure it carries is in the wrong currency for this report, and is discarded
+      // rather than converted or reused.
+      const unpriced = { ...receipt, reference_cost_usd: null, pricing_basis: null, pricing_basis_version: null };
       // The NAMED basis, never merely the newest.
       //
       // "Most recently derived" looks equivalent while exactly one basis exists and stops being so
@@ -1042,7 +1062,7 @@ export class ManagerService {
           pricing_basis: derived.pricing_basis,
           pricing_basis_version: derived.pricing_basis_version || null,
         }
-        : receipt;
+        : unpriced;
     }).filter(Boolean);
     // Re-derived under the report's basis, not read off receipts priced under another one. A report
     // is denominated in one price list or it is not a report.
