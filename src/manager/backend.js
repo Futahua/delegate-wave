@@ -182,7 +182,7 @@ export class CodexManagerBackend extends ManagerBackend {
 // Everything is per-invocation. Writing a provider into ~/.codex/config.toml would change every
 // Codex session the operator runs, to serve one job of delegate-wave's -- and the key would then
 // have to live somewhere permanent too.
-export function providerLaunch({ id, name, baseUrl, envKey, wireApi = "chat", apiKey = null }) {
+export function providerLaunch({ id, name, baseUrl, envKey, wireApi = "responses", apiKey = null }) {
   if (!id || !baseUrl || !envKey) {
     throw new Error("a manager provider needs at least id, baseUrl and envKey");
   }

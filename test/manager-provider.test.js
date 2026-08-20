@@ -24,7 +24,7 @@ test("a provider is selected entirely through per-invocation overrides", () => {
   assert.match(line, /-c model_provider="opencode-go"/);
   assert.match(line, /model_providers\.opencode-go\.base_url="https:\/\/opencode\.ai\/zen\/go\/v1"/);
   assert.match(line, /model_providers\.opencode-go\.env_key="OPENCODE_API_KEY"/);
-  assert.match(line, /model_providers\.opencode-go\.wire_api="chat"/);
+  assert.match(line, /model_providers\.opencode-go\.wire_api="responses"/);
 
   // Values are TOML-quoted. A base URL or a name containing a space would otherwise be parsed as
   // something else entirely, and the manager would quietly talk to the wrong endpoint.

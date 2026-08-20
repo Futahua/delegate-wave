@@ -139,7 +139,7 @@ export class ManagerService {
     } catch { return null; }
   }
 
-  async runTurn(run, { phase, prompt, subjectAttemptId = null }) {
+  async runTurn(run, { phase, prompt, subjectAttemptId = null, rolledOver = false }) {
     const existing = this.turns(run.id);
     if (existing.length >= run.max_turns) {
       throw new ManagerStop(
@@ -184,6 +184,46 @@ export class ManagerService {
     } catch (error) {
       // A failed turn still consumed allowance, so the AFTER sample is taken on this path too.
       await this.recordRateLimits(turnId, "AFTER");
+
+      // The conversation outlived by the work it commissioned.
+      //
+      // A managed run is mostly waiting: the manager decides in seconds, then a worker builds for
+      // minutes. On 2026-08-20 a thread survived 45s of consecutive turns and was gone after a
+      // 6m48s gap, taking a finished candidate down with it. The gap is not incidental -- it is the
+      // architecture, and it happens on every run.
+      //
+      // Replayed ONLY because the backend positively established the thread was rejected before
+      // inference: no output, no usage, nothing billed. Conversation continuity is an optimization
+      // here, not correctness -- the evidence pack carries the objective, the current evidence and
+      // the prior decisions -- so a fresh thread receiving the same pack decides the same question.
+      //
+      // Once. If a brand-new thread is also refused, that is not a stale conversation any more.
+      if (error?.staleThread === true && !rolledOver) {
+        this.finishTurn(turnId, run, "FAILED", {
+          error: `thread rollover: ${String(error?.message ?? error)}`,
+        });
+        const previous = run.thread_id;
+        const started = await this.backend.startRun({ model: run.requested_model ?? undefined });
+        // Persisted BEFORE anything uses it, so a crash mid-rollover cannot leave the run pointing
+        // at a thread that no longer exists while a live one goes unrecorded.
+        if (started?.threadId) {
+          this.setRun(run.id, { thread_id: started.threadId });
+          run.thread_id = started.threadId;
+        }
+        recordEvent(this.db, {
+          kind: "MANAGER_THREAD_ROLLOVER", entityType: "job", entityId: run.job_id,
+          payload: {
+            old_thread: previous,
+            new_thread: started?.threadId ?? null,
+            reason: "THREAD_NOT_FOUND",
+            semantic_turn: { phase, subjectAttemptId },
+            failed_turn_id: turnId,
+            retry: 1,
+          },
+        });
+        return this.runTurn(run, { phase, prompt, subjectAttemptId, rolledOver: true });
+      }
+
       const uncertain = error?.uncertain === true;
       this.finishTurn(turnId, run, uncertain ? "UNCERTAIN" : "FAILED", { error: String(error?.message ?? error) });
       throw new ManagerStop(

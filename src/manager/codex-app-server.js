@@ -40,6 +40,28 @@ const HANDSHAKE_TIMEOUT_MS = 60_000;
 // as terminal settles the turn before any item or usage notification has arrived.
 const TERMINAL_TURN_STATUS = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
+// Whether a rejection positively establishes that the thread is gone.
+//
+// Deliberately narrow, because the consequence of a false positive is replaying a turn that already
+// ran: the manager pays twice and the second answer overwrites the first. Three conditions must
+// hold together --
+//
+//   the call was REJECTED rather than timed out, so inference never began;
+//   the message says the thread is missing, in the server's own words;
+//   the message names the exact thread that was sent, so a rejection about some other conversation
+//     cannot be read as being about this one.
+//
+// Anything else -- a timeout, a transport drop, a 500, an unexplained refusal -- stays uncertain and
+// stops the run. "We do not know whether that spent money" is not a retryable condition.
+const STALE_THREAD_PHRASES = /thread not found|unknown thread|no such thread|thread .{0,80}(does not exist|expired)/i;
+
+export function isStaleThreadRejection(error, threadId) {
+  if (!threadId) return false;
+  const message = String(error?.message ?? "");
+  if (!STALE_THREAD_PHRASES.test(message)) return false;
+  return message.includes(String(threadId));
+}
+
 export class CodexAppServer {
   constructor({
     executable = "codex",
@@ -348,7 +370,14 @@ export class CodexAppServer {
       } catch (error) {
         // A clean protocol rejection means the turn never started, so nothing was billed. A timeout
         // means we do not know whether it started, which is a different and more expensive fact.
-        throw Object.assign(error, { uncertain: Boolean(error.timedOut) });
+        //
+        // A rejection that positively names THIS thread as missing is narrower still, and is the one
+        // case a caller may safely replay: the server refused before inference, so there is no
+        // answer to lose and no spend to duplicate.
+        throw Object.assign(error, {
+          uncertain: Boolean(error.timedOut),
+          staleThread: !error.timedOut && isStaleThreadRejection(error, threadId),
+        });
       }
 
       // Some versions answer turn/start with the completed turn inline, which IS terminal and must

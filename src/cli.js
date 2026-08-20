@@ -148,7 +148,7 @@ async function main() {
     if (!apiKey) {
       throw new Error(`No credential for provider "${id}": set ${envKey}, or authenticate it in OpenCode.`);
     }
-    return { id, name: entry.name ?? id, baseUrl: entry.api, envKey, wireApi: "chat", apiKey };
+    return { id, name: entry.name ?? id, baseUrl: entry.api, envKey, wireApi: "responses", apiKey };
   }
 
   // commission strong-model work.
