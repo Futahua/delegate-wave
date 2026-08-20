@@ -18,6 +18,7 @@ import {
   resolveRevision,
   updateRefCas,
 } from "./git.js";
+import { referenceCostUsd } from "./pricing.js";
 import { assertNotShellComposed, runCommand, runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { readFinalText } from "./manager/runtime.js";
@@ -2179,6 +2180,57 @@ export class Dispatcher {
       totals.unpriced_attempts += spend.unpriced_attempts;
     }
     return { ...totals, complete: totals.unpriced_attempts === 0, jobs: ids.length };
+  }
+
+  // The family's cost re-derived under ONE named basis, for reporting only.
+  //
+  // Deliberately not familySpend(). That path is budget AUTHORITY: it sums the price each receipt was
+  // stamped with when it was written, under the basis the $0.50 ceiling was calibrated against, and
+  // nothing about presenting a comparison may move the number that admits or refuses work.
+  //
+  // This path answers a different question -- "what would this family have cost under the basis I am
+  // quoting the manager in" -- and answers it from the immutable token counts rather than from the
+  // stored figure. Without it a report claiming one basis was denominated in two: the scarce half in
+  // the requested basis, the cheap half in whatever its receipts happened to be priced under. Those
+  // two agree today for DeepSeek Flash, exactly, which is why run 13's total was right; agreeing by
+  // luck is not the same as being enforced.
+  //
+  // Anything the basis cannot price makes the total incomplete rather than falling back to the
+  // receipt's own figure. A silent basis substitution is precisely the defect this exists to remove.
+  familyReferenceSpend(rootJobId, basisId) {
+    const ids = this.familyJobIds(rootJobId);
+    const totals = { spent: 0, priced_attempts: 0, unpriced_attempts: 0, basis_id: basisId };
+    for (const id of ids) {
+      const rows = this.db.prepare(`SELECT r.*, a.model, a.id AS attempt_id
+        FROM attempt_usage_receipts r JOIN attempts a ON a.id = r.attempt_id
+        WHERE a.job_id = ?`).all(id);
+      const ran = this.db.prepare(`SELECT COUNT(*) AS count FROM attempts a
+        JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'
+        WHERE a.job_id = ?`).get(id).count;
+
+      let priced = 0;
+      for (const row of rows) {
+        // Same rule as jobSpend: only a COMPLETE observation can make accounting complete, and
+        // NO_PROVIDER_CONTACT is the one status where zero IS the measurement.
+        if (row.status === "NO_PROVIDER_CONTACT") { priced += 1; continue; }
+        if (row.status !== "COMPLETE") continue;
+        const { reference_cost_usd: cost } = referenceCostUsd(row, { model: row.model, basisId });
+        if (cost === null) continue;
+        totals.spent += cost;
+        priced += 1;
+      }
+      totals.priced_attempts += priced;
+      totals.unpriced_attempts += Math.max(0, ran - priced);
+    }
+    const complete = totals.unpriced_attempts === 0;
+    return {
+      ...totals,
+      complete,
+      // A partial sum reads as the family's cost while being a subset's, so it is withheld rather
+      // than quoted -- the same rule the manager side already applies to its own turns.
+      spent: complete ? totals.spent : null,
+      jobs: ids.length,
+    };
   }
 
   // The ceiling in force for this job, and who holds it.

@@ -1044,7 +1044,9 @@ export class ManagerService {
         }
         : receipt;
     }).filter(Boolean);
-    const family = this.dispatcher.familySpend(jobId);
+    // Re-derived under the report's basis, not read off receipts priced under another one. A report
+    // is denominated in one price list or it is not a report.
+    const family = this.dispatcher.familyReferenceSpend(jobId, basisId);
     return {
       job_id: jobId,
       status: run.status,
@@ -1062,6 +1064,8 @@ export class ManagerService {
         jobs: family.jobs,
         reference_cost_usd: family.spent,
         complete: family.complete,
+        pricing_basis: basisId,
+        ...(family.complete ? {} : { unpriced_attempts: family.unpriced_attempts }),
       },
     };
   }

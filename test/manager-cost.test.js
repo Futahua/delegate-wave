@@ -369,3 +369,65 @@ test("repricing refuses a model no basis prices, and says which", async (t) => {
   assert.equal(result.refused[0].model, "gpt-5.5");
   assert.equal(result.totalCostUsd, 0);
 });
+
+test("a report denominates BOTH halves in the basis it was asked for", async (t) => {
+  // The seam this closes: the manager half honoured the requested basis while the worker half was
+  // read off receipts priced under whatever basis was in force when they were written. Those two
+  // agree exactly for DeepSeek Flash today, which is why run 13's total was right -- but agreeing by
+  // luck is not the same as being enforced, and the next basis that disagrees would have produced a
+  // confident two-basis total with nothing in it to reveal the mixture.
+  const { dispatcher, service, job } = await managedRun(t, "opencode-go/gpt-5.6-luna");
+
+  const go = await service.report(job.id, { basisId: MANAGER_PRICING_BASIS });
+  assert.equal(go.cheap.pricing_basis, MANAGER_PRICING_BASIS);
+  assert.ok(go.cheap.reference_cost_usd > 0, "workers price under the Go basis");
+  assert.ok(go.strong.reference_cost_usd > 0);
+
+  // Asked for a basis that cannot price the workers, the cheap half goes incomplete rather than
+  // quietly reverting to the figure its receipts already carry.
+  const elsewhere = await service.report(job.id, { basisId: "deepseek-direct-2026-08-14-v1" });
+  assert.equal(elsewhere.cheap.pricing_basis, "deepseek-direct-2026-08-14-v1");
+  const stored = dispatcher.familySpend(job.id);
+  assert.ok(stored.spent > 0, "the receipts do carry a figure under their own basis");
+  assert.notEqual(elsewhere.cheap.reference_cost_usd, stored.spent,
+    "and the report must not silently present it as the requested basis");
+});
+
+test("worker receipts priced under one basis are re-derived, never re-used, under another", async (t) => {
+  const { dispatcher, job } = await managedRun(t, "opencode-go/gpt-5.6-luna");
+
+  // v1 and v2 of the DeepSeek basis disagree on purpose: v1 was superseded for wrong rates. That
+  // makes them the honest way to prove a substitution is not happening.
+  const v2 = dispatcher.familyReferenceSpend(job.id, "deepseek-direct-2026-08-14-v2");
+  const v1 = dispatcher.familyReferenceSpend(job.id, "deepseek-direct-2026-08-14-v1");
+  assert.ok(v2.spent > 0);
+  assert.ok(v1.spent > 0);
+  assert.notEqual(v1.spent, v2.spent, "different rates must produce different totals");
+  assert.equal(v1.basis_id, "deepseek-direct-2026-08-14-v1");
+
+  // A basis that prices nothing here withholds the total instead of reporting a partial one.
+  const unpriceable = dispatcher.familyReferenceSpend(job.id, "opencode-go-2026-08-20-v1");
+  assert.ok(unpriceable.spent === null || unpriceable.spent > 0);
+  const nonsense = dispatcher.familyReferenceSpend(job.id, "no-such-basis");
+  assert.equal(nonsense.spent, null);
+  assert.equal(nonsense.complete, false);
+  assert.ok(nonsense.unpriced_attempts > 0);
+});
+
+test("budget admission still uses the basis its ceiling was calibrated against", async (t) => {
+  // familySpend is authority, not presentation. Reporting gained a basis parameter; admission must
+  // not have moved, or a display preference would have become a spending decision.
+  const { dispatcher, job } = await managedRun(t, "opencode-go/gpt-5.6-luna");
+
+  const authoritative = dispatcher.familySpend(job.id);
+  const receipts = dispatcher.db.prepare(`SELECT r.reference_cost_usd
+    FROM attempt_usage_receipts r JOIN attempts a ON a.id = r.attempt_id
+    JOIN jobs j ON j.id = a.job_id WHERE j.id = ? OR j.parent_job_id = ?`).all(job.id, job.id);
+  const stamped = receipts.reduce((acc, row) => acc + (row.reference_cost_usd ?? 0), 0);
+  assert.ok(Math.abs(authoritative.spent - stamped) < 1e-12,
+    "the ceiling is measured against the price each receipt was stamped with");
+
+  // And it is unmoved by asking a report for a different basis.
+  dispatcher.familyReferenceSpend(job.id, "deepseek-direct-2026-08-14-v1");
+  assert.equal(dispatcher.familySpend(job.id).spent, authoritative.spent);
+});
