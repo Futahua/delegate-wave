@@ -1005,11 +1005,15 @@ export class ManagerService {
   }
 
   // Everything the scarce-resource metric needs, in one place.
-  report(jobId) {
+  //
+  // basisId names which price list this report is denominated in. Passed rather than assumed,
+  // because a total whose halves came from different bases is not a total.
+  report(jobId, { basisId = MANAGER_PRICING_BASIS } = {}) {
     const run = this.getRun(jobId);
     if (!run) return null;
     const turns = this.turns(run.id);
-    // A receipt's own figure first; otherwise the most recent derivation over its tokens.
+    const wanted = pricingBasisParts(basisId);
+    // A receipt's own figure first; otherwise a derivation over its tokens under the named basis.
     //
     // Priced-at-observation and priced-later are both legitimate answers to "what did this cost",
     // and the receipt's own is preferred because it was computed against the model actually serving
@@ -1020,10 +1024,17 @@ export class ManagerService {
         "SELECT * FROM manager_usage_receipts WHERE manager_turn_id = ?",
       ).get(turn.id);
       if (!receipt || receipt.reference_cost_usd !== null) return receipt;
+      // The NAMED basis, never merely the newest.
+      //
+      // "Most recently derived" looks equivalent while exactly one basis exists and stops being so
+      // the moment a second is added: a report would then silently change basis as derivations
+      // accumulate, and observation-time figures under one basis would sit beside retropriced
+      // figures under another in the same total. Asking for a basis by name keeps a report
+      // reproducible and keeps its components comparable to each other.
       const derived = this.db.prepare(
-        `SELECT * FROM manager_receipt_pricings WHERE manager_turn_id = ?
-         ORDER BY derived_at DESC LIMIT 1`,
-      ).get(turn.id);
+        `SELECT * FROM manager_receipt_pricings
+         WHERE manager_turn_id = ? AND pricing_basis = ? AND pricing_basis_version = ?`,
+      ).get(turn.id, wanted.basis, wanted.version ?? "");
       return derived
         ? {
           ...receipt,

@@ -86,6 +86,19 @@ export const PRICING_BASES = Object.freeze({
         // rather than invent. Establishing the metric is what unlocks the upper tier.
         rates_valid_up_to_tokens: 272_000,
       }),
+      // The worker route, published by Go at exactly the rates the direct-API basis already
+      // records: $0.14 / $0.0028 / $0.28 per million. Present here so a run's two halves can be
+      // stated under ONE basis rather than summed across two, which was never a valid total even
+      // when the arithmetic happened to agree.
+      //
+      // No cache-write tariff is published, exactly as in the direct basis, so an observation
+      // carrying cache-write tokens still refuses rather than inventing a rate. The agreement
+      // between the two bases is a fact worth having checked, not an assumption worth relying on.
+      "deepseek-v4-flash": Object.freeze({
+        input_per_mtok: 0.14,
+        cache_read_per_mtok: 0.0028,
+        output_per_mtok: 0.28,
+      }),
     }),
   }),
 });

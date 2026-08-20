@@ -292,7 +292,8 @@ test("an observation that could cross the published tier boundary prices as NULL
 test("repricing derives a cost for history no basis could price at the time", async (t) => {
   // The real scenario, staged honestly: a manager route the MANAGER basis does not cover, priced
   // later under a basis that does. Receipts are immutable, so this cannot be faked by editing them.
-  const { dispatcher, service, job } = await managedRun(t, "opencode-go/deepseek-v4-flash");
+  // deepseek-v4-pro sits in the direct-API basis only, so the OpenCode Go basis cannot price it.
+  const { dispatcher, service, job } = await managedRun(t, "opencode-go/deepseek-v4-pro");
   const runId = service.getRun(job.id).id;
   const before = receiptsFor(dispatcher, runId);
   assert.ok(before.length > 0);
@@ -325,10 +326,17 @@ test("repricing derives a cost for history no basis could price at the time", as
     assert.equal(row.pricing_basis_version, "v2");
   }
 
-  // And the run report now states a cost, carrying the basis that produced it.
-  const report = await service.report(job.id);
+  // And the run report states a cost when asked for THAT basis by name.
+  const report = await service.report(job.id, { basisId: DEFAULT_PRICING_BASIS });
   assert.ok(Math.abs(report.strong.reference_cost_usd - applied.totalCostUsd) < 1e-12);
   assert.deepEqual(report.strong.pricing_bases, ["deepseek-direct-2026-08-14-v2"]);
+
+  // Asked for a basis nothing was derived under, it reports no cost rather than reaching for
+  // whatever figure happens to exist. A report is denominated in one price list or it is not a
+  // report.
+  const elsewhere = await service.report(job.id, { basisId: MANAGER_PRICING_BASIS });
+  assert.equal(elsewhere.strong.reference_cost_usd, null);
+  assert.equal(elsewhere.strong.unpriced_turns, elsewhere.strong.turns);
 
   // Idempotent: the same basis is not derived twice.
   const again = service.repriceReceipts({ apply: true, basisId: DEFAULT_PRICING_BASIS });
