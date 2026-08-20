@@ -97,6 +97,7 @@ function readArtifact(artifactPath, limit, options) {
 // prevent.
 export function buildPlanEvidence({
   objective, baseSha, validationCommands, protectedPaths, explorations = [], workerCapabilities = null,
+  priorCandidate = null,
 }) {
   return {
     kind: "PLAN",
@@ -111,6 +112,15 @@ export function buildPlanEvidence({
     // does not, and a manager taught one executor's limits would be confidently wrong the moment the
     // router picked another.
     worker_capabilities: workerCapabilities,
+    // The candidate that survived a rethink, when there is one.
+    //
+    // Carried in the PACK rather than left to the conversation, because a manager thread is a cache,
+    // not a record. A thread that expires between turns -- which happens on every run, while a
+    // worker builds for minutes -- must not take the knowledge that a repairable candidate exists
+    // down with it. With this here, a fresh thread given the same pack reaches the same decision
+    // state, which is what makes thread rollover a correctness-preserving property rather than a
+    // transport patch.
+    prior_candidate: priorCandidate,
     // Who executes the deterministic checks. Not the worker.
     validation_owner: "delegate-wave",
     // Present only after an exploration round; empty on the first turn.
@@ -310,6 +320,29 @@ function renderCapabilities(lines, capabilities) {
   }
 }
 
+// The state a rethink left behind: enough to decide, not the whole diff again.
+//
+// Bounded on purpose. The point is that the decision can be made without the conversation, not that
+// the entire review is replayed at full price on every subsequent turn.
+function renderPriorCandidate(lines, candidate) {
+  if (!candidate) return;
+  lines.push("", "Prior candidate (still available as a revision base):");
+  lines.push(`  attempt: ${candidate.attempt_id}`);
+  lines.push(`  candidate commit: ${candidate.result_commit ?? "none recorded"}`);
+  lines.push(`  changed files: ${candidate.changed_files?.length ?? 0}`);
+  lines.push(`  validation: ${candidate.validation_state ?? "UNKNOWN"}`);
+  lines.push(`  previous review decision: ${candidate.previous_decision ?? "unknown"}`);
+  if (candidate.review_diagnosis) {
+    lines.push("  why that review rejected it:");
+    lines.push(`    ${candidate.review_diagnosis}`);
+  }
+  lines.push(
+    "",
+    "REVISE repairs this candidate, starting from its commit. IMPLEMENT abandons it and starts "
+    + "again from the authorized base. Both are available; choose deliberately.",
+  );
+}
+
 export function renderEvidence(pack) {
   const lines = [];
   const section = (title) => { lines.push("", `## ${title}`, ""); };
@@ -353,6 +386,7 @@ export function renderEvidence(pack) {
       lines.push("No deterministic checks are configured for this project.");
     }
     renderCapabilities(lines, pack.worker_capabilities);
+    renderPriorCandidate(lines, pack.prior_candidate);
     if (pack.protected_paths.length) {
       lines.push(`Paths a worker may not touch: ${pack.protected_paths.join(", ")}`);
     }

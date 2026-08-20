@@ -437,7 +437,10 @@ export class ManagerService {
       // RETHINK may legitimately arrive with no questions: the manager wants to re-plan rather than
       // re-investigate. Nothing to buy, so go straight back to planning.
       transaction(this.db, () => {
-        this.setRun(run.id, { status: "PLANNING", last_candidate_attempt_id: null });
+        // The candidate is NOT erased here. A rethink invalidates the diagnosis, not the work: the
+        // manager may decide, once it knows more, that the existing candidate is repairable after
+        // all. Only IMPLEMENT abandons it, and that is an explicit decision to start over.
+        this.setRun(run.id, { status: "PLANNING" });
         recordEvent(this.db, {
           kind: "MANAGER_REPLAN", entityType: "job", entityId: run.job_id,
           payload: { runId: run.id, reason },
@@ -454,9 +457,8 @@ export class ManagerService {
     }
     this.writeRoundPlan(run, round, explorations);
     transaction(this.db, () => {
-      this.setRun(run.id, {
-        exploration_round: round, status: "EXPLORING", last_candidate_attempt_id: null,
-      });
+      // Same reason as above: exploring does not throw away a candidate that already exists.
+      this.setRun(run.id, { exploration_round: round, status: "EXPLORING" });
       recordEvent(this.db, {
         kind: "MANAGER_EXPLORATION_REQUESTED", entityType: "job", entityId: run.job_id,
         payload: { runId: run.id, round, questions: explorations.map((item) => item.question), reason },
@@ -595,6 +597,42 @@ export class ManagerService {
     });
   }
 
+  // The candidate a rethink left behind, assembled from the ledger rather than from the turn that
+  // produced it.
+  //
+  // Read fresh every time. If this came from anything the conversation carried, a thread that
+  // expired between turns would take it with it -- and the whole point is that a fresh thread given
+  // the same pack decides the same question.
+  priorCandidate(run) {
+    const safeParse = (value) => { try { return JSON.parse(value ?? "null"); } catch { return null; } };
+    if (!run.last_candidate_attempt_id) return null;
+    const attempt = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(run.last_candidate_attempt_id);
+    if (!attempt) return null;
+
+    // The decision that sent this candidate back, and its stated reason, from the last REVIEW turn
+    // that judged it.
+    const review = this.db.prepare(
+      `SELECT * FROM manager_turns WHERE manager_run_id = ? AND phase = 'REVIEW'
+         AND subject_attempt_id = ? AND action IS NOT NULL ORDER BY ordinal DESC LIMIT 1`,
+    ).get(run.id, attempt.id);
+    let diagnosis = null;
+    if (review?.response_artifact) {
+      try {
+        diagnosis = JSON.parse(fs.readFileSync(review.response_artifact, "utf8"))?.reason ?? null;
+      } catch { diagnosis = null; }
+    }
+
+    return {
+      attempt_id: attempt.id,
+      result_commit: attempt.result_commit,
+      changed_files: safeParse(attempt.changed_files_json) ?? [],
+      validation_state: attempt.validation_state,
+      previous_decision: review?.action ?? null,
+      // Bounded: enough to decide, not the whole review replayed at full price on every later turn.
+      review_diagnosis: diagnosis ? diagnosis.slice(0, 1200) : null,
+    };
+  }
+
   async synthesize(run, round, plan) {
     const job = this.dispatcher.getJob(run.job_id);
     const project = this.dispatcher.getProject(job.project_id);
@@ -605,6 +643,7 @@ export class ManagerService {
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       explorations: reports,
+      priorCandidate: this.priorCandidate(run),
       // The envelope for the work being PLANNED, which is implementation. Investigation children run
       // read-only, but the manager is deciding what to build, not what to read.
       workerCapabilities: this.workerCapabilities(job),
@@ -616,13 +655,41 @@ export class ManagerService {
     const { decision } = await this.runTurn(run, { phase: "SYNTHESIS", prompt: renderEvidence(pack) });
 
     if (decision.action === "IMPLEMENT") {
+      // An explicit decision to abandon whatever candidate exists and start from the authorized
+      // base. Recorded, because "we threw away a working tree and started over" is a fact about how
+      // the money was spent, not an implementation detail.
+      if (run.last_candidate_attempt_id) {
+        recordEvent(this.db, {
+          kind: "MANAGER_CANDIDATE_ABANDONED", entityType: "job", entityId: run.job_id,
+          payload: { runId: run.id, attemptId: run.last_candidate_attempt_id, reason: decision.reason },
+        });
+      }
       this.storeBrief(run, decision.brief);
-      this.setRun(run.id, { status: "IMPLEMENTING" });
+      this.setRun(run.id, { status: "IMPLEMENTING", last_candidate_attempt_id: null });
       return;
     }
     if (decision.action === "ESCALATE") throw new ManagerStop(decision.reason, "ESCALATED", decision.question);
     if (decision.action === "EXPLORE" || decision.action === "RETHINK") {
       return this.openExplorationRound(this.getRun(run.job_id), decision.explorations, decision.reason);
+    }
+    // Repairing the candidate that survived the rethink.
+    //
+    // This is the state the manager kept trying to express and the machine could not represent: a
+    // review invalidated the diagnosis, investigation established something new, and the existing
+    // candidate is repairable under the corrected understanding. Answering REVISE there is coherent,
+    // and refusing it threw away a whole run on 2026-08-20.
+    //
+    // Only valid post-candidate. A synthesis that has never produced anything has nothing to revise,
+    // and accepting REVISE there would start a "repair" from a base commit with no repair to make.
+    if (decision.action === "REVISE") {
+      if (!run.last_candidate_attempt_id) {
+        throw new ManagerStop(
+          `the manager answered REVISE after synthesizing round ${round}, but no candidate has been `
+          + "produced yet; there is nothing to revise",
+          "REVISE_WITHOUT_CANDIDATE",
+        );
+      }
+      return this.revise(run, decision);
     }
     throw new ManagerStop(
       `the manager answered ${decision.action} after synthesizing round ${round}: ${decision.reason}`,
