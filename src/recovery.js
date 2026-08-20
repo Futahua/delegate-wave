@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { backup as sqliteBackup } from "node:sqlite";
+import { DatabaseSync, backup as sqliteBackup } from "node:sqlite";
 import { managedPaths } from "./paths.js";
 import { SCHEMA_VERSION } from "./db.js";
 import { resolveRevision, updateRefCas, isAncestor } from "./git.js";
@@ -85,9 +85,30 @@ export async function createBackup({ root, database, label = "manual" }) {
   // Operational truth and code truth must be restorable together. A database snapshot alone can be
   // restored on top of repositories that have moved on, which is precisely the inconsistency a
   // recovery feature exists to prevent, so where each integration branch stood is recorded here.
+  // Whether a repository must participate in restore is decided by its retirement state AT BACKUP
+  // TIME, and recorded explicitly rather than inferred from a null head.
+  //
+  // Retirement exists so a project you stopped tracking, whose repository you then deleted, cannot
+  // make the system look permanently broken. Inferring restore requirements from a missing head
+  // undid that: the backup dutifully recorded `integration_head: null` for the deleted repository,
+  // preflight treated every missing head as a hard blocker, and default restore became permanently
+  // impossible. One supported lifecycle closed a recovery path.
+  //
+  // Recorded at backup time, not read at restore time, because the two can disagree and only one of
+  // them is the truth the restore is reconstructing:
+  //
+  //   backup while ACTIVE, retire and delete later, restore that backup
+  //     -> the restored database makes the project active again, so its repository IS required.
+  //        Today's retirement cannot weaken a guarantee an older backup made.
+  //
+  //   backup while RETIRED
+  //     -> the restored database keeps it retired, so the repository is not part of code truth and
+  //        a missing one is not incoherence.
   const repositories = [];
   if (database) {
-    const projects = database.prepare("SELECT id, name, repo_path, integration_branch FROM projects").all();
+    const projects = database.prepare(
+      "SELECT id, name, repo_path, integration_branch, retired_at FROM projects",
+    ).all();
     for (const project of projects) {
       let head = null;
       let error = null;
@@ -96,7 +117,14 @@ export async function createBackup({ root, database, label = "manual" }) {
       } catch (failure) {
         error = String(failure?.message ?? failure).slice(0, 200);
       }
-      repositories.push({ ...project, integration_head: head, ...(error ? { error } : {}) });
+      repositories.push({
+        ...project,
+        // delegate-wave claims authority over keeping a repository synchronized only while it is
+        // tracking that project. Retirement is exactly the withdrawal of that claim.
+        restore_required: project.retired_at === null || project.retired_at === undefined,
+        integration_head: head,
+        ...(error ? { error } : {}),
+      });
     }
   }
 
@@ -152,9 +180,65 @@ export function verifyBackup(backupDirectory) {
 // A restore that swaps the database and then discovers a repository will not move leaves operational
 // truth describing code that does not exist. Finding that out first means the operator still has an
 // untouched system and a clear reason, instead of a half-applied recovery.
-export async function preflightRepositories(manifest) {
+// Decides, for a manifest that may predate `restore_required`, which repositories the restore is
+// responsible for.
+//
+// The order of preference matters, and the fallback is deliberately conservative:
+//
+//   1. the manifest says so                 -- backups written by this build
+//   2. the backed-up DATABASE says so       -- older manifests, but the snapshot being restored
+//                                              still records what the world was at backup time,
+//                                              which makes it authoritative rather than a guess
+//   3. required                             -- a schema with no retired_at at all really did have
+//                                              no retired projects
+//
+// Absence is never read as retirement. Treating an unannotated old backup as retired would silently
+// weaken a recovery guarantee that backup was made under, which is the opposite of the trade this
+// feature exists to make.
+export function resolveRestoreRequirements(manifest, backupDirectory = null) {
+  const repositories = (manifest.repositories ?? []).map((repository) => ({ ...repository }));
+  const undecided = repositories.filter((repository) => repository.restore_required === undefined);
+  if (undecided.length === 0 || !backupDirectory) {
+    for (const repository of undecided) repository.restore_required = true;
+    return repositories;
+  }
+
+  // Read retirement out of the snapshot itself rather than out of the live database: the live one
+  // describes now, and the question is what was true when the backup was taken.
+  let retirement = null;
+  const snapshot = path.join(backupDirectory, "delegate-wave.sqlite");
+  if (fs.existsSync(snapshot)) {
+    let db = null;
+    try {
+      db = new DatabaseSync(snapshot, { readOnly: true });
+      const columns = db.prepare("PRAGMA table_info(projects)").all().map((column) => column.name);
+      if (columns.includes("retired_at")) {
+        retirement = new Map(
+          db.prepare("SELECT id, retired_at FROM projects").all().map((row) => [row.id, row.retired_at]),
+        );
+      }
+    } catch {
+      // An unreadable snapshot decides nothing; the conservative default applies below.
+      retirement = null;
+    } finally {
+      try { db?.close(); } catch { /* already closed */ }
+    }
+  }
+
+  for (const repository of undecided) {
+    repository.restore_required = retirement && retirement.has(repository.id)
+      ? retirement.get(repository.id) === null || retirement.get(repository.id) === undefined
+      : true;
+  }
+  return repositories;
+}
+
+export async function preflightRepositories(manifest, backupDirectory = null) {
   const blocked = [];
-  for (const repository of manifest.repositories ?? []) {
+  for (const repository of resolveRestoreRequirements(manifest, backupDirectory)) {
+    // A retired project's repository is not part of code truth. It may be gone, moved, or long since
+    // rewritten, and none of that makes the restored database incoherent.
+    if (!repository.restore_required) continue;
     if (!repository.integration_head) {
       blocked.push({ name: repository.name, reason: "the backup recorded no head for this repository" });
       continue;
@@ -199,7 +283,7 @@ export async function restoreBackup({
   // Default restore is all-or-nothing. `--database-only` is the escape hatch, and it is incoherent
   // because the operator asked for that, not because the restore quietly gave up partway.
   if (restoreRepositories) {
-    const blocked = await preflightRepositories(verified.manifest);
+    const blocked = await preflightRepositories(verified.manifest, backupDirectory);
     if (blocked.length) {
       throw new Error(
         "Refusing to restore: these repositories cannot be returned to their recorded heads, so the "
@@ -231,7 +315,14 @@ export async function restoreBackup({
   // integrations that the repositories no longer match. Each branch returns to the head recorded in
   // the manifest, compare-and-swap against where it actually is.
   const repositories = [];
-  for (const repository of verified.manifest.repositories ?? []) {
+  for (const repository of resolveRestoreRequirements(verified.manifest, backupDirectory)) {
+    // A retired project's branch is left exactly where it is. delegate-wave stopped claiming
+    // authority over that repository when it was retired, and silently moving a branch in a
+    // repository the operator has moved on from would be that claim reasserting itself.
+    if (!repository.restore_required) {
+      repositories.push({ ...repository, restored: false, reason: "retired at backup time" });
+      continue;
+    }
     if (!restoreRepositories || !repository.integration_head) {
       repositories.push({ ...repository, restored: false, reason: repository.integration_head ? "skipped" : "no recorded head" });
       continue;
@@ -255,7 +346,11 @@ export async function restoreBackup({
     }
   }
 
-  const coherent = repositories.every((entry) => entry.restored || entry.reason === "already at the recorded head");
+  // Coherence is judged only over the repositories this restore was responsible for. A retired
+  // project that was skipped is not a failure to restore anything -- there was nothing owed.
+  const coherent = repositories.every((entry) => (
+    !entry.restore_required || entry.restored || entry.reason === "already at the recorded head"
+  ));
 
   // Preflight makes this rare, not impossible: a repository can still become unmovable between the
   // check and the effect. The database is already replaced by this point, so the only honest outcome

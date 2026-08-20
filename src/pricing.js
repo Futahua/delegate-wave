@@ -51,9 +51,87 @@ export const PRICING_BASES = Object.freeze({
       }),
     }),
   }),
+
+  // OpenCode Go's published usage-accounting rates, captured 2026-08-20.
+  //
+  // NOT provider-reported per-request spend. Go meters its subscription in dollar value -- the plan
+  // states $12/5h, $30/week, $60/month -- so this basis approximates the resource the subscription
+  // itself is denominated in, which makes it a far better comparison basis than an arbitrary one.
+  // It is still a reference cost: no card is charged per request, and delegate-wave must not present
+  // it as though one were.
+  //
+  // Deliberately separate from the DeepSeek basis. The same model priced under a route's published
+  // rates and under a direct-API tariff are two different claims, and merging them would make an
+  // arithmetic answer right while making its provenance false.
+  "opencode-go-2026-08-20-v1": Object.freeze({
+    id: "opencode-go-2026-08-20-v1",
+    description: "OpenCode Go published usage-accounting rates, captured 2026-08-20. "
+      + "Not provider-reported per-request spend.",
+    recorded_at: "2026-08-20",
+    source: "https://opencode.ai/docs/go/",
+    models: Object.freeze({
+      "gpt-5.6-luna": Object.freeze({
+        input_per_mtok: 0.20,
+        cache_read_per_mtok: 0.02,
+        cache_write_per_mtok: 0.25,
+        output_per_mtok: 1.20,
+        // OpenCode publishes a second tier above 272K tokens -- $0.40 input, $0.04 cached read,
+        // $0.50 cached write, $1.80 output -- but labels the boundary only as "272K tokens" without
+        // stating WHICH count it is measured against: uncached input, effective context, or some
+        // other total. Two readings can put the same observation on opposite sides of it.
+        //
+        // So the boundary is recorded as the limit of what this basis can price, not as a second
+        // rate table to guess with. An observation that could exceed it prices as NULL, which is the
+        // same rule this module already applies to a dimension a basis does not tariff: refuse
+        // rather than invent. Establishing the metric is what unlocks the upper tier.
+        rates_valid_up_to_tokens: 272_000,
+      }),
+      // The worker route, published by Go at exactly the rates the direct-API basis already
+      // records: $0.14 / $0.0028 / $0.28 per million. Present here so a run's two halves can be
+      // stated under ONE basis rather than summed across two, which was never a valid total even
+      // when the arithmetic happened to agree.
+      //
+      // No cache-write tariff is published, exactly as in the direct basis, so an observation
+      // carrying cache-write tokens still refuses rather than inventing a rate. The agreement
+      // between the two bases is a fact worth having checked, not an assumption worth relying on.
+      "deepseek-v4-flash": Object.freeze({
+        input_per_mtok: 0.14,
+        cache_read_per_mtok: 0.0028,
+        output_per_mtok: 0.28,
+      }),
+    }),
+  }),
 });
 
 export const DEFAULT_PRICING_BASIS = "deepseek-direct-2026-08-14-v2";
+
+// The manager's own turns price under the route that actually serves them.
+//
+// Named separately from DEFAULT_PRICING_BASIS rather than replacing it: worker attempts keep
+// pricing under the direct-API basis their ceiling was calibrated against, and nothing about
+// measuring the scarce side is allowed to move the cheap side's numbers underneath it.
+export const MANAGER_PRICING_BASIS = "opencode-go-2026-08-20-v1";
+
+// The basis id, split into the two facts a receipt records separately.
+//
+// A receipt keeps the family ("which price list") apart from the revision ("which reading of it"),
+// because those answer different questions later: comparing two runs needs the family to match,
+// while auditing a figure needs the exact revision that produced it. The id remains the single
+// source -- these are derived from it, never stored independently and allowed to drift.
+export function pricingBasisParts(basisId) {
+  if (typeof basisId !== "string" || !basisId) return { basis: null, version: null };
+  const match = /^(.*)-(v\d+)$/.exec(basisId);
+  return match ? { basis: match[1], version: match[2] } : { basis: basisId, version: null };
+}
+
+// Whether any known basis can price this model at all.
+//
+// Asked before a turn is bought rather than after, so "we cannot price the scarce side" is a fact
+// the operator can see in advance instead of discovering across a column of NULLs.
+export function isPriceable(model, basisId = DEFAULT_PRICING_BASIS) {
+  const basis = PRICING_BASES[basisId];
+  return Boolean(basis && basis.models[pricedModelName(model)]);
+}
 
 // Strips any provider/route prefix: routing identity belongs to the dispatcher, but pricing is a
 // property of the underlying model. `opencode-go/deepseek-v4-flash` and
@@ -77,6 +155,20 @@ export function referenceCostUsd(usage, { model, basisId = DEFAULT_PRICING_BASIS
   // Refuse rather than guess when the observation uses a dimension the basis does not price.
   if ((usage.cache_write_tokens ?? 0) > 0 && rates.cache_write_per_mtok === undefined) {
     return { reference_cost_usd: null, pricing_basis_id: null };
+  }
+  // Refuse rather than guess when the observation may fall outside the band these rates cover.
+  //
+  // Compared against the largest count the receipt can support -- its stated total, or the sum of
+  // its parts, whichever is greater. Every candidate reading of a published threshold (uncached
+  // input, effective context, some other total) is bounded by that figure, so staying under it means
+  // the rates apply on ANY reading. Above it the answer depends on which reading was meant, and a
+  // number that depends on an unestablished definition is not evidence.
+  if (rates.rates_valid_up_to_tokens !== undefined) {
+    const parts = (usage.input_tokens ?? 0) + (usage.cache_read_tokens ?? 0)
+      + (usage.cache_write_tokens ?? 0) + (usage.output_tokens ?? 0) + (usage.reasoning_tokens ?? 0);
+    if (Math.max(parts, usage.total_tokens ?? 0) > rates.rates_valid_up_to_tokens) {
+      return { reference_cost_usd: null, pricing_basis_id: null };
+    }
   }
 
   const perToken = (value, rate) => ((value ?? 0) * (rate ?? 0)) / 1_000_000;

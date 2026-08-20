@@ -9,9 +9,255 @@ import { managedPaths } from "./paths.js";
 // 11: attempt_usage_receipts, the normalized executor usage/cost evidence projection.
 // 12: usage receipts record cost provenance and enforce their value invariants.
 // 13: durable cancellation intents and results.
-// 14: jobs carry an enforced cost ceiling.
+// 14: jobs carry a pre-attempt worker budget gate.
 // 15: integration rollbacks are a first-class recorded outcome.
-export const SCHEMA_VERSION = "18";
+// 19: the semantic layer. Jobs carry a strategy and a parent; attempts record the exact instruction
+//     they were given and the tree they started from; manager runs, turns and usage receipts give
+//     scarce-model activity its own ledger; work proposals bind to the repository head they were
+//     written against.
+// 20: a managed root becomes integration-ready only when a REVIEW turn accepted one exact attempt,
+//     and manager_runs records which one.
+// 22: attempt_runtime_provenance separates what was requested, what the executor can prove it
+//     applied, and what the runtime independently observed.
+// 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
+//     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
+export const SCHEMA_VERSION = "28";
+
+// Column bodies shared by table creation and table REBUILD.
+//
+// `ALTER TABLE ADD COLUMN` cannot add a table-level CHECK, so migrating an old database by adding
+// columns produces a table that accepts states the fresh one rejects. Two installations then run
+// the same version number with different invariants, and every fresh-root test passes on both.
+//
+// The only durable fix is one source of DDL text. These constants are interpolated into `CREATE
+// TABLE IF NOT EXISTS <name>` for a new database and into `CREATE TABLE <name>_rebuilt` for an old
+// one, so "fresh equals migrated" is a property of the code rather than a claim in a test.
+const ATTEMPT_USAGE_RECEIPTS_COLUMNS = `
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN', 'NO_PROVIDER_CONTACT')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  provider_steps INTEGER NOT NULL,
+  reported_cost_usd REAL,
+  reported_cost_source TEXT,
+  reference_cost_usd REAL,
+  pricing_basis_id TEXT,
+  source_backend TEXT NOT NULL,
+  source_artifact TEXT,
+  source_format TEXT NOT NULL,
+  malformed_events INTEGER NOT NULL DEFAULT 0,
+  observed_at TEXT NOT NULL,
+  -- An UNKNOWN receipt carries no numbers at all: no tokens, no steps, and no cost of either kind.
+  -- malformed_events may still be nonzero, because an unreadable artifact is itself evidence that
+  -- malformed accounting existed even though no usable usage did.
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+    AND provider_steps = 0
+    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
+    AND reference_cost_usd IS NULL AND pricing_basis_id IS NULL
+  )),
+  -- A COMPLETE or PARTIAL receipt observed at least one usable step and every token dimension.
+  CHECK (status IN ('UNKNOWN', 'NO_PROVIDER_CONTACT') OR (
+    input_tokens >= 0 AND output_tokens >= 0 AND reasoning_tokens >= 0
+    AND cache_read_tokens >= 0 AND cache_write_tokens >= 0
+    AND provider_steps >= 1
+  )),
+  -- NO_PROVIDER_CONTACT is the one status whose numbers are all DERIVED zeroes. Writing NULL would
+  -- make the row indistinguishable from UNKNOWN, and any nonzero figure would contradict the claim.
+  -- reported_* stays NULL because the executor reported nothing -- it died first -- while the zero
+  -- reference cost is delegate-wave's own determination and is what keeps the family accountable.
+  CHECK (status != 'NO_PROVIDER_CONTACT' OR (
+    input_tokens = 0 AND output_tokens = 0 AND reasoning_tokens = 0
+    AND cache_read_tokens = 0 AND cache_write_tokens = 0
+    AND provider_steps = 0
+    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
+    AND reference_cost_usd = 0 AND pricing_basis_id IS NULL
+  )),
+  CHECK (reported_cost_usd IS NULL OR reported_cost_usd >= 0),
+  CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
+  CHECK (malformed_events >= 0)`;
+
+// One deterministic check, and whether it actually happened.
+//
+// `outcome` exists because "the tests failed" and "the tests never ran" were previously the same
+// row. In dogfood run 5 the stored plan was a single shell string joined with `&&`, handed to
+// Windows PowerShell 5.1 where `&&` is a parse error; the interpreter exited nonzero without
+// running anything, and two candidates were recorded as having failed validation. The manager
+// reviewed that evidence faithfully and asked for revisions that could not have helped.
+//
+// A verifier that did not execute produces no evidence about the candidate at all, and must never
+// be readable as evidence against it.
+const VALIDATION_RUNS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  command TEXT NOT NULL,
+  -- NULL exactly when the command never started, so there was no exit status to observe.
+  exit_code INTEGER,
+  outcome TEXT NOT NULL DEFAULT 'CHECK_FAILED' CHECK (outcome IN (
+    'PASSED', 'CHECK_FAILED', 'CHECK_DID_NOT_RUN'
+  )),
+  -- Why it could not start, when it could not. Free text from the runner, recorded verbatim.
+  did_not_run_reason TEXT,
+  output_path TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL,
+  CHECK (outcome != 'CHECK_DID_NOT_RUN' OR (exit_code IS NULL AND did_not_run_reason IS NOT NULL)),
+  CHECK (outcome = 'CHECK_DID_NOT_RUN' OR (exit_code IS NOT NULL AND did_not_run_reason IS NULL)),
+  CHECK (outcome != 'PASSED' OR exit_code = 0)
+`;
+
+// SYNTHESIZING is a re-synthesis, not a fresh plan.
+//
+// A rethink that carries no questions still has something to decide: the previous diagnosis was
+// rejected and a candidate may still be repairable. Sending that to PLANNING would relabel it as
+// initial planning in the turn ledger, and -- worse -- PLAN cannot act on a candidate, so the
+// surviving work would vanish from the manager's decision surface while staying in the database.
+const MANAGER_USAGE_RECEIPTS_COLUMNS = `
+  manager_turn_id TEXT PRIMARY KEY REFERENCES manager_turns(id),
+  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  -- The provider's own reported total, kept separately from the component split.
+  --
+  -- These are two different measurements with two different reliabilities, and collapsing them
+  -- loses the good one. Whether cachedInputTokens nests inside inputTokens is genuinely ambiguous;
+  -- the total is not ambiguous at all. Since the primary metric is strong tokens per finished task,
+  -- an unresolvable decomposition must not be allowed to destroy a figure the provider stated
+  -- exactly.
+  total_tokens INTEGER,
+  source TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  -- What the scarce side actually cost, in money rather than in tokens.
+  --
+  -- Three columns because there are three separable facts, and collapsing them loses the ability to
+  -- audit any of them. NULL is the honest value throughout: a turn whose model no basis prices has
+  -- UNKNOWN cost, not zero cost, and zero is the one answer that would quietly understate the whole
+  -- point of measuring the expensive component.
+  --
+  -- reference_cost_usd is tokens x a named price, never the provider's bill. The App Server reports
+  -- token counts and no dollars at all, so no observed figure exists on this route today; if one
+  -- ever does it belongs in its own column beside this, not merged into it.
+  reference_cost_usd REAL,
+  -- Which price list, and which reading of it. Split so that comparing two runs can require the
+  -- family to match while auditing one figure can name the exact revision that produced it.
+  pricing_basis TEXT,
+  pricing_basis_version TEXT,
+  -- An UNKNOWN receipt carries no numbers at all, including no total. A manager whose provider
+  -- reported nothing has unknown cost, not zero cost, and the difference is the entire point of
+  -- measuring the scarce side.
+  CHECK (status != 'UNKNOWN' OR (
+    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
+    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL AND total_tokens IS NULL
+  )),
+  CHECK (status = 'UNKNOWN' OR (input_tokens >= 0 AND output_tokens >= 0)),
+CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
+  -- A cost without a stated basis is not reproducible, and a basis without a cost is not evidence
+  -- of anything. Either both are present or neither is.
+  CHECK ((reference_cost_usd IS NULL) = (pricing_basis IS NULL)),
+  -- A version cannot exist without the basis it versions.
+  CHECK (pricing_basis IS NOT NULL OR pricing_basis_version IS NULL),
+  -- An unmeasured turn has no tokens, so it can have no token-derived cost either.
+  CHECK (status != 'UNKNOWN' OR reference_cost_usd IS NULL)`;
+
+const MANAGER_RUNS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  status TEXT NOT NULL CHECK (status IN (
+    'PLANNING', 'SYNTHESIZING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING',
+    'ACCEPTED', 'AWAITING_HUMAN', 'FAILED', 'CANCELLED'
+  )),
+  -- What was asked for, and what the provider says actually ran. Two facts, because they can differ
+  -- and only one of them is evidence. actual_model stays NULL when the provider reports nothing:
+  -- backfilling it from the request would record a preference as an observation, and a manufactured
+  -- provenance is worse than a missing one because only the missing one is detectable later.
+  requested_model TEXT,
+  actual_model TEXT,
+  -- The manager's conversation identity with its provider. One managed job is one thread, so the
+  -- manager's own context is the provider's problem rather than something reassembled per turn.
+  thread_id TEXT,
+  exploration_round INTEGER NOT NULL DEFAULT 0,
+  revision_round INTEGER NOT NULL DEFAULT 0,
+  max_exploration_rounds INTEGER NOT NULL,
+  max_revision_rounds INTEGER NOT NULL,
+  max_turns INTEGER NOT NULL,
+  -- The child job currently carrying this run forward, if any.
+  active_child_job_id TEXT REFERENCES jobs(id),
+  last_candidate_attempt_id TEXT REFERENCES attempts(id),
+  -- Set when the manager escalated: the question a person actually has to answer.
+  -- The one attempt a completed ACCEPT review bound itself to.
+  --
+  -- Written in the same transaction as the ACCEPT transition, and cross-checked against the review
+  -- turn's subject_attempt_id. proposeIntegration() reads this instead of choosing among candidates:
+  -- after a revision there are two PASSED attempts and 'the passed one' stops being a description of
+  -- anything. Null until a review accepts, which is also what makes 'no worker runs after ACCEPT'
+  -- checkable.
+  accepted_attempt_id TEXT REFERENCES attempts(id),
+  escalation_question TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL`;
+
+const JOBS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  goal TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+  status TEXT NOT NULL CHECK (status IN (
+    'PENDING', 'RUNNING', 'READY_FOR_INTEGRATION', 'SUCCEEDED',
+    'FAILED', 'CANCELLED', 'NEEDS_ATTENTION'
+  )),
+  base_sha TEXT NOT NULL,
+  max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
+  -- A recorded ceiling in reference dollars, shared by the whole job family. NULL means no ceiling;
+  -- a value gates every attempt start and settles after the work is done.
+  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
+  -- An explicit request for a narrower worker: a task run against something untrusted, or an
+  -- experiment with hidden verifiers. Null means the system default, which is broad.
+  capability_profile TEXT,
+  -- How this job reaches a candidate. 'direct' is the original path: one authorization, one worker,
+  -- the goal as its instruction. 'managed' hands the job to a strong manager that plans, delegates,
+  -- reviews and revises. Both paths use the same attempt machinery and the same integration gate;
+  -- only who writes the worker's instruction differs.
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
+  -- Set on jobs the manager created for itself. A child is real work with real cost and real
+  -- evidence -- it is deliberately NOT a private side channel -- but it belongs to its parent's
+  -- accounting rather than to the operator's queue.
+  parent_job_id TEXT REFERENCES jobs(id),
+  internal_kind TEXT CHECK (internal_kind IS NULL OR internal_kind IN ('MANAGER_EXPLORATION')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- An internal job without a parent would be invisible with nothing to be visible under.
+  CHECK (internal_kind IS NULL OR parent_job_id IS NOT NULL)
+`;
+
+const WORK_PROPOSALS_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  goal TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+  action_digest TEXT NOT NULL,
+  expected_state_version TEXT,
+  -- The integration head this proposal was written against.
+  --
+  -- expected_state_version alone hashes delegate-wave's own job rows, which says nothing about the
+  -- code. A proposal reasoned about repository version A could be authorized against version B with
+  -- the state version unchanged, and authorization resolves the branch head fresh -- so the system
+  -- would report that the world matched while the only world that matters had moved.
+  expected_base_sha TEXT,
+  strategy TEXT NOT NULL DEFAULT 'direct' CHECK (strategy IN ('direct', 'managed')),
+  maximum_cost REAL,
+  expires_at TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  origin_principal TEXT NOT NULL,
+  origin_channel TEXT NOT NULL,
+  created_at TEXT NOT NULL
+`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -34,26 +280,7 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS jobs (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  goal TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
-  status TEXT NOT NULL CHECK (status IN (
-    'PENDING', 'RUNNING', 'READY_FOR_INTEGRATION', 'SUCCEEDED',
-    'FAILED', 'CANCELLED', 'NEEDS_ATTENTION'
-  )),
-  base_sha TEXT NOT NULL,
-  max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
-  -- A recorded ceiling in reference dollars. NULL means no ceiling; a value is enforced before each
-  -- attempt starts, and unaccounted spend blocks rather than passes.
-  maximum_cost REAL CHECK (maximum_cost IS NULL OR maximum_cost > 0),
-  -- An explicit request for a narrower worker: a task run against something untrusted, or an
-  -- experiment with hidden verifiers. Null means the system default, which is broad.
-  capability_profile TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS jobs (${JOBS_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY,
@@ -89,18 +316,38 @@ CREATE TABLE IF NOT EXISTS attempts (
   -- everyday surface say "3 files changed" without recomputing a diff, and lets a person ask which.
   changed_files_json TEXT,
   failure_signature TEXT,
+  -- The tree this attempt's worktree was created from.
+  --
+  -- Distinct from jobs.base_sha, and the distinction is the whole point of managed revision: a
+  -- revising worker starts from the previous candidate so it corrects an implementation rather than
+  -- rewriting one from nothing, while candidate capture still measures the result against the
+  -- AUTHORIZED base. Without this column those two would have to be the same commit, and a revision
+  -- would either lose the prior work or produce a candidate that is not a complete net change from
+  -- what the operator authorized.
+  start_sha TEXT,
+  -- The exact text this worker was given, and its identity.
+  --
+  -- Stored as an artifact path plus a digest rather than inline: instructions carry whole evidence
+  -- packs and SQLite is the operational ledger, not a document store. The digest is what makes
+  -- "attempt 2 was told something different from attempt 1" a fact rather than a claim.
+  instruction_artifact TEXT,
+  instruction_digest TEXT,
+  -- What the worker said it did, as an immutable artifact. The candidate is what it actually did;
+  -- this is testimony, and the reviewer needs both to notice when they disagree.
+  result_text_artifact TEXT,
+  -- Spending authority claimed for this attempt, in the same transaction that created it.
+  --
+  -- Authority, not a cap: a provider call cannot be preempted mid-flight, so an attempt may still
+  -- overshoot what it reserved and that is recorded as an overrun. What this guarantees is that a
+  -- family never AUTHORIZES more than its ceiling at one time, which is the property a check that
+  -- sums only settled receipts cannot provide once siblings can start together.
+  --
+  -- NULL means the family carries no ceiling, so there was no authority to divide.
+  budget_reservation_usd REAL CHECK (budget_reservation_usd IS NULL OR budget_reservation_usd > 0),
   UNIQUE(job_id, ordinal)
 );
 
-CREATE TABLE IF NOT EXISTS validation_runs (
-  id TEXT PRIMARY KEY,
-  attempt_id TEXT NOT NULL REFERENCES attempts(id),
-  command TEXT NOT NULL,
-  exit_code INTEGER NOT NULL,
-  output_path TEXT NOT NULL,
-  started_at TEXT NOT NULL,
-  finished_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS validation_runs (${VALIDATION_RUNS_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,20 +435,7 @@ CREATE TABLE IF NOT EXISTS control_request_results (
 
 -- Bounded work proposed in ordinary language by a non-operator principal. A proposal is a request,
 -- never authority: only an operator-authorized transition turns one into a job.
-CREATE TABLE IF NOT EXISTS work_proposals (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  goal TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
-  action_digest TEXT NOT NULL,
-  expected_state_version TEXT,
-  maximum_cost REAL,
-  expires_at TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL UNIQUE,
-  origin_principal TEXT NOT NULL,
-  origin_channel TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS work_proposals (${WORK_PROPOSALS_COLUMNS});
 
 -- Terminal decisions on a work proposal. Separate table so proposals stay immutable and every
 -- decision keeps its own authorizing identity.
@@ -265,6 +499,12 @@ BEGIN SELECT RAISE(ABORT, 'cancellation_results is immutable'); END;
 --   COMPLETE  a full accounting receipt was observed (including an explicit zero-usage receipt)
 --   PARTIAL   some usage was observed but the accounting is known to be incomplete
 --   UNKNOWN   no usage receipt was observed at all
+--   NO_PROVIDER_CONTACT
+--             the executor is positively known to have failed during local initialization, before a
+--             provider request was possible. Distinct from UNKNOWN in the one way that matters to
+--             the budget: the zero is DERIVED from positive local evidence rather than observed
+--             from provider usage, so it does not make family spend unestablishable. Nothing here
+--             measured a provider; the proof is that no provider was reached.
 -- Numeric columns are NULL under UNKNOWN. A missing receipt must never be recorded as zero, or
 -- failed work appears free in cost per validated candidate.
 -- A rollback is a first-class terminal outcome, not an event footnote. Current integration state is
@@ -290,44 +530,39 @@ CREATE TRIGGER IF NOT EXISTS trg_rollbacks_immutable_delete
 BEFORE DELETE ON integration_rollbacks
 BEGIN SELECT RAISE(ABORT, 'integration_rollbacks is immutable'); END;
 
-CREATE TABLE IF NOT EXISTS attempt_usage_receipts (
-  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
-  status TEXT NOT NULL CHECK (status IN ('COMPLETE', 'PARTIAL', 'UNKNOWN')),
-  input_tokens INTEGER,
-  output_tokens INTEGER,
-  reasoning_tokens INTEGER,
-  cache_read_tokens INTEGER,
-  cache_write_tokens INTEGER,
-  provider_steps INTEGER NOT NULL,
-  reported_cost_usd REAL,
-  reported_cost_source TEXT,
-  reference_cost_usd REAL,
-  pricing_basis_id TEXT,
-  source_backend TEXT NOT NULL,
-  source_artifact TEXT,
-  source_format TEXT NOT NULL,
-  malformed_events INTEGER NOT NULL DEFAULT 0,
+-- The scarce resource in its own units, sampled either side of every manager turn.
+--
+-- Token counts are an accounting of what was sent and generated. They are NOT known to be what a
+-- plan-authenticated subscription actually charges: billing categories and quota accounting need
+-- not coincide, and cache reads were 73% of dogfood run 5's strong total, so the difference is not
+-- a rounding error. Optimising "fewest tokens" while the plan meters something else would tune the
+-- wrong quantity confidently.
+--
+-- The provider's ORIGINAL response is stored verbatim. Any normalisation delegate-wave applies is a
+-- reading of that response and can be redone later; a percentage computed today cannot be
+-- un-computed when the shape turns out to mean something else.
+--
+-- Evidence only. Nothing enforces a quota from these rows: this exists to answer what one manager
+-- turn consumes, which must be known before anything is built to limit it.
+CREATE TABLE IF NOT EXISTS manager_rate_limit_snapshots (
+  id TEXT PRIMARY KEY,
+  manager_turn_id TEXT NOT NULL REFERENCES manager_turns(id),
+  boundary TEXT NOT NULL CHECK (boundary IN ('BEFORE', 'AFTER')),
+  -- NULL when the account exposes no rate-limit information at all, which is itself worth recording:
+  -- absence must be visible rather than inferred from a missing row.
+  raw_json TEXT,
   observed_at TEXT NOT NULL,
-  -- An UNKNOWN receipt carries no numbers at all: no tokens, no steps, and no cost of either kind.
-  -- malformed_events may still be nonzero, because an unreadable artifact is itself evidence that
-  -- malformed accounting existed even though no usable usage did.
-  CHECK (status != 'UNKNOWN' OR (
-    input_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL
-    AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
-    AND provider_steps = 0
-    AND reported_cost_usd IS NULL AND reported_cost_source IS NULL
-    AND reference_cost_usd IS NULL AND pricing_basis_id IS NULL
-  )),
-  -- A COMPLETE or PARTIAL receipt observed at least one usable step and every token dimension.
-  CHECK (status = 'UNKNOWN' OR (
-    input_tokens >= 0 AND output_tokens >= 0 AND reasoning_tokens >= 0
-    AND cache_read_tokens >= 0 AND cache_write_tokens >= 0
-    AND provider_steps >= 1
-  )),
-  CHECK (reported_cost_usd IS NULL OR reported_cost_usd >= 0),
-  CHECK (reference_cost_usd IS NULL OR reference_cost_usd >= 0),
-  CHECK (malformed_events >= 0)
+  UNIQUE (manager_turn_id, boundary)
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_rate_limits_immutable_update
+BEFORE UPDATE ON manager_rate_limit_snapshots
+BEGIN SELECT RAISE(ABORT, 'manager_rate_limit_snapshots is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_rate_limits_immutable_delete
+BEFORE DELETE ON manager_rate_limit_snapshots
+BEGIN SELECT RAISE(ABORT, 'manager_rate_limit_snapshots is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS attempt_usage_receipts (${ATTEMPT_USAGE_RECEIPTS_COLUMNS});
 
 CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_update
 BEFORE UPDATE ON attempt_usage_receipts
@@ -335,6 +570,148 @@ BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
 BEFORE DELETE ON attempt_usage_receipts
 BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END;
+
+-- One strong-manager run per managed job.
+--
+-- Mutable on purpose, unlike almost everything else here: this is the run's live position in its
+-- state machine, and it is the row a reboot reads to discover where it was. The immutable history of
+-- what the manager actually did lives in manager_turns and in events.
+--
+-- The round counters are the bounded-authority invariant. Token accounting depends on what a
+-- provider chooses to report; a turn ceiling does not, so the scarce resource stays bounded even
+-- when its usage is UNKNOWN.
+CREATE TABLE IF NOT EXISTS manager_runs (${MANAGER_RUNS_COLUMNS});
+
+-- One row per scarce-model call, recorded BEFORE the call is made.
+--
+-- Intent and result are separate states of the same row for the reason the Control API already
+-- established: a process that dies after an expensive call but before its response is durable must
+-- leave evidence that the call happened. Re-asking would be a second scarce call to answer a
+-- question that may already have been answered and paid for, which is precisely the resource this
+-- system exists to conserve.
+CREATE TABLE IF NOT EXISTS manager_turns (
+  id TEXT PRIMARY KEY,
+  manager_run_id TEXT NOT NULL REFERENCES manager_runs(id),
+  ordinal INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('PLAN', 'SYNTHESIS', 'REVIEW')),
+  state TEXT NOT NULL CHECK (state IN ('INTENDED', 'RUNNING', 'COMPLETED', 'FAILED', 'UNCERTAIN')),
+  model TEXT,
+  prompt_artifact TEXT,
+  response_artifact TEXT,
+  response_digest TEXT,
+  -- The parsed decision, small enough to live inline and the thing every later turn reads back.
+  action TEXT,
+  -- What this turn is a judgment ABOUT. Set for REVIEW; null for PLAN and SYNTHESIS.
+  --
+  -- This is the durable binding that makes "the reviewed candidate is the validated candidate is the
+  -- candidate offered for integration" a checkable fact rather than an inference. The tempting
+  -- alternative -- trusting that the candidate SHA appeared somewhere in the prompt artifact -- makes
+  -- the authoritative link a property of prose that a future orchestration bug can silently break,
+  -- validating attempt A while reviewing artifacts from attempt B. A foreign key cannot drift.
+  subject_attempt_id TEXT REFERENCES attempts(id),
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(manager_run_id, ordinal),
+  -- A review with no subject could never satisfy the acceptance gate, so it is refused at write time
+  -- rather than discovered as an unexplained refusal later.
+  CHECK (phase != 'REVIEW' OR state IN ('INTENDED', 'RUNNING') OR subject_attempt_id IS NOT NULL)
+);
+
+-- One immutable usage observation per manager turn.
+--
+-- Deliberately NOT attempt_usage_receipts. That table means one executor attempt, one observation,
+-- and widening it to cover a different kind of actor would make "cheap worker cost" and "scarce
+-- manager cost" indistinguishable in exactly the query the whole project is optimizing.
+--
+-- No reference_cost_usd column: the pricing bases price cheap-worker models against a common basis
+-- so two executors can be compared. A subscription-plan manager has no marginal token price, and
+-- inventing one would be the same fabrication the executor receipts refuse to make. Tokens and turns
+-- are what can honestly be reported, so tokens and turns are what is stored.
+CREATE TABLE IF NOT EXISTS manager_usage_receipts (${MANAGER_USAGE_RECEIPTS_COLUMNS});
+
+-- What delegate-wave asked for, what the executor can prove it launched, and what the runtime
+-- independently reported. Three levels, deliberately not two.
+--
+-- A configuration proves what delegate-wave asked the executor to do; only runtime evidence may
+-- claim what actually ran, and absence remains unknown. Collapsing "applied" into "actual" is the
+-- error Orca issue #10846 describes from the other side: a requested effort that silently vanishes
+-- from the launch args, with no way for the caller to tell it launched at the default.
+--
+-- Deliberately a separate receipt rather than new meanings for attempts.model and
+-- attempts.capability_profile. Those record what was REQUESTED at claim time and have always meant
+-- that; redefining them would rewrite the meaning of every historical row.
+--
+-- Orthogonal to attempt_usage_receipts. Cost evidence and identity evidence fail independently: a
+-- run can have perfect token accounting and unverifiable model identity, or verified identity and no
+-- usable cost. Neither receipt may stand in for the other's health.
+CREATE TABLE IF NOT EXISTS attempt_runtime_provenance (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  requested_model TEXT,
+  requested_effort TEXT,
+  requested_executor TEXT,
+  requested_capability_profile TEXT,
+  -- What the local executor can mechanically prove it SUPPLIED AT LAUNCH: the patch delegate-wave
+  -- wrote, the argv a CLI was invoked with. Strong evidence that intent reached the runtime, and no
+  -- evidence whatsoever about what a remote provider then served -- nor, without a config dump, that
+  -- every entry survived the runtime's own composition, since Harness skips entries it rejects and
+  -- only warns.
+  applied_model TEXT,
+  applied_effort TEXT,
+  applied_executor TEXT,
+  applied_capability_profile TEXT,
+  applied_source TEXT,
+  -- What the runtime or provider independently reported back. NULL means unknown, never "the same as
+  -- what we asked for".
+  observed_model TEXT,
+  observed_effort TEXT,
+  observed_source TEXT,
+  status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'PARTIAL', 'UNVERIFIED', 'CONTRADICTED')),
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_runtime_provenance_immutable_update
+BEFORE UPDATE ON attempt_runtime_provenance
+BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_runtime_provenance_immutable_delete
+BEFORE DELETE ON attempt_runtime_provenance
+BEGIN SELECT RAISE(ABORT, 'attempt_runtime_provenance is immutable'); END;
+
+-- A price derived over a receipt's tokens under a basis that did not exist when it was bought.
+--
+-- Separate from the receipt because the receipt is IMMUTABLE, and rightly so: it records what the
+-- provider said, and that observation is not revisable. A dollar figure is not part of that
+-- observation. It is a derivation over it, under a price list chosen later, and delegate-wave has
+-- already had to supersede one basis after discovering its rates were wrong -- so a price welded to
+-- an unrevisable row would have been unrepairable by construction.
+--
+-- Append-only, keyed by basis, so the same history can be priced under several bases and compared
+-- rather than overwritten. A receipt priced at observation time keeps that figure in its own row and
+-- needs nothing here.
+CREATE TABLE IF NOT EXISTS manager_receipt_pricings (
+  manager_turn_id TEXT NOT NULL REFERENCES manager_usage_receipts(manager_turn_id),
+  pricing_basis TEXT NOT NULL,
+  -- Empty rather than NULL: it is part of the key, and SQLite treats NULLs in a key as distinct,
+  -- which would let the same basis be recorded twice.
+  pricing_basis_version TEXT NOT NULL DEFAULT '',
+  reference_cost_usd REAL NOT NULL CHECK (reference_cost_usd >= 0),
+  derived_at TEXT NOT NULL,
+  PRIMARY KEY (manager_turn_id, pricing_basis, pricing_basis_version)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_manager_receipt_pricings_immutable_update
+BEFORE UPDATE ON manager_receipt_pricings
+BEGIN SELECT RAISE(ABORT, 'manager_receipt_pricings is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_manager_receipt_pricings_immutable_delete
+BEFORE DELETE ON manager_receipt_pricings
+BEGIN SELECT RAISE(ABORT, 'manager_receipt_pricings is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_update
+BEFORE UPDATE ON manager_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'manager_usage_receipts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_manager_usage_immutable_delete
+BEFORE DELETE ON manager_usage_receipts
+BEGIN SELECT RAISE(ABORT, 'manager_usage_receipts is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
 BEFORE UPDATE ON work_proposals
@@ -399,6 +776,19 @@ CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_
 CREATE INDEX IF NOT EXISTS idx_work_decisions_job ON work_proposal_decisions(job_id);
 CREATE INDEX IF NOT EXISTS idx_cancel_intents_job ON cancellation_intents(job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_rollbacks_proposal ON integration_rollbacks(proposal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_manager_turns_run ON manager_turns(manager_run_id, ordinal);
+`;
+
+// Indexes over columns that MIGRATIONS add.
+//
+// These cannot live in SCHEMA. openDatabase() runs SCHEMA first, where CREATE TABLE IF NOT EXISTS
+// leaves an existing table at its old shape, and only then runs migrate() to add columns. An index
+// in SCHEMA naming a migrated column therefore executes against a table that does not have it yet,
+// and opening any real pre-19 database throws "no such column" before a single migration runs.
+//
+// Fresh-root tests never see this: their tables are created by SCHEMA with every column present.
+const POST_MIGRATION_INDEXES = `
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 `;
 
 export function initializeDataRoot(root) {
@@ -471,6 +861,17 @@ function migrate(db) {
   if (!jobColumns.includes("capability_profile")) {
     db.exec("ALTER TABLE jobs ADD COLUMN capability_profile TEXT");
   }
+  // Every job that predates the semantic layer really was a direct job: one worker, the goal as its
+  // instruction. Defaulting them to `direct` records history rather than rewriting it.
+  if (!jobColumns.includes("strategy")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN strategy TEXT NOT NULL DEFAULT 'direct'");
+  }
+  if (!jobColumns.includes("parent_job_id")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT REFERENCES jobs(id)");
+  }
+  if (!jobColumns.includes("internal_kind")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN internal_kind TEXT");
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   if (!attemptColumns.includes("changed_files_json")) {
     // Null for attempts that predate the column: they genuinely have no record, and inventing an
@@ -500,6 +901,53 @@ function migrate(db) {
   if (!attemptColumns.includes("executor_intent_id")) {
     db.exec("ALTER TABLE attempts ADD COLUMN executor_intent_id TEXT");
   }
+  // Schema 19's attempt columns.
+  //
+  // Declaring these only in the fresh SCHEMA was a real defect, not a tidiness issue: an existing
+  // installation would be stamped schema 19 by the version write at the end of this function and
+  // then fail its very next runJob() INSERT, because the columns it names do not exist. Fresh-root
+  // tests cannot see this class of bug at all -- they create the table from SCHEMA and never migrate.
+  //
+  // Left NULL for attempts that predate them, which is the truth: those attempts were given the
+  // job's goal as their instruction, but no artifact of it was written and inventing a digest for a
+  // file that never existed would fabricate provenance.
+  for (const column of ["start_sha", "instruction_artifact", "instruction_digest", "result_text_artifact"]) {
+    if (!attemptColumns.includes(column)) {
+      db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
+    }
+  }
+  if (!attemptColumns.includes("budget_reservation_usd")) {
+    db.exec("ALTER TABLE attempts ADD COLUMN budget_reservation_usd REAL");
+  }
+  const workProposalColumns = db.prepare("PRAGMA table_info(work_proposals)").all().map((column) => column.name);
+  if (workProposalColumns.length) {
+    if (!workProposalColumns.includes("expected_base_sha")) {
+      db.exec("ALTER TABLE work_proposals ADD COLUMN expected_base_sha TEXT");
+    }
+    if (!workProposalColumns.includes("strategy")) {
+      db.exec("ALTER TABLE work_proposals ADD COLUMN strategy TEXT NOT NULL DEFAULT 'direct'");
+    }
+  }
+  const managerRunColumns = db.prepare("PRAGMA table_info(manager_runs)").all().map((column) => column.name);
+  if (managerRunColumns.length) {
+    if (!managerRunColumns.includes("requested_model")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN requested_model TEXT");
+    }
+    if (!managerRunColumns.includes("actual_model")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN actual_model TEXT");
+    }
+    if (!managerRunColumns.includes("accepted_attempt_id")) {
+      db.exec("ALTER TABLE manager_runs ADD COLUMN accepted_attempt_id TEXT REFERENCES attempts(id)");
+    }
+  }
+  const managerTurnColumns = db.prepare("PRAGMA table_info(manager_turns)").all().map((column) => column.name);
+  if (managerTurnColumns.length && !managerTurnColumns.includes("subject_attempt_id")) {
+    db.exec("ALTER TABLE manager_turns ADD COLUMN subject_attempt_id TEXT REFERENCES attempts(id)");
+  }
+  const managerUsageColumns = db.prepare("PRAGMA table_info(manager_usage_receipts)").all().map((column) => column.name);
+  if (managerUsageColumns.length && !managerUsageColumns.includes("total_tokens")) {
+    db.exec("ALTER TABLE manager_usage_receipts ADD COLUMN total_tokens INTEGER");
+  }
   const proposalColumns = db.prepare("PRAGMA table_info(integration_proposals)").all().map((column) => column.name);
   if (!proposalColumns.includes("validation_plan_json")) {
     db.exec("ALTER TABLE integration_proposals ADD COLUMN validation_plan_json TEXT NOT NULL DEFAULT '[]'");
@@ -526,7 +974,172 @@ function migrate(db) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
     }
   }
+  // Only now that every column exists.
+  db.exec(POST_MIGRATION_INDEXES);
+  // And only now that every table enforces what the fresh schema enforces.
+  rebuildConstrainedTables(db);
   db.prepare("UPDATE metadata SET value = ? WHERE key = 'schema_version'").run(SCHEMA_VERSION);
+}
+
+// Brings tables whose CHECK constraints were added by ALTER TABLE up to the canonical definition.
+//
+// A migrated database that merely has the right COLUMNS is not the same database as a fresh one. It
+// accepts `strategy = 'nonsense'`, an internal job with no parent, and every other state the fresh
+// CHECKs reject -- so an orchestration bug becomes installation-specific and survives every
+// fresh-root test. The schema version must not be stamped until this is untrue.
+//
+// SQLite's documented table-rebuild procedure, followed exactly:
+//
+//   PRAGMA foreign_keys = OFF        (must be outside a transaction, or it is a silent no-op)
+//   BEGIN
+//     create the replacement from the SAME DDL text the fresh schema uses
+//     copy every row
+//     drop the original, rename the replacement
+//     recreate indexes and triggers, which the drop removed
+//     PRAGMA foreign_key_check       (rollback on any row)
+//   COMMIT
+//   PRAGMA foreign_keys = ON
+function rebuildConstrainedTables(db) {
+  const definition = (name) => db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(name)?.sql ?? "";
+
+  const pending = [];
+  // Detected from the stored DDL rather than from the schema version: a database part-way through an
+  // interrupted upgrade must be judged on what it actually contains.
+  if (definition("jobs") && !definition("jobs").includes("strategy IN ('direct', 'managed')")) {
+    pending.push({
+      name: "jobs",
+      columns: JOBS_COLUMNS,
+      // Named explicitly rather than SELECT *: column order after successive ALTER TABLE ADD COLUMN
+      // is not the order of the canonical definition, and a positional copy would silently transpose
+      // values into the wrong columns.
+      copy: `id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+             capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at`,
+      after: [
+        "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id)",
+      ],
+    });
+  }
+  if (definition("work_proposals") && !definition("work_proposals").includes("strategy IN ('direct', 'managed')")) {
+    pending.push({
+      name: "work_proposals",
+      columns: WORK_PROPOSALS_COLUMNS,
+      copy: `id, project_id, goal, mode, action_digest, expected_state_version, expected_base_sha,
+             strategy, maximum_cost, expires_at, idempotency_key, origin_principal, origin_channel,
+             created_at`,
+      after: [
+        "CREATE INDEX IF NOT EXISTS idx_work_proposals_project ON work_proposals(project_id, created_at)",
+        `CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_update
+         BEFORE UPDATE ON work_proposals
+         BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END`,
+        `CREATE TRIGGER IF NOT EXISTS trg_work_proposals_immutable_delete
+         BEFORE DELETE ON work_proposals
+         BEGIN SELECT RAISE(ABORT, 'work_proposals is immutable'); END`,
+      ],
+    });
+  }
+  if (definition("attempt_usage_receipts")
+    && !definition("attempt_usage_receipts").includes("NO_PROVIDER_CONTACT")) {
+    pending.push({
+      name: "attempt_usage_receipts",
+      columns: ATTEMPT_USAGE_RECEIPTS_COLUMNS,
+      // Positional copies transpose after ALTER TABLE, so every column is named. Historical rows
+      // migrate unchanged: a receipt written as UNKNOWN under the old semantics stays UNKNOWN,
+      // because it was a correct observation of what was knowable at the time.
+      copy: `attempt_id, status, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+             cache_write_tokens, provider_steps, reported_cost_usd, reported_cost_source,
+             reference_cost_usd, pricing_basis_id, source_backend, source_artifact, source_format,
+             malformed_events, observed_at`,
+      after: [
+        `CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_update
+         BEFORE UPDATE ON attempt_usage_receipts
+         BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END`,
+        `CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
+         BEFORE DELETE ON attempt_usage_receipts
+         BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END`,
+      ],
+    });
+  }
+  if (definition("validation_runs") && !definition("validation_runs").includes("CHECK_DID_NOT_RUN")) {
+    pending.push({
+      name: "validation_runs",
+      columns: VALIDATION_RUNS_COLUMNS,
+      // Historical rows are migrated on their own terms: every existing row DID run, because the
+      // old schema could not represent anything else, so outcome derives from the exit code it
+      // recorded. That is a faithful reading of what those rows meant, not a reinterpretation --
+      // including run 5's, which genuinely did execute an interpreter that then refused the line.
+      copy: null,
+      insert: `INSERT INTO validation_runs_rebuilt
+                 (id, attempt_id, command, exit_code, outcome, did_not_run_reason,
+                  output_path, started_at, finished_at)
+               SELECT id, attempt_id, command, exit_code,
+                      CASE WHEN exit_code = 0 THEN 'PASSED' ELSE 'CHECK_FAILED' END,
+                      NULL, output_path, started_at, finished_at
+               FROM validation_runs`,
+      after: [],
+    });
+  }
+  if (definition("manager_runs") && !definition("manager_runs").includes("SYNTHESIZING")) {
+    pending.push({
+      name: "manager_runs",
+      columns: MANAGER_RUNS_COLUMNS,
+      copy: `id, job_id, status, requested_model, actual_model, thread_id, exploration_round,
+             revision_round, max_exploration_rounds, max_revision_rounds, max_turns,
+             active_child_job_id, last_candidate_attempt_id, accepted_attempt_id,
+             escalation_question, created_at, updated_at`,
+      after: [],
+    });
+  }
+  if (definition("manager_usage_receipts")
+      && !definition("manager_usage_receipts").includes("reference_cost_usd")) {
+    pending.push({
+      name: "manager_usage_receipts",
+      columns: MANAGER_USAGE_RECEIPTS_COLUMNS,
+      // Historical receipts keep their tokens and gain NULL cost, which is the truthful value: they
+      // were observed before any basis priced this model. Because the tokens survive, adding a basis
+      // later can price them retroactively without re-running anything.
+      copy: `manager_turn_id, status, input_tokens, output_tokens, reasoning_tokens,
+             cache_read_tokens, cache_write_tokens, total_tokens, source, observed_at`,
+      after: [],
+    });
+  }
+  if (pending.length === 0) return;
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const table of pending) {
+        const temporary = `${table.name}_rebuilt`;
+        db.exec(`DROP TABLE IF EXISTS ${temporary}`);
+        db.exec(`CREATE TABLE ${temporary} (${table.columns})`);
+        db.exec(table.insert
+          ?? `INSERT INTO ${temporary} (${table.copy}) SELECT ${table.copy} FROM ${table.name}`);
+        db.exec(`DROP TABLE ${table.name}`);
+        db.exec(`ALTER TABLE ${temporary} RENAME TO ${table.name}`);
+        for (const statement of table.after) db.exec(statement);
+      }
+      // Every reference must still resolve. A rebuild that orphaned an attempt or a proposal decision
+      // has corrupted operational truth, and committing it would be worse than never migrating.
+      const violations = db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length) {
+        throw new Error(
+          `Refusing to migrate: rebuilding ${pending.map((t) => t.name).join(", ")} left `
+          + `${violations.length} broken foreign key reference(s)`,
+        );
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    // Restored on every path, including the failure path: leaving a live connection with foreign
+    // keys disabled would silently relax every constraint for the rest of the process.
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }
 
 export function transaction(db, action) {

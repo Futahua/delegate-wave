@@ -18,13 +18,19 @@ import {
   resolveRevision,
   updateRefCas,
 } from "./git.js";
-import { runShell } from "./process.js";
+import { referenceCostUsd } from "./pricing.js";
+import { assertNotShellComposed, runCommand, runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
-import { finalizeUsageReceipt, observeOpenCodeArtifact } from "./usage.js";
+import { readFinalText } from "./manager/runtime.js";
+import { instructionDigest } from "./manager/contracts.js";
+import { finalizeUsageReceipt, noProviderContactObservation, observeOpenCodeArtifact } from "./usage.js";
+import { assessExperimentalCondition, deriveProvenanceStatus } from "./provenance.js";
 import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
   readRestoreMarker, clearRestoreMarker,
 } from "./recovery.js";
+
+const ROOTS_ONLY = "parent_job_id IS NULL";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -43,6 +49,13 @@ const OVERVIEW_PROJECT_LIMIT = 20;
 const OVERVIEW_ATTENTION_LIMIT = 20;
 const OVERVIEW_SUMMARY_LIMIT = 160;
 const OVERVIEW_BYTE_LIMIT = 3 * 1024;
+
+// The one job shape that may run alongside its siblings. All three conditions are required: an
+// internal exploration that was somehow write-mode could produce a candidate, and two candidates
+// racing for one root is exactly what serialization exists to prevent.
+const isParallelExploration = (job) => Boolean(
+  job && job.parent_job_id && job.internal_kind === "MANAGER_EXPLORATION" && job.mode === "read",
+);
 
 const lifecycleActive = (alias = "") => {
   const p = alias ? `${alias}.` : "";
@@ -63,6 +76,7 @@ function parseValidationPlan(value) {
   if (!Array.isArray(parsed) || parsed.some((command) => typeof command !== "string" || !command.trim())) {
     throw new Error("Stored validation plan must be an array of non-empty command strings");
   }
+  for (const command of parsed) assertNotShellComposed(command);
   return parsed;
 }
 
@@ -87,6 +101,8 @@ function compactOverviewText(value) {
 
 export class Dispatcher {
   constructor({ root, backend, router = null, updateRef = updateRefCas }) {
+    // Per-repository serialization for Git operations that take a repo-wide lock.
+    this.repositoryLocks = new Map();
     this.root = root;
     this.paths = managedPaths(root);
     this.db = openDatabase(this.paths.database);
@@ -109,6 +125,9 @@ export class Dispatcher {
   close() { this.db.close(); }
 
   async addProject({ name, repoPath, branch = "HEAD", validation = [], protectedPaths = [] }) {
+    // Checked here rather than only at run time, so a plan that can never execute is rejected while
+    // someone is looking at it -- not mid-run, against a candidate it would then appear to condemn.
+    for (const command of validation) assertNotShellComposed(command);
     const resolvedPath = path.resolve(repoPath);
     await assertRepository(resolvedPath);
     const integrationBranch = branch === "HEAD"
@@ -139,32 +158,81 @@ export class Dispatcher {
 
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
-  insertJobRow({ projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null }) {
+  insertJobRow({
+    projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null,
+    strategy = "direct", parentJobId = null, internalKind = null,
+  }) {
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
       id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
-      capability_profile, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`).run(
+      capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost,
-      capabilityProfile, timestamp, timestamp,
+      capabilityProfile, strategy, parentJobId, internalKind, timestamp, timestamp,
     );
-    recordEvent(this.db, { kind: "JOB_CREATED", entityType: "job", entityId: jobId, payload: { baseSha, mode } });
+    recordEvent(this.db, {
+      kind: "JOB_CREATED", entityType: "job", entityId: jobId,
+      payload: { baseSha, mode, strategy, parentJobId, internalKind },
+    });
     return this.getJob(jobId);
   }
 
   async createJob({
     projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null, capabilityProfile = null,
+    strategy = "direct", parentJobId = null, internalKind = null,
   }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!['read', 'write'].includes(mode)) throw new Error("mode must be read or write");
-    const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
+    if (!["direct", "managed"].includes(strategy)) throw new Error("strategy must be direct or managed");
+
+    // A child job carries no ceiling of its own, and this is refused rather than ignored.
+    //
+    // Authority over spending belongs to one family, held by the root. Letting a child carry its own
+    // number would create a second authority that nothing reconciles: five explorations at $0.10
+    // each would each pass their own check while spending five times what the operator authorized.
+    // Silently discarding the argument would be worse than refusing it, because the caller would go
+    // on believing the child was bounded by the figure it supplied.
+    if (parentJobId) {
+      const parent = this.getJob(parentJobId);
+      if (!parent) throw new Error(`Unknown parent job: ${parentJobId}`);
+      if (parent.project_id !== projectId) {
+        throw new Error("A child job must belong to the same project as its parent");
+      }
+      if (parent.parent_job_id) {
+        // Nesting depth one. A child that could commission children turns a bounded delegation into
+        // a recursive one, and the cap that made it affordable stops meaning anything.
+        throw new Error("Delegation nests one level: a child job may not commission further children");
+      }
+      if (maximumCost !== null) {
+        throw new Error(
+          "A child job may not carry its own cost ceiling; it settles against its parent's family budget",
+        );
+      }
+    } else if (internalKind) {
+      throw new Error("An internal job requires a parent job");
+    }
+
+    // A child inherits its parent's authorized world; it does not resolve its own.
+    //
+    // Resolving the branch fresh for a child is a mixed-world bug with a plausible face: the root is
+    // authorized against A, the branch moves to B, and an investigation commissioned to inform work
+    // on A comes back describing B. The manager then writes a brief for a repository that is not the
+    // one being changed, and every individual step looks correct.
+    //
+    // This is also the premise assertAuthorizedBaseIntact() relies on when it skips children: they
+    // are not independently authorized, so there is nothing of their own to re-check.
+    const parent = parentJobId ? this.getJob(parentJobId) : null;
+    const baseSha = parent
+      ? parent.base_sha
+      : await resolveRevision(project.repo_path, project.integration_branch);
     // Validated at creation, so an unusable profile is refused when the job is described rather
     // than discovered when a worker is about to run.
     if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
     return transaction(this.db, () => this.insertJobRow({
       projectId, goal, mode, maxAttempts, baseSha, maximumCost, capabilityProfile,
+      strategy, parentJobId, internalKind,
     }));
   }
 
@@ -175,9 +243,13 @@ export class Dispatcher {
   // Digest of the requested action only. The expiry is deliberately excluded: it may be defaulted
   // from the clock, and including it would make two identical retries hash differently and defeat
   // the idempotency key.
-  workActionDigest({ projectId, goal, mode, maximumCost, expectedStateVersion }) {
+  // Every bound the proposal makes, including the world it was written against and how it will be
+  // executed. Anything outside this hash is a field an operator could be shown at proposal time and
+  // silently authorize differently.
+  workActionDigest({ projectId, goal, mode, maximumCost, expectedStateVersion, strategy, expectedBaseSha }) {
     return crypto.createHash("sha256").update(JSON.stringify([
       projectId, goal, mode, maximumCost ?? null, expectedStateVersion ?? null,
+      strategy ?? "direct", expectedBaseSha ?? null,
     ])).digest("hex");
   }
 
@@ -193,13 +265,15 @@ export class Dispatcher {
       .slice(0, 16);
   }
 
-  proposeWork({
+  async proposeWork({
     projectId, goal, mode = "write", maximumCost = null, expiresAt = null,
-    expectedStateVersion = null, idempotencyKey, principal, origin,
+    expectedStateVersion = null, expectedBaseSha = null, strategy = "direct",
+    idempotencyKey, principal, origin,
   }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     if (!["read", "write"].includes(mode)) throw new Error("mode must be read or write");
+    if (!["direct", "managed"].includes(strategy)) throw new Error("strategy must be direct or managed");
     if (typeof goal !== "string" || !goal.trim()) throw new Error("goal must be a non-empty string");
     if (!idempotencyKey || typeof idempotencyKey !== "string") throw new Error("idempotency_key is required");
     if (!principal || !origin) throw new Error("Proposal origin identity is required");
@@ -212,8 +286,17 @@ export class Dispatcher {
     if (Number.isNaN(Date.parse(expiry))) throw new Error("expires_at must be an ISO timestamp");
 
     const stateVersion = expectedStateVersion || this.projectStateVersion(projectId);
+    // The repository state this proposal was written against.
+    //
+    // projectStateVersion() hashes delegate-wave's own job rows, which says nothing whatsoever about
+    // the code. A proposal reasoned about repository version A could be authorized against version B
+    // with that hash unchanged -- and since authorization resolves the branch head fresh, the system
+    // would report that the world matched while the only world that matters had moved underneath it.
+    const baseSha = expectedBaseSha
+      || await resolveRevision(project.repo_path, project.integration_branch);
     const actionDigest = this.workActionDigest({
       projectId, goal: goal.trim(), mode, maximumCost, expectedStateVersion: stateVersion,
+      strategy, expectedBaseSha: baseSha,
     });
 
     const proposalId = id("wprop");
@@ -230,15 +313,15 @@ export class Dispatcher {
         return this.getWorkProposal(existing.id);
       }
       this.db.prepare(`INSERT INTO work_proposals(
-        id, project_id, goal, mode, action_digest, expected_state_version, maximum_cost,
-        expires_at, idempotency_key, origin_principal, origin_channel, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        proposalId, projectId, goal.trim(), mode, actionDigest, stateVersion,
-        maximumCost, expiry, idempotencyKey, principal, origin, timestamp,
+        id, project_id, goal, mode, action_digest, expected_state_version, expected_base_sha,
+        strategy, maximum_cost, expires_at, idempotency_key, origin_principal, origin_channel, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        proposalId, projectId, goal.trim(), mode, actionDigest, stateVersion, baseSha,
+        strategy, maximumCost, expiry, idempotencyKey, principal, origin, timestamp,
       );
       recordEvent(this.db, {
         kind: "WORK_PROPOSED", entityType: "work_proposal", entityId: proposalId,
-        payload: { projectId, mode, origin, principal },
+        payload: { projectId, mode, origin, principal, strategy, expectedBaseSha: baseSha },
       });
       return this.getWorkProposal(proposalId);
     });
@@ -260,7 +343,42 @@ export class Dispatcher {
 
   // The human gate. Turns one exact proposal into one job, under operator identity, and refuses
   // anything the proposal did not already bound.
-  assertAuthorizable(proposal) {
+  // Refuses to spend money on work whose authorized world has already moved.
+  //
+  // Authorization observes the branch at one instant; time passes before a worker starts. This is
+  // the cheap guard that closes that window at the moment it begins to matter -- when real cost is
+  // about to be incurred -- rather than pretending the authorization transaction held a lock on a
+  // Git ref it cannot lock.
+  //
+  //   proposal created against A
+  //     -> authorization observes branch == A
+  //     -> before the first paid attempt, branch must still be A
+  //     -> worker starts on A
+  //     -> later movement is ordinary concurrency, and integration CAS still protects Git truth
+  //
+  // Only for the FIRST attempt of a ROOT job. A retry is already committed to its job's base, and a
+  // manager's exploration child inherits a base its parent established; re-checking either would
+  // abandon work mid-flight over movement that no longer changes what is being built.
+  async assertAuthorizedBaseIntact(job, project) {
+    if (job.parent_job_id) return null;
+    const previousAttempts = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?",
+    ).get(job.id).count;
+    if (previousAttempts > 0) return null;
+    const head = await resolveRevision(project.repo_path, project.integration_branch);
+    if (head !== job.base_sha) {
+      throw new Error(
+        `Job ${job.id} was authorized against ${job.base_sha.slice(0, 12)} but ${project.integration_branch} `
+        + `is now at ${head.slice(0, 12)}; refusing to start paid work against a different base`,
+      );
+    }
+    return head;
+  }
+
+  // `currentBaseSha` is the branch head resolved at authorization time. Compared for exact equality
+  // against the head the proposal was written against: a proposal is a statement about one world,
+  // and authorizing it against a different one silently substitutes work nobody proposed.
+  assertAuthorizable(proposal, { currentBaseSha = null } = {}) {
     if (Date.parse(proposal.expires_at) <= Date.now()) {
       throw new Error(`Work proposal ${proposal.id} expired at ${proposal.expires_at}`);
     }
@@ -271,10 +389,20 @@ export class Dispatcher {
         + `but the project is at ${currentVersion}`,
       );
     }
+    // Proposals that predate this binding carry no recorded head and cannot be checked against one;
+    // they are still bounded by their state version and expiry. New proposals always carry it.
+    if (proposal.expected_base_sha && currentBaseSha && proposal.expected_base_sha !== currentBaseSha) {
+      throw new Error(
+        `Work proposal ${proposal.id} was written against ${proposal.expected_base_sha.slice(0, 12)} `
+        + `but the branch is now at ${currentBaseSha.slice(0, 12)}; re-propose against the current state`,
+      );
+    }
     // Re-derive the digest so a tampered stored row cannot authorize different work than proposed.
+    // Strategy and base are inside it, so neither can be edited after the operator saw the proposal.
     const expected = this.workActionDigest({
       projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode,
       maximumCost: proposal.maximum_cost, expectedStateVersion: proposal.expected_state_version,
+      strategy: proposal.strategy, expectedBaseSha: proposal.expected_base_sha,
     });
     if (expected !== proposal.action_digest) {
       throw new Error(`Work proposal ${proposal.id} action digest does not match its stored intent`);
@@ -294,12 +422,13 @@ export class Dispatcher {
       if (preliminary.decision.decision === "AUTHORIZED") return preliminary;
       throw new Error(`Work proposal ${proposalId} was already rejected`);
     }
-    this.assertAuthorizable(preliminary);
-
     const project = this.getProject(preliminary.project_id);
     if (!project) throw new Error(`Unknown project: ${preliminary.project_id}`);
-    // Async Git resolution must happen outside the transaction.
+    // Async Git resolution must happen outside the transaction, and it must happen BEFORE the first
+    // authorizability check: the head is one of the things being checked, so resolving it afterwards
+    // would leave the branch unverified on the path that matters.
     const baseSha = await resolveRevision(project.repo_path, project.integration_branch);
+    this.assertAuthorizable(preliminary, { currentBaseSha: baseSha });
 
     return transaction(this.db, () => {
       // Re-read under BEGIN IMMEDIATE: a concurrent request may have decided this proposal since
@@ -309,11 +438,23 @@ export class Dispatcher {
         if (proposal.decision.decision === "AUTHORIZED") return this.getWorkProposal(proposalId);
         throw new Error(`Work proposal ${proposalId} was already rejected`);
       }
-      this.assertAuthorizable(proposal);
+      // Re-checked inside the transaction against the SAME head resolved above.
+      //
+      // Deliberately NOT a second Git observation, and this check does not detect branch movement.
+      // It guards against the proposal ROW changing between the two calls -- a concurrent decision,
+      // an edited digest. SQLite cannot lock an externally mutable Git ref, and pretending otherwise
+      // would be a comforting comment rather than an invariant.
+      //
+      // So authorization is an observation at one instant: the branch was at `baseSha` when it was
+      // read. The window between that read and the worker starting is closed separately, by
+      // assertAuthorizedBaseIntact() before the first paid attempt.
+      this.assertAuthorizable(proposal, { currentBaseSha: baseSha });
 
       // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
-      // bound the scheduler keeps, not a note.
+      // bound the scheduler keeps, not a note. Its strategy travels the same way -- a managed
+      // proposal must produce a managed job, or the operator authorized one thing and got another.
       const job = this.insertJobRow({
+        strategy: proposal.strategy ?? "direct",
         projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
         maximumCost: proposal.maximum_cost,
       });
@@ -356,7 +497,34 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
   }
 
+  // --- Three sizes of the same world ------------------------------------------------------------
+  //
+  //   everyday      the ROOT job. What a person asked for.
+  //   accounting    the whole FAMILY. What it cost, and what recovery must reason about.
+  //   detailed      a root with its children, on request.
+  //
+  // A manager's exploration children are real jobs with real cost and real evidence, and they stay
+  // fully visible to doctor, reconciliation, family spend and attempt recovery. They are not work
+  // the operator asked for, so listing them on an everyday surface turns the product into its own
+  // implementation: "Investigate cancellation semantics -- Done -- $0.0014" is plumbing wearing the
+  // costume of a deliverable.
+  //
+  // Filtered at the SQL projection rather than in presentation, because these rows do not merely get
+  // displayed. They feed totals, per-project attention counts, which project looks busiest, and
+  // truncation arithmetic -- a caller that filtered only the final text would still be reading
+  // numbers that had counted them.
   listJobs(projectId = null) {
+    if (projectId) {
+      return this.db.prepare(
+        `SELECT * FROM jobs WHERE project_id = ? AND ${ROOTS_ONLY} ORDER BY created_at DESC`,
+      ).all(projectId);
+    }
+    return this.db.prepare(`SELECT * FROM jobs WHERE ${ROOTS_ONLY} ORDER BY created_at DESC`).all();
+  }
+
+  // Every job, internal children included. For recovery, forensics and accounting; never for an
+  // everyday surface.
+  listAllJobs(projectId = null) {
     if (projectId) return this.db.prepare("SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at DESC").all(projectId);
     return this.db.prepare("SELECT * FROM jobs ORDER BY created_at DESC").all();
   }
@@ -372,7 +540,7 @@ export class Dispatcher {
 
   attention() {
     const jobs = this.db.prepare(`SELECT * FROM jobs
-      WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+      WHERE status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION') AND ${ROOTS_ONLY}
       ORDER BY updated_at`).all();
     const unresolvedIntegrations = this.doctor().unresolved_integrations;
     // A proposal nobody can see is a proposal nobody acts on: surface it in the normal path rather
@@ -390,7 +558,7 @@ export class Dispatcher {
     const jobTotals = this.db.prepare(`SELECT
       COALESCE(SUM(CASE WHEN status = 'NEEDS_ATTENTION' THEN 1 ELSE 0 END), 0) AS needs_attention,
       COALESCE(SUM(CASE WHEN status = 'READY_FOR_INTEGRATION' THEN 1 ELSE 0 END), 0) AS ready_for_integration
-      FROM jobs`).get();
+      FROM jobs WHERE ${ROOTS_ONLY}`).get();
     const unresolvedIntegrations = doctor.unresolved_integrations.length;
     const activeAttempts = doctor.running_attempts.length;
     const pendingProposalTotal = this.db.prepare(`SELECT COUNT(*) AS count FROM work_proposals w
@@ -400,11 +568,11 @@ export class Dispatcher {
         p.id,
         p.name,
         p.integration_branch,
-        (SELECT j.id FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_id,
-        (SELECT j.status FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_status,
-        (SELECT j.updated_at FROM jobs j WHERE j.project_id = p.id ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_updated_at,
-        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'NEEDS_ATTENTION') AS needs_attention,
-        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND j.status = 'READY_FOR_INTEGRATION') AS ready_for_integration
+        (SELECT j.id FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_id,
+        (SELECT j.status FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_status,
+        (SELECT j.updated_at FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} ORDER BY j.updated_at DESC, j.id DESC LIMIT 1) AS latest_job_updated_at,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} AND j.status = 'NEEDS_ATTENTION') AS needs_attention,
+        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id AND ${ROOTS_ONLY} AND j.status = 'READY_FOR_INTEGRATION') AS ready_for_integration
       FROM projects p
       ORDER BY (needs_attention + ready_for_integration) DESC,
         COALESCE(latest_job_updated_at, p.created_at) DESC,
@@ -465,7 +633,7 @@ export class Dispatcher {
           j.updated_at AS updated_at,
           CASE WHEN j.status = 'NEEDS_ATTENTION' THEN 1 ELSE 2 END AS priority
         FROM jobs j JOIN projects p ON p.id = j.project_id
-        WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION')
+        WHERE j.status IN ('NEEDS_ATTENTION', 'READY_FOR_INTEGRATION') AND j.${ROOTS_ONLY}
       )
       ORDER BY priority, updated_at DESC, id
       LIMIT ?`)
@@ -519,7 +687,24 @@ export class Dispatcher {
     return resolved;
   }
 
-  async runJob(jobId, { model = null } = {}) {
+  // Runs one attempt.
+  //
+  // `instruction` is the seam this whole layer exists for. Before it, every attempt received
+  // `job.goal` -- the human's sentence -- which meant the strong model's only channel into execution
+  // was the same string the human typed, and attempt 2 received it again byte-for-byte. Retry was a
+  // re-roll rather than iterative problem solving.
+  //
+  // Direct mode still passes the goal, explicitly, right here. That explicitness matters: the
+  // fallback lives at the dispatcher where "direct" is a deliberate choice, not inside the backend
+  // where a managed attempt missing its brief would silently receive the objective instead and
+  // reintroduce the exact collapse this seam undoes.
+  //
+  // `startSha` is where the worktree begins, which is NOT what the candidate is measured against. A
+  // revision starts from the previous candidate so it corrects an implementation rather than
+  // rewriting one from nothing, while snapshotCandidate still measures the result against the
+  // AUTHORIZED base, so what is offered for integration remains one complete net change from what
+  // the operator approved.
+  async runJob(jobId, { model = null, instruction = null, startSha = null, reservationRequest = null } = {}) {
     model = this.resolveModel(model);
     // Selected from the resolved model, before the attempt exists, and held for the whole attempt.
     // A job may ask for a narrower worker; otherwise the system default applies.
@@ -532,37 +717,87 @@ export class Dispatcher {
     if (!['PENDING', 'NEEDS_ATTENTION'].includes(job.status)) throw new Error(`Job ${jobId} is ${job.status}`);
     const project = this.getProject(job.project_id);
     const validationPlan = job.mode === "write" ? parseValidationPlan(project.validation_json) : [];
+    // Fails closed for managed work.
+    //
+    // `instruction ?? job.goal` for every strategy was the same collapse one level up: a managed
+    // attempt that lost its brief would quietly execute the human's sentence, produce a plausible
+    // candidate, and reach review with nothing in the record showing the manager's instruction never
+    // arrived. Direct mode resolves the objective as its instruction here, explicitly, because
+    // "direct" is a deliberate choice; managed mode has no default at all.
+    if (job.strategy !== "direct" && (typeof instruction !== "string" || !instruction.trim())) {
+      throw new Error(
+        `Job ${jobId} is a ${job.strategy} job and requires an explicit instruction; `
+        + "refusing to substitute the objective for a manager brief",
+      );
+    }
+    const instructionText = job.strategy === "direct" ? (instruction ?? job.goal) : instruction;
+    const startFrom = startSha ?? job.base_sha;
+    // Checked before the claim, because the claim is the point of no return for spending.
+    await this.assertAuthorizedBaseIntact(job, project);
     const claim = transaction(this.db, () => {
       const current = this.getJob(jobId);
       if (!current || !['PENDING', 'NEEDS_ATTENTION'].includes(current.status)) {
         throw new Error(`Job ${jobId} cannot be claimed from ${current?.status ?? "missing"}`);
       }
-      const runningJob = this.db.prepare("SELECT id FROM jobs WHERE status = 'RUNNING' LIMIT 1").get();
-      if (runningJob) throw new Error(`Bootstrap scheduler already has running job ${runningJob.id}`);
-      const conflict = this.db.prepare(`SELECT id FROM attempts WHERE ${lifecycleActive()} LIMIT 1`).get();
-      if (conflict) throw new Error(`Bootstrap scheduler already has live attempt ${conflict.id}`);
+      // A managed root sits at RUNNING for the whole life of its manager run, including while its
+      // manager is thinking and no worker exists. Counting that as "a job is running" would make the
+      // root block its own next attempt and its own exploration children -- it would be the only
+      // thing preventing the work it is supervising.
+      //
+      // The job's own family is therefore excluded here. The authoritative concurrency check is the
+      // live-attempt query below, which counts actual workers rather than lifecycle labels.
+      this.assertAdmissible(jobId);
       const previousAttempts = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       if (previousAttempts >= current.max_attempts) throw new Error(`Job ${jobId} exhausted its ${current.max_attempts} attempts`);
       // Checked inside the claim transaction, so a ceiling cannot be raced by two starts.
-      this.assertWithinBudget(jobId, current.maximum_cost);
+      //
+      // Resolved rather than passed in. Handing `current.maximum_cost` to the gate would ask a child
+      // job about its own ceiling, which is NULL by construction -- so every exploration would pass
+      // unbounded while the family it belongs to was already over budget. The authority is the
+      // family's, and only the family can answer.
+      this.assertWithinBudget(jobId);
       const ordinal = previousAttempts + 1;
       const attemptId = `${job.id}.${ordinal}`;
       const worktreePath = path.join(this.paths.worktrees, project.id, `attempt-${ordinal}-${job.id.slice(-8)}`);
-      const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
-      const epoch = currentEpoch + 1;
-      this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'scheduler_epoch'").run(String(epoch));
+      // The GENERATION this attempt belongs to -- not a per-attempt sequence number.
+      //
+      // This integer used to be incremented on every claim, and acceptAttemptEvent required the
+      // attempt's value to equal the CURRENT global value. Together those meant "only the newest
+      // attempt anyone created may speak", which was true and harmless while exactly one attempt
+      // could be alive. Under concurrency it is fatal: start sibling B and sibling A's executor
+      // result, usage receipt and terminal transition are all rejected as stale, so the second
+      // exploration silently invalidates the first.
+      //
+      // The integer now carries only the meaning it always needed to: which scheduler incarnation
+      // owns callbacks. It advances on restart, takeover and reconciliation -- never per attempt --
+      // so siblings share a generation and coexist, while a callback from a scheduler that has since
+      // been superseded is still fenced out. Per-attempt identity is carried where it belongs, by
+      // the attempt id and its executor/validation intent ids.
+      const epoch = this.schedulerGeneration();
+
+      // Authority for this attempt's spend, claimed atomically with the attempt itself.
+      const reservation = this.admitAttempt({ jobId, requested: reservationRequest });
+
       this.db.prepare(`INSERT INTO attempts(
         id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
-        scheduler_pid, worktree_path, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        scheduler_pid, worktree_path, started_at, start_sha, instruction_digest,
+        budget_reservation_usd
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         attemptId, jobId, ordinal, epoch, backend.constructor.name,
         // Recorded before the worker starts: the authority a worker ran under is evidence, not a
         // detail to be reconstructed afterwards from which artifacts happen to exist.
         backend.profile ?? null,
         model, process.pid, worktreePath, now(),
+        // Both recorded in the claim, before any worker runs. The digest is what makes "attempt 2 was
+        // told something different from attempt 1" a mechanical fact rather than the manager's word.
+        startFrom, instructionDigest(instructionText),
+        reservation,
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
-      recordEvent(this.db, { kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch });
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CREATED", entityType: "attempt", entityId: attemptId, epoch,
+        payload: { reservation_usd: reservation },
+      });
       return { epoch, ordinal, attemptId, worktreePath };
     });
     const { epoch, attemptId, worktreePath } = claim;
@@ -571,7 +806,21 @@ export class Dispatcher {
     let executorIntentId = null;
 
     try {
-      await createDetachedWorktree(project.repo_path, worktreePath, job.base_sha);
+      // Created from startFrom, measured against job.base_sha. Identical for every direct attempt
+      // and for a first managed attempt; they diverge only when a revision builds on a candidate.
+      //
+      // Serialized per repository. `git worktree add` takes a lock under .git/worktrees, and
+      // concurrent investigations against one repository can collide on it -- which surfaced exactly
+      // once in four full-suite runs as an investigation failing for a reason that had nothing to do
+      // with its task. Only this step is serialized; the workers themselves still run together, and
+      // they are where the wall time actually goes.
+      await this.withRepositoryLock(project.repo_path, () =>
+        createDetachedWorktree(project.repo_path, worktreePath, startFrom));
+      // Written before the worker runs, so the exact text it received survives independently of
+      // whatever the worker does with it.
+      const instructionPath = path.join(artifactDir, "instruction.txt");
+      fs.writeFileSync(instructionPath, instructionText);
+      this.db.prepare("UPDATE attempts SET instruction_artifact = ? WHERE id = ?").run(instructionPath, attemptId);
       executorIntentId = id("executor");
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET executor_intent_id = ?, executor_pid = NULL WHERE id = ?").run(executorIntentId, attemptId);
@@ -584,7 +833,16 @@ export class Dispatcher {
       let backendError = null;
       try {
         backendResult = await backend.run({
-          attemptId, worktreePath, artifactDir, goal: job.goal, model, mode: job.mode,
+          attemptId, worktreePath, artifactDir, model, mode: job.mode,
+          // Private, disposable working space for the executor's own machinery. Deliberately NOT
+          // the artifact directory -- artifacts are retained evidence, and an executor's state
+          // database is neither evidence nor small -- and emphatically not the worktree, where it
+          // would show up in the candidate diff.
+          scratchDir: path.join(this.paths.tmp, "executor", attemptId),
+          // Two distinct inputs. `instruction` is what this worker must do; `goal` is the human's
+          // immutable objective, available for framing and never a substitute for the instruction.
+          instruction: instructionText,
+          goal: job.goal,
           onSpawn: (pid) => this.recordExecutorPid(attemptId, epoch, executorIntentId, pid),
         });
       } catch (error) {
@@ -597,6 +855,28 @@ export class Dispatcher {
       // The attempt's OWN backend reads its usage: each executor writes a different artifact in a
       // different format, so the default would misread another executor's evidence as absent.
       this.recordAttemptUsage({ attemptId, epoch, artifactDir, model, backendResult, backend });
+
+      // Identity evidence, recorded separately from cost evidence and for the same reason: they fail
+      // independently. A run can have perfect token accounting and unverifiable model identity, or
+      // verified identity and no usable cost, and neither receipt may stand in for the other.
+      this.recordRuntimeProvenance({
+        attemptId, model, backend, selection, backendResult,
+        requestedProfile: backend.profile ?? requestedProfile ?? null,
+      });
+
+      // What the worker SAYS it did, captured whether or not the attempt goes on to succeed.
+      //
+      // Testimony, never evidence: the captured tree is what actually changed. It is recorded anyway
+      // because the disagreement between the two is frequently the whole finding -- a worker
+      // reporting a fix it did not make is the failure mode semantic review exists to catch, and a
+      // reviewer that only ever saw the diff could not notice the claim was false.
+      const finalText = backendResult ? readFinalText(backendResult, artifactDir) : null;
+      if (finalText) {
+        const reportPath = path.join(artifactDir, "worker-report.txt");
+        fs.writeFileSync(reportPath, finalText);
+        this.db.prepare("UPDATE attempts SET result_text_artifact = ? WHERE id = ?").run(reportPath, attemptId);
+      }
+
       if (backendError) {
         // A Harness configuration failure -- a profile that will not compose, a fence the loader
         // refuses -- will recur on every attempt, so the router stops choosing it. This attempt
@@ -615,6 +895,12 @@ export class Dispatcher {
 
       if (backendResult.timedOut) throw new Error("worker timeout");
       if (backendResult.exitCode !== 0) throw new Error(`worker exited ${backendResult.exitCode}: ${backendResult.stderr?.slice(-2000) ?? ""}`);
+      // A clean exit is necessary and NOT sufficient. Where a backend can read its own protocol, its
+      // reading of whether the agent turn completed outranks the exit code, because an executor that
+      // died at the provider and then exited 0 is otherwise indistinguishable from one that worked.
+      if (backendResult.outcome && backendResult.outcome.state !== "SUCCEEDED") {
+        throw new Error(`worker did not complete: ${backendResult.outcome.reason}`);
+      }
 
       // ONE snapshot of what the attempt actually produced, taken through a delegate-wave-owned
       // temporary index rather than the worker's.
@@ -631,6 +917,20 @@ export class Dispatcher {
       const snapshot = await snapshotCandidate(worktreePath, job.base_sha, artifactDir);
       const files = snapshot.files;
       this.assertAllowedDiff(files, parseJson(project.protected_json));
+
+      // A read investigation that modified the tree is a failed investigation.
+      //
+      // Read mode previously just ignored whatever a worker left behind, because nothing downstream
+      // consumed it. Once a manager reasons from these reports that stops being harmless: an
+      // investigation that edited the code is describing a repository state that no longer matches
+      // the one the eventual implementation will start from, and it says so nowhere. Enforced at the
+      // product contract rather than trusted to the executor's permissions, which are a preference.
+      if (job.mode === "read" && files.length > 0) {
+        throw new Error(
+          `investigation modified ${files.length} file(s) and is therefore invalid: ${files.slice(0, 5).join(", ")}`,
+        );
+      }
+
       let resultCommit = null;
       if (job.mode === "write") {
         if (files.length === 0) {
@@ -666,12 +966,69 @@ export class Dispatcher {
 
       for (const command of validationPlan) await this.validate(attemptId, epoch, worktreePath, artifactDir, command);
 
+      // Settled AFTER validation and BEFORE the job claims to be ready.
+      //
+      // Two independent truths, kept independent. The attempt's engineering record is written
+      // unconditionally: it succeeded, its validation passed, its candidate stands. Settlement never
+      // writes to that record, because a cost overrun does not make correct code incorrect, and
+      // stamping a failure on the attempt would falsify engineering history to express a financial
+      // fact.
+      //
+      // What an exceeded budget withholds is automatic progression. The job does not announce
+      // READY_FOR_INTEGRATION -- that is an invitation to integrate, and the operator has not agreed
+      // to buy this at this price -- and the start gate independently refuses any further paid call,
+      // because family spend now sits at or above the ceiling. The candidate commit is preserved, so
+      // raising the limit recovers work already paid for rather than repurchasing it.
+      const settlement = this.settleBudget(jobId);
       this.acceptAttemptEvent(attemptId, epoch, () => {
         this.db.prepare("UPDATE attempts SET validation_state = 'PASSED' WHERE id = ?").run(attemptId);
-        this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(
-          job.mode === "write" ? "READY_FOR_INTEGRATION" : "SUCCEEDED", now(), jobId,
-        );
         recordEvent(this.db, { kind: "VALIDATION_PASSED", entityType: "job", entityId: jobId, epoch });
+        if (settlement.blocks_integration_offer) {
+          this.db.prepare("UPDATE jobs SET status = 'NEEDS_ATTENTION', updated_at = ? WHERE id = ?").run(now(), jobId);
+          recordEvent(this.db, {
+            kind: "BUDGET_EXCEEDED", entityType: "job", entityId: jobId, epoch,
+            payload: {
+              ceiling: settlement.ceiling, spent: settlement.spent, attemptId,
+              // Named explicitly so the record shows the candidate was preserved, not discarded.
+              candidate: resultCommit, validation: "PASSED", root_job_id: settlement.root_job_id,
+            },
+          });
+          return;
+        }
+        if (settlement.state === "UNVERIFIED") {
+          // Not a violation and not a clean pass. The candidate proceeds; what cannot be stated is
+          // that it stayed inside the limit, and the everyday surface says so rather than implying it.
+          recordEvent(this.db, {
+            kind: "BUDGET_UNVERIFIED", entityType: "job", entityId: jobId, epoch,
+            payload: {
+              ceiling: settlement.ceiling, spent: settlement.spent,
+              unpriced_attempts: settlement.unpriced_attempts, root_job_id: settlement.root_job_id,
+            },
+          });
+        }
+        // READY_FOR_INTEGRATION means different things for the two strategies, and only one of them
+        // is "deterministic validation passed".
+        //
+        // For direct work that is the whole story: a passing candidate is ready for a human. For a
+        // managed root it is not. The manager has not seen the candidate yet, and announcing it as
+        // integration-ready would expose a candidate for approval before the semantic review that
+        // the entire strategy exists to perform -- the operator could integrate work the manager was
+        // about to reject.
+        //
+        // So the promotion belongs to the coordinator, which owns it and grants it only after a
+        // REVIEW turn accepts one exact attempt. The root stays RUNNING here: its manager run is
+        // genuinely still in progress.
+        const managedRoot = job.strategy === "managed" && !job.parent_job_id;
+        const next = managedRoot
+          ? "RUNNING"
+          : (job.mode === "write" ? "READY_FOR_INTEGRATION" : "SUCCEEDED");
+        this.db.prepare("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?").run(next, now(), jobId);
+        if (managedRoot) {
+          recordEvent(this.db, {
+            kind: "CANDIDATE_AWAITING_REVIEW", entityType: "job", entityId: jobId, epoch,
+            payload: { attemptId, candidate: resultCommit },
+          });
+        }
       }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
       return this.status(jobId);
     } catch (error) {
@@ -697,6 +1054,13 @@ export class Dispatcher {
       const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
       const terminalMatches = attempt?.terminal_state === (expected.terminalState ?? null);
       const validationMatches = expected.validationState === undefined || attempt?.validation_state === expected.validationState;
+      // `currentEpoch !== epoch` now reads as "this attempt belongs to the scheduler generation that
+      // is currently in charge", because the generation no longer advances per attempt. It used to
+      // read as "this is the newest attempt anyone created", which rejected any sibling's callback
+      // the moment a second attempt started.
+      //
+      // Per-attempt identity is carried by attemptId and by the executor/validation intent ids that
+      // every caller checks, so nothing was weakened by removing that accidental exclusivity.
       if (!attempt || attempt.scheduler_epoch !== epoch || currentEpoch !== epoch || !terminalMatches || !validationMatches) {
         throw new Error(`Stale or terminal attempt event rejected for ${attemptId}`);
       }
@@ -736,7 +1100,18 @@ export class Dispatcher {
       // A backend that reports usage directly is preferred over artifact scraping. Either way it
       // supplies only a neutral observation; pricing is applied centrally by the finalizer, so no
       // executor computes delegate-wave's comparator.
-      const observation = backendResult?.usage
+      // A backend may assert that its executor died before a provider request was possible. That
+      // claim is the executor adapter's to make and nobody else's: only the adapter knows which
+      // failure signatures belong to its own local initialization. delegate-wave does not infer it
+      // from an empty log or a null exit code, because a worker that spent money and then crashed
+      // while writing its report looks identical from here.
+      const observation = backendResult?.preProviderFailure
+        ? noProviderContactObservation({
+          evidence: backendResult.preProviderFailure.evidence,
+          artifact: backendResult.preProviderFailure.artifact ?? null,
+          format: backendResult.preProviderFailure.format ?? "none",
+        })
+        : backendResult?.usage
         ?? (typeof backend?.observeUsage === "function"
           ? backend.observeUsage({ attemptId, artifactDir, backendResult })
           : observeOpenCodeArtifact(artifactDir ? path.join(artifactDir, "opencode-events.jsonl") : null));
@@ -782,6 +1157,89 @@ export class Dispatcher {
   // Eligibility is attempts that reached EXECUTOR_INTENDED. An attempt that failed during worktree
   // setup never invoked a backend and consumed no provider usage, so requiring evidence from it
   // would report a gap that cannot exist.
+  // Writes one immutable identity receipt for an attempt.
+  //
+  // A backend contributes only what it can actually prove. Whatever it does not report stays NULL,
+  // and NULL means unknown -- never "the same as what we asked for". Substituting the request for an
+  // observation is how a measurement quietly starts confirming its own configuration.
+  recordRuntimeProvenance({ attemptId, model, backend, selection, backendResult, requestedProfile }) {
+    const reported = backendResult?.provenance ?? {};
+    const record = {
+      attempt_id: attemptId,
+      requested_model: model ?? null,
+      requested_effort: backend?.reasoningEffort ?? null,
+      requested_executor: selection?.selected ?? backend?.constructor?.name ?? null,
+      requested_capability_profile: requestedProfile,
+      applied_model: reported.appliedModel ?? null,
+      applied_effort: reported.appliedEffort ?? null,
+      applied_executor: reported.appliedExecutor ?? selection?.selected ?? backend?.constructor?.name ?? null,
+      applied_capability_profile: reported.appliedCapabilityProfile ?? null,
+      applied_source: reported.appliedSource ?? null,
+      observed_model: reported.observedModel ?? null,
+      observed_effort: reported.observedEffort ?? null,
+      observed_source: reported.observedSource ?? null,
+    };
+    const { status, detail } = deriveProvenanceStatus(record);
+
+    // Plain INSERT, never INSERT OR REPLACE.
+    //
+    // REPLACE resolves a primary-key collision by deleting the existing row and inserting the new
+    // one, and SQLite does not fire delete triggers for that unless recursive_triggers is on -- so
+    // the immutability triggers on this table would have watched a receipt be overwritten and said
+    // nothing. An "immutable" receipt that a second call silently rewrites is worse than a mutable
+    // one, because the guarantee is what the reader trusts.
+    const existing = this.getRuntimeProvenance(attemptId);
+    if (existing) {
+      const differs = Object.keys(record).some((key) => (existing[key] ?? null) !== (record[key] ?? null));
+      if (differs) {
+        // Two different accounts of what ran. Neither is discarded and neither wins: the first
+        // stands, and the disagreement itself becomes evidence.
+        recordEvent(this.db, {
+          kind: "PROVENANCE_CONFLICT", entityType: "attempt", entityId: attemptId,
+          payload: { recorded: existing, rejected: { ...record, status, detail } },
+        });
+      }
+      return existing;
+    }
+
+    try {
+      this.db.prepare(`INSERT INTO attempt_runtime_provenance(
+        attempt_id, requested_model, requested_effort, requested_executor, requested_capability_profile,
+        applied_model, applied_effort, applied_executor, applied_capability_profile, applied_source,
+        observed_model, observed_effort, observed_source, status, detail, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        record.attempt_id, record.requested_model, record.requested_effort,
+        record.requested_executor, record.requested_capability_profile,
+        record.applied_model, record.applied_effort, record.applied_executor,
+        record.applied_capability_profile, record.applied_source,
+        record.observed_model, record.observed_effort, record.observed_source,
+        status, detail, now(),
+      );
+    } catch (error) {
+      // A capture failure leaves a durable gap rather than a fabricated receipt. An experiment
+      // reading this attempt finds nothing and must treat it as an invalid sample, which is the
+      // correct answer: we do not know what ran.
+      recordEvent(this.db, {
+        kind: "PROVENANCE_CAPTURE_FAILED", entityType: "attempt", entityId: attemptId,
+        payload: { error: String(error?.message ?? error) },
+      });
+    }
+    return { ...record, status, detail };
+  }
+
+  getRuntimeProvenance(attemptId) {
+    return this.db.prepare("SELECT * FROM attempt_runtime_provenance WHERE attempt_id = ?").get(attemptId) ?? null;
+  }
+
+  // Is this attempt a valid SAMPLE of an experimental condition?
+  //
+  // Reads only runtime evidence. Nothing about validation, the candidate, or a manager's acceptance
+  // reaches this decision, because provenance assessed after seeing the outcome would become another
+  // post-outcome selection channel.
+  assessExperimentalCondition(attemptId, expected = {}) {
+    return assessExperimentalCondition(this.getRuntimeProvenance(attemptId), expected);
+  }
+
   usageCoverage({ jobIds = null } = {}) {
     const eligible = jobIds?.length
       ? this.db.prepare(`SELECT DISTINCT a.id FROM attempts a
@@ -845,25 +1303,48 @@ export class Dispatcher {
       this.db.prepare("UPDATE attempts SET validation_intent_id = ?, validation_pid = NULL WHERE id = ?").run(validationId, attemptId);
       recordEvent(this.db, { kind: "VALIDATION_INTENDED", entityType: "attempt", entityId: attemptId, epoch, payload: { validationId, command } });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
-    const result = await runShell(command, {
+    // One command, no shell. Sequencing belongs to the plan, so no operator can be misparsed into
+    // silence by whichever interpreter this machine happens to ship.
+    const result = await runCommand(command, {
       cwd: worktreePath,
       timeoutMs: 15 * 60_000,
       onSpawn: (pid) => this.recordValidationPid(attemptId, epoch, validationId, pid),
     });
+    const outcome = !result.ran ? "CHECK_DID_NOT_RUN"
+      : result.exitCode === 0 ? "PASSED"
+      : "CHECK_FAILED";
     const outputPath = path.join(artifactDir, `${validationId}.log`);
-    fs.writeFileSync(outputPath, `${result.stdout}\n${result.stderr}`, { flag: "wx" });
+    fs.writeFileSync(
+      outputPath,
+      result.ran ? `${result.stdout}\n${result.stderr}` : `the check did not run: ${result.reason}`,
+      { flag: "wx" },
+    );
     this.acceptAttemptEvent(attemptId, epoch, (attempt) => {
       if (attempt.validation_intent_id !== validationId) {
         throw new Error(`Stale validation result rejected for ${attemptId}`);
       }
       this.db.prepare(`INSERT INTO validation_runs(
-        id, attempt_id, command, exit_code, output_path, started_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-        validationId, attemptId, command, result.exitCode, outputPath, startedAt, now(),
+        id, attempt_id, command, exit_code, outcome, did_not_run_reason,
+        output_path, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        validationId, attemptId, command, result.ran ? result.exitCode : null,
+        outcome, result.ran ? null : result.reason, outputPath, startedAt, now(),
       );
       this.db.prepare("UPDATE attempts SET validation_intent_id = NULL, validation_pid = NULL WHERE id = ?").run(attemptId);
-      recordEvent(this.db, { kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch, payload: { command, exitCode: result.exitCode } });
+      recordEvent(this.db, {
+        kind: "VALIDATION_FINISHED", entityType: "attempt", entityId: attemptId, epoch,
+        payload: { command, exitCode: result.ran ? result.exitCode : null, outcome },
+      });
     }, { terminalState: "SUCCEEDED", validationState: "PENDING" });
+    // A verifier that never started produced NO evidence about this candidate, so it must not read
+    // as the candidate failing. Marked as its own kind of error, and deliberately not recorded as a
+    // validation verdict: the attempt's validation_state stays NOT_RUN, which is already the exact
+    // word for what happened.
+    if (!result.ran) {
+      const error = new Error(`validation could not be executed: ${result.reason} -- ${command}`);
+      error.validationDidNotRun = true;
+      throw error;
+    }
     if (result.exitCode !== 0) throw new Error(`validation failed (${result.exitCode}): ${command}`);
   }
 
@@ -944,8 +1425,14 @@ export class Dispatcher {
     const money = (value) => (value === null || value === undefined ? null : Number(value.toFixed(6)));
 
     // Cost is reported with its completeness, never as a bare number that might be silently partial.
+    // Everyday cost is the FAMILY total, not the root job's own attempts.
+    //
+    // Hiding exploration children from the surface without changing this would hide their spend
+    // too: a managed root would report only what its implementation attempts cost, and the
+    // investigations that produced the brief would vanish from the operator's account entirely.
+    // A direct root's family contains only itself, so the two cases unify rather than branch.
     const jobCost = (jobId) => {
-      const spend = this.jobSpend(jobId);
+      const spend = this.familySpend(jobId);
       return {
         reference_cost_usd: money(spend.spent),
         complete: spend.complete,
@@ -955,8 +1442,14 @@ export class Dispatcher {
 
     const working = this.db.prepare(`SELECT j.id, j.goal, p.name AS project, j.updated_at
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'RUNNING' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
-      .map((row) => ({ job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at }));
+      WHERE j.status = 'RUNNING' AND j.parent_job_id IS NULL AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      // Cost belongs here too, and only becomes true once it is the FAMILY's cost. A managed root is
+      // at its most expensive while it is working -- that is when it is buying investigations -- and
+      // "Working" with no figure is the moment an operator most wants one.
+      .map((row) => ({
+        job: row.id, project: row.project, goal: short(row.goal), since: row.updated_at,
+        cost: jobCost(row.id),
+      }));
 
     const proposals = this.pendingWorkProposals().slice(0, limit).map((row) => ({
       // Written as the question a person is actually being asked. The identifier stays in the
@@ -975,7 +1468,7 @@ export class Dispatcher {
     const candidates = this.db.prepare(`SELECT ip.id, ip.job_id, ip.attempt_id, j.goal, p.name AS project
       FROM integration_proposals ip
       JOIN jobs j ON j.id = ip.job_id JOIN projects p ON p.id = ip.project_id
-      WHERE ip.state = 'OPEN' AND p.retired_at IS NULL
+      WHERE ip.state = 'OPEN' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_records r
           WHERE r.proposal_id = ip.id AND r.kind = 'INTEGRATION_SUCCEEDED'
@@ -1014,7 +1507,8 @@ export class Dispatcher {
         (SELECT a.failure_signature FROM attempts a WHERE a.job_id = j.id
          ORDER BY a.ordinal DESC LIMIT 1) AS last_failure
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'NEEDS_ATTENTION' AND p.retired_at IS NULL ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
+      WHERE j.status = 'NEEDS_ATTENTION' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
+      ORDER BY j.updated_at DESC LIMIT ?`).all(limit)
       .map((row) => {
         // What happened to the change, then what it means, then the mechanism -- never the internal
         // state name. `why` is retained because callers and the detailed tools already use it.
@@ -1035,7 +1529,7 @@ export class Dispatcher {
     // A job whose integration was rolled back is not Done: the change it describes is gone.
     const done = this.db.prepare(`SELECT j.id, j.goal, j.updated_at, p.name AS project
       FROM jobs j JOIN projects p ON p.id = j.project_id
-      WHERE j.status = 'SUCCEEDED' AND p.retired_at IS NULL
+      WHERE j.status = 'SUCCEEDED' AND j.parent_job_id IS NULL AND p.retired_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM integration_rollbacks rb
           JOIN integration_proposals ip ON ip.id = rb.proposal_id
@@ -1123,7 +1617,7 @@ export class Dispatcher {
       "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal",
     ).all(jobId);
     const last = attempts.at(-1) ?? null;
-    const spend = this.jobSpend(jobId);
+    const spend = this.familySpend(this.budgetRootJobId(jobId));
     const spent = spend.spent > 0
       ? `About $${spend.spent.toFixed(4)} was spent${spend.complete ? "" : " so far"}`
       : null;
@@ -1243,8 +1737,29 @@ export class Dispatcher {
   budgetObstacle(job, spend) {
     // Trailing zeros make a limit read as an instrument reading rather than an amount of money.
     const money = (value) => Number(value).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
-    const ceiling = job.maximum_cost;
+    const ceiling = this.budgetAuthority(job.id).ceiling;
     if (ceiling === null || ceiling === undefined) return null;
+
+    // Retraction reads completely differently from refusal, and conflating them would be the worst
+    // kind of wrong: "I stopped before another attempt" when the work is finished and a validated
+    // candidate is sitting there would send someone looking for a failure that did not happen.
+    const exceeded = this.db.prepare(
+      "SELECT payload_json FROM events WHERE kind = 'BUDGET_EXCEEDED' AND entity_id = ? ORDER BY sequence DESC LIMIT 1",
+    ).get(job.id);
+    if (exceeded) {
+      const payload = parseJson(exceeded.payload_json, {});
+      return {
+        state: "budget-exceeded",
+        headline: "The work is finished and passed its checks, but it cost about "
+          + `$${Number(payload.spent ?? spend.spent).toFixed(4)} against a $${money(ceiling)} limit. `
+          + "I have not offered it for integration. I need your decision.",
+        detail: "Nothing was integrated and nothing was thrown away: the change itself is fine and "
+          + "the candidate is intact, so raising the limit accepts work you have already paid for "
+          + "rather than repeating it.",
+        needs_decision: true,
+      };
+    }
+
     if (!spend.complete) {
       return {
         state: "budget-unverifiable",
@@ -1598,32 +2113,366 @@ export class Dispatcher {
       // already closes, one status along. Whatever was observed is still added to `spent`, because
       // it was really consumed; it just cannot make the accounting complete.
       if (row.reference_cost_usd !== null) spent += row.reference_cost_usd;
-      if (row.status === "COMPLETE" && row.reference_cost_usd !== null) priced += 1;
+      // NO_PROVIDER_CONTACT counts as priced at zero. Not a softening of the rule above: that rule
+      // exists because unmeasured spend must not pass as measured, and this status is the one case
+      // where zero IS the measurement. Treating it as unaccounted would let a worker that crashed
+      // while opening its own database permanently freeze a family's budget -- which is precisely
+      // what it did on 2026-08-19, to a run that had already bought 81,495 strong-manager tokens.
+      if ((row.status === "COMPLETE" || row.status === "NO_PROVIDER_CONTACT")
+        && row.reference_cost_usd !== null) priced += 1;
     }
     // Every attempt that ran without producing a complete priced receipt is unaccounted spend.
     const unpriced = Math.max(0, attempts - priced);
     return { spent, priced_attempts: priced, unpriced_attempts: unpriced, complete: unpriced === 0 };
   }
 
+  // --- Budget authority is held by a family, not by a job -----------------------------------------
+  //
+  // A managed job commissions child jobs for exploration. The obvious implementation gives each child
+  // its own ceiling, which silently multiplies the operator's limit by the number of children: five
+  // explorations under a $0.10 ceiling would authorize $0.60 of work while every individual check
+  // passed. So a ceiling belongs to the family that shares it, and a child settles against its root.
+  //
+  // Learned rather than derived: Claudexor's delegation belt keeps "one live parent-owned paid-budget
+  // authority shared by the parent and every child", and states the failure mode as a typed refusal
+  // rather than an independent budget. See docs/research/EXTERNAL-ORCHESTRATION-LESSONS.md.
+
+  // The job that owns the ceiling this job spends against. Bounded rather than recursive: nesting is
+  // one level by construction, and a cycle introduced by a bad write must not hang the scheduler.
+  budgetRootJobId(jobId) {
+    let current = jobId;
+    for (let depth = 0; depth < 8; depth += 1) {
+      const row = this.db.prepare("SELECT parent_job_id FROM jobs WHERE id = ?").get(current);
+      if (!row?.parent_job_id) return current;
+      current = row.parent_job_id;
+    }
+    throw new Error(`Job ${jobId} has a parent chain deeper than delegation permits`);
+  }
+
+  // familySpend() sums COMPLETED usage receipts only, which by itself is not safe under concurrency:
+  // simultaneous children would each observe the same headroom and collectively exceed one ceiling.
+  //
+  // Safety comes from admitAttempt(), which adds the authority held by live attempts to settled
+  // spend inside the transaction that claims the attempt. This function is therefore the settled
+  // half of a two-part total and must not be used alone to decide admission.
+  familyJobIds(rootJobId) {
+    const seen = new Set([rootJobId]);
+    const queue = [rootJobId];
+    while (queue.length) {
+      const parent = queue.shift();
+      for (const row of this.db.prepare("SELECT id FROM jobs WHERE parent_job_id = ?").all(parent)) {
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        queue.push(row.id);
+      }
+    }
+    return [...seen];
+  }
+
+  // Family spend, in the same shape and with the same honesty as jobSpend.
+  familySpend(rootJobId) {
+    const ids = this.familyJobIds(rootJobId);
+    const totals = { spent: 0, priced_attempts: 0, unpriced_attempts: 0 };
+    for (const id of ids) {
+      const spend = this.jobSpend(id);
+      totals.spent += spend.spent;
+      totals.priced_attempts += spend.priced_attempts;
+      totals.unpriced_attempts += spend.unpriced_attempts;
+    }
+    return { ...totals, complete: totals.unpriced_attempts === 0, jobs: ids.length };
+  }
+
+  // The family's cost re-derived under ONE named basis, for reporting only.
+  //
+  // Deliberately not familySpend(). That path is budget AUTHORITY: it sums the price each receipt was
+  // stamped with when it was written, under the basis the $0.50 ceiling was calibrated against, and
+  // nothing about presenting a comparison may move the number that admits or refuses work.
+  //
+  // This path answers a different question -- "what would this family have cost under the basis I am
+  // quoting the manager in" -- and answers it from the immutable token counts rather than from the
+  // stored figure. Without it a report claiming one basis was denominated in two: the scarce half in
+  // the requested basis, the cheap half in whatever its receipts happened to be priced under. Those
+  // two agree today for DeepSeek Flash, exactly, which is why run 13's total was right; agreeing by
+  // luck is not the same as being enforced.
+  //
+  // Anything the basis cannot price makes the total incomplete rather than falling back to the
+  // receipt's own figure. A silent basis substitution is precisely the defect this exists to remove.
+  familyReferenceSpend(rootJobId, basisId) {
+    const ids = this.familyJobIds(rootJobId);
+    const totals = { spent: 0, priced_attempts: 0, unpriced_attempts: 0, basis_id: basisId };
+    for (const id of ids) {
+      const rows = this.db.prepare(`SELECT r.*, a.model, a.id AS attempt_id
+        FROM attempt_usage_receipts r JOIN attempts a ON a.id = r.attempt_id
+        WHERE a.job_id = ?`).all(id);
+      const ran = this.db.prepare(`SELECT COUNT(*) AS count FROM attempts a
+        JOIN events e ON e.entity_id = a.id AND e.kind = 'EXECUTOR_INTENDED'
+        WHERE a.job_id = ?`).get(id).count;
+
+      let priced = 0;
+      for (const row of rows) {
+        // Same rule as jobSpend: only a COMPLETE observation can make accounting complete, and
+        // NO_PROVIDER_CONTACT is the one status where zero IS the measurement.
+        if (row.status === "NO_PROVIDER_CONTACT") { priced += 1; continue; }
+        if (row.status !== "COMPLETE") continue;
+        const { reference_cost_usd: cost } = referenceCostUsd(row, { model: row.model, basisId });
+        if (cost === null) continue;
+        totals.spent += cost;
+        priced += 1;
+      }
+      totals.priced_attempts += priced;
+      totals.unpriced_attempts += Math.max(0, ran - priced);
+    }
+    const complete = totals.unpriced_attempts === 0;
+    return {
+      ...totals,
+      complete,
+      // A partial sum reads as the family's cost while being a subset's, so it is withheld rather
+      // than quoted -- the same rule the manager side already applies to its own turns.
+      spent: complete ? totals.spent : null,
+      jobs: ids.length,
+    };
+  }
+
+  // The ceiling in force for this job, and who holds it.
+  budgetAuthority(jobId) {
+    const rootJobId = this.budgetRootJobId(jobId);
+    const root = this.db.prepare("SELECT maximum_cost FROM jobs WHERE id = ?").get(rootJobId);
+    return { rootJobId, ceiling: root?.maximum_cost ?? null };
+  }
+
   // Refuses to start work that a recorded ceiling cannot cover.
   //
   // Unaccounted spend blocks rather than passes: if an earlier attempt's cost is unknown, the honest
   // answer is that the budget cannot be shown to be intact, not that it is.
-  assertWithinBudget(jobId, ceiling) {
+  //
+  // This is a START GATE and nothing more. It cannot bound the attempt it admits: once a worker is
+  // running there is no live cost cutoff, so an attempt admitted with $0.01 of headroom may spend
+  // many times the ceiling before it exits. settleBudget() below is what gives the ceiling
+  // consequences after the fact.
+  assertWithinBudget(jobId, ceiling = undefined) {
+    const authority = this.budgetAuthority(jobId);
+    const limit = ceiling === undefined ? authority.ceiling : ceiling;
+    if (limit === null || limit === undefined) return null;
+    const spend = this.familySpend(authority.rootJobId);
+    if (!spend.complete) {
+      throw new Error(
+        `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
+        + `the ${limit} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
+      );
+    }
+    if (spend.spent >= limit) {
+      throw new Error(
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${limit} ceiling; refusing to start more work`,
+      );
+    }
+    return spend;
+  }
+
+  // Serializes Git operations that take a repository-wide lock.
+  //
+  // In-process only, and that is the right scope: it protects concurrent attempts driven by one
+  // scheduler, which is the concurrency this system creates. Two schedulers on one repository would
+  // still contend, and Git's own locking is what covers that -- this exists so the common case does
+  // not depend on losing a race gracefully.
+  withRepositoryLock(repoPath, action) {
+    const previous = this.repositoryLocks.get(repoPath) ?? Promise.resolve();
+    // Chained on settlement rather than success: a failed worktree creation must not wedge the lock
+    // for every attempt that follows it.
+    const next = previous.then(action, action);
+    this.repositoryLocks.set(repoPath, next.then(() => {}, () => {}));
+    return next;
+  }
+
+  // May this job claim an attempt right now, given what is already live?
+  //
+  // The scheduler admitted exactly one live attempt at a time. That was the right default while
+  // fencing, budget admission and cancellation all assumed a single worker -- and it is what kept
+  // the previous lane from switching concurrency on before the coordinator could handle it.
+  //
+  // It is relaxed NARROWLY, for the one shape that has been made safe:
+  //
+  //   concurrent      read-mode MANAGER_EXPLORATION children of the SAME root
+  //   serialized      everything else -- unrelated roots, root implementations, revisions,
+  //                   any write child, and integration
+  //
+  // Read investigations are the case where concurrency is both valuable and cheap to reason about:
+  // they cannot produce a candidate, cannot integrate, and are refused outright if they modify the
+  // tree, so two of them running together cannot interfere through anything but budget -- which
+  // admitAttempt() now settles atomically.
+  assertAdmissible(jobId) {
+    const job = this.getJob(jobId);
+    const root = this.budgetRootJobId(jobId);
+    const incomingParallel = isParallelExploration(job);
+    const live = this.db.prepare(`SELECT a.id, a.job_id, j.parent_job_id, j.internal_kind, j.mode
+      FROM attempts a JOIN jobs j ON j.id = a.job_id
+      WHERE ${lifecycleActive("a")}`).all();
+    for (const other of live) {
+      const compatible = incomingParallel
+        && isParallelExploration(other)
+        && this.budgetRootJobId(other.job_id) === root;
+      if (!compatible) {
+        throw new Error(
+          `Bootstrap scheduler already has live attempt ${other.id}`
+          + (incomingParallel ? " that is not a sibling investigation of the same root" : ""),
+        );
+      }
+    }
+  }
+
+  // Which scheduler incarnation currently owns callbacks.
+  schedulerGeneration() {
+    return Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
+  }
+
+  // Authority held by attempts that are alive right now.
+  //
+  // Counted as PENDING spend even though nothing has been billed yet, which is the whole point: a
+  // check that only sums settled receipts lets N simultaneous starts each observe the same headroom
+  // and collectively spend N times it. Claudexor states the property as admission being "atomic and
+  // monotonic (pending starts count toward the max)".
+  reservedAuthority(rootJobId, { excludeAttemptId = null } = {}) {
+    const ids = this.familyJobIds(rootJobId);
+    const rows = this.db.prepare(`SELECT a.id, a.budget_reservation_usd FROM attempts a
+      WHERE a.job_id IN (${ids.map(() => "?").join(",")}) AND ${lifecycleActive("a")}`).all(...ids);
+    return rows
+      .filter((row) => row.id !== excludeAttemptId)
+      .reduce((total, row) => total + (row.budget_reservation_usd ?? 0), 0);
+  }
+
+  // Claims spending authority for one new attempt, or refuses.
+  //
+  // MUST be called inside the same BEGIN IMMEDIATE that creates the attempt. That is what makes it
+  // atomic: two schedulers cannot both read the same headroom, because the second blocks until the
+  // first has committed its reservation and then sees it.
+  //
+  //   settled family spend + authority held by live attempts + this request  <=  ceiling
+  //
+  // A reservation is AUTHORITY, not a spend cap. delegate-wave cannot preempt a provider mid-call,
+  // so an attempt can still overshoot what it reserved; that is recorded as an overrun rather than
+  // pretended away. What the reservation guarantees is that the family never AUTHORIZES more than
+  // the ceiling at once.
+  //
+  // `requested` defaults to the entire remaining headroom, which preserves today's serial behaviour
+  // exactly: one attempt at a time may use everything that is left. Splitting that authority among
+  // concurrent children is an allocation policy, and belongs to the lane that introduces them.
+  admitAttempt({ jobId, requested = null }) {
+    const { rootJobId, ceiling } = this.budgetAuthority(jobId);
     if (ceiling === null || ceiling === undefined) return null;
-    const spend = this.jobSpend(jobId);
+
+    const spend = this.familySpend(rootJobId);
     if (!spend.complete) {
       throw new Error(
         `Job ${jobId} has ${spend.unpriced_attempts} attempt(s) with unpriced usage, so spend against `
         + `the ${ceiling} ceiling cannot be established. Resolve the usage evidence or raise the ceiling explicitly.`,
       );
     }
-    if (spend.spent >= ceiling) {
+    const reserved = this.reservedAuthority(rootJobId);
+    const remaining = ceiling - spend.spent - reserved;
+    if (remaining <= 0) {
       throw new Error(
-        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling; refusing to start more work`,
+        `Job ${jobId} has spent ${spend.spent.toFixed(6)} of its ${ceiling} ceiling`
+        + `${reserved > 0 ? ` with ${reserved.toFixed(6)} reserved by live attempts` : ""}`
+        + "; refusing to start more work",
       );
     }
-    return spend;
+    const reservation = requested === null ? remaining : Number(requested);
+    if (!(reservation > 0)) throw new Error("A budget reservation must be a positive amount");
+    if (reservation > remaining + 1e-12) {
+      throw new Error(
+        `Job ${jobId} requested ${reservation.toFixed(6)} of authority but only `
+        + `${remaining.toFixed(6)} remains of its ${ceiling} family ceiling`,
+      );
+    }
+    return reservation;
+  }
+
+  // What an attempt actually spent against what it was authorized to.
+  //
+  // An overrun is not an admission failure. It is the standing fact that provider spend cannot be
+  // preempted exactly inside one call, recorded rather than reconciled away.
+  attemptOverrun(attemptId) {
+    const attempt = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
+    if (!attempt || attempt.budget_reservation_usd === null) return null;
+    const receipt = this.getAttemptUsage(attemptId);
+    if (!receipt || receipt.status !== "COMPLETE" || receipt.reference_cost_usd === null) {
+      return { attempt_id: attemptId, reserved: attempt.budget_reservation_usd, spent: null, overrun: null };
+    }
+    const overrun = receipt.reference_cost_usd - attempt.budget_reservation_usd;
+    return {
+      attempt_id: attemptId,
+      reserved: attempt.budget_reservation_usd,
+      spent: receipt.reference_cost_usd,
+      overrun: overrun > 0 ? overrun : 0,
+    };
+  }
+
+  // What the ceiling turned out to mean, once the work is done and the receipts are in.
+  //
+  // The start gate above can only ever ask "was the budget intact BEFORE this?", so a ceiling has
+  // historically been describable only as a permission to begin. Settlement is where it acquires
+  // consequences.
+  //
+  // The critical framing: a cost overrun does not make correct code incorrect. These are two
+  // independent truths about one attempt, and collapsing them would corrupt both.
+  //
+  //   ENGINEERING OUTCOME     candidate captured? validation passed? manager accepted?
+  //   BUDGET OUTCOME          within authorization? exceeded? unverifiable?
+  //
+  // So nothing here touches the attempt's record. The attempt succeeded and its validation passed;
+  // stamping a failure signature on it to express a budget opinion would falsify engineering history
+  // to record a financial fact. What settlement withholds is AUTOMATIC PROGRESSION -- the job does
+  // not claim READY_FOR_INTEGRATION, no further paid call may start, and the overrun is surfaced --
+  // while the candidate commit is preserved intact. You cannot unspend money; you can decline to
+  // spend more of it, and decline to imply the work is cleared to proceed.
+  //
+  // Three states, matching the COMPLETE/PARTIAL/UNKNOWN discipline the usage receipts already use:
+  //
+  //   WITHIN      measured spend is complete and under the ceiling
+  //   EXCEEDED    measured spend reached or passed the ceiling -- progression is blocked
+  //   UNVERIFIED  spend cannot be established, so compliance cannot be claimed either way
+  //
+  // UNVERIFIED does NOT block. An executor that failed to report usage is a reporting gap, not
+  // evidence of overspending, and withholding a validated candidate over one would penalise the
+  // operator for an executor's silence. The start gate already refuses to spend anything further
+  // under an unestablished total, so the remaining exposure is bounded at the attempt that already
+  // ran -- and the honest response to that is to say the cost is unknown, not to claim the limit
+  // held.
+  // Two consequences, reported separately, because they genuinely differ per state.
+  //
+  // An earlier version carried a single `authorized` boolean, which had to answer a ternary question
+  // and therefore lied about UNVERIFIED: it read `true`, while the prose one screen above said
+  // compliance could not be claimed either way. A boolean cannot express "I do not know", so it
+  // stopped being asked.
+  //
+  //   state        blocks_further_spend   blocks_integration_offer
+  //   WITHIN       false                  false
+  //   EXCEEDED     true                   true
+  //   UNVERIFIED   true                   false
+  //
+  // UNVERIFIED blocking further spend is not a policy choice made here -- it is a restatement of what
+  // assertWithinBudget() already does, since an unestablished total cannot be shown to be intact. It
+  // does not block the integration offer, because a validated candidate already paid for should not
+  // be withheld from the human over an executor's silence about its cost.
+  budgetState(jobId) {
+    const { rootJobId, ceiling } = this.budgetAuthority(jobId);
+    const spend = this.familySpend(rootJobId);
+    const base = {
+      ceiling: ceiling ?? null, root_job_id: rootJobId, spent: spend.spent,
+      complete: spend.complete, unpriced_attempts: spend.unpriced_attempts, jobs: spend.jobs,
+    };
+    const decided = (state, blocksSpend, blocksOffer) => ({
+      ...base, state, blocks_further_spend: blocksSpend, blocks_integration_offer: blocksOffer,
+    });
+    if (ceiling === null || ceiling === undefined) return decided("WITHIN", false, false);
+    if (spend.complete && spend.spent >= ceiling) return decided("EXCEEDED", true, true);
+    if (!spend.complete) return decided("UNVERIFIED", true, false);
+    return decided("WITHIN", false, false);
+  }
+
+  // The settlement moment. `state` is the budget truth; `blocks_integration_offer` is the only thing
+  // settlement is permitted to decide about the engineering lifecycle.
+  settleBudget(jobId) {
+    return this.budgetState(jobId);
   }
 
   // --- Cancellation -----------------------------------------------------------------------------
@@ -1656,8 +2505,21 @@ export class Dispatcher {
     // succeeded but whose validation is still pending is running work: the job is RUNNING and a
     // validation process may be alive, so treating it as "nothing running" would make cancel useless
     // for exactly the phase most likely to hang.
-    const active = this.db.prepare(`SELECT * FROM attempts WHERE job_id = ?
-      AND ${lifecycleActive()} ORDER BY ordinal DESC LIMIT 1`).get(jobId);
+    // Searched across the whole FAMILY, not just this job.
+    //
+    // During exploration the running worker belongs to a CHILD while the root itself has no active
+    // attempt at all. A root-only query therefore found nothing, reported NOTHING_RUNNING, and left
+    // the investigation running -- cancelling a managed job did not cancel the work it was doing.
+    // That hole exists in the serial implementation already; concurrency only multiplies it.
+    //
+    // Delegation is capped at one level, so this is a two-level walk rather than a recursive engine.
+    const familyIds = this.familyJobIds(jobId);
+    const activeInFamily = this.db.prepare(`SELECT * FROM attempts
+      WHERE job_id IN (${familyIds.map(() => "?").join(",")}) AND ${lifecycleActive()}
+      ORDER BY started_at`).all(...familyIds);
+    // The root's own attempt is preferred as the intent's subject when it has one, so a direct job's
+    // records are byte-for-byte what they were before family cancellation existed.
+    const active = activeInFamily.find((attempt) => attempt.job_id === jobId) ?? activeInFamily[0] ?? null;
 
     // Record the intent before touching any process.
     const intentId = id("cancel");
@@ -1765,7 +2627,9 @@ export class Dispatcher {
           executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
           WHERE id = ?`).run(now(), active.id);
       }
-      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), jobId);
+      // The attempt's OWN job is cancelled, which for an exploration child is the child. The root is
+      // cancelled below, once every live attempt in the family has settled.
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now(), active.job_id);
       recordEvent(this.db, {
         kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: active.id, epoch,
         payload: { intentId, killedPid, phase: stillValidating ? "validation" : "executor" },
@@ -1773,9 +2637,74 @@ export class Dispatcher {
       return true;
     });
 
+    // Every OTHER live attempt in the family, under its own identity.
+    //
+    // Two levels of delegation means at most root + children, so this is a loop rather than a
+    // recursive engine. Each sibling is killed and marked separately because each is its own attempt
+    // with its own executor, and a single receipt covering several of them would say less than the
+    // system knows.
+    const siblings = [];
+    for (const other of activeInFamily) {
+      if (other.id === active.id) continue;
+      siblings.push(this.cancelFamilyAttempt(other, { intentId, epoch }));
+    }
+
+    // The root settles only once nothing in the family is still running.
+    if (this.familyHasLiveAttempt(jobId)) {
+      return settle("CANCELLED", `attempt ${active.id} cancelled; family still settling`, killedPid);
+    }
+    this.db.prepare(
+      "UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ? AND status NOT IN ('SUCCEEDED', 'READY_FOR_INTEGRATION')",
+    ).run(now(), jobId);
+
+    const detail = siblings.length
+      ? `attempt ${active.id} cancelled, plus ${siblings.length} sibling attempt(s)`
+      : `attempt ${active.id} cancelled`;
     return applied
-      ? settle("CANCELLED", `attempt ${active.id} cancelled`, killedPid)
+      ? settle("CANCELLED", detail, killedPid)
       : settle("ALREADY_TERMINAL", `attempt ${active.id} reached a terminal state first`, killedPid);
+  }
+
+  familyHasLiveAttempt(rootJobId) {
+    const ids = this.familyJobIds(rootJobId);
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM attempts WHERE job_id IN (${ids.map(() => "?").join(",")}) AND ${lifecycleActive()} LIMIT 1`,
+    ).get(...ids));
+  }
+
+  // Kills and marks one additional live attempt during a family cancellation.
+  cancelFamilyAttempt(attempt, { intentId, epoch }) {
+    const validating = attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING";
+    const targetPid = validating ? attempt.validation_pid : attempt.executor_pid;
+    let killedPid = null;
+    if (targetPid && ![process.pid, attempt.scheduler_pid].filter(Boolean).includes(targetPid)) {
+      try { process.kill(targetPid); killedPid = targetPid; } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    transaction(this.db, () => {
+      const current = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attempt.id);
+      if (!current || current.scheduler_epoch !== epoch) return;
+      const stillValidating = current.terminal_state === "SUCCEEDED" && current.validation_state === "PENDING";
+      if (current.terminal_state !== null && !stillValidating) return;
+      if (stillValidating) {
+        this.db.prepare(`UPDATE attempts SET validation_state = 'NOT_RUN',
+          validation_intent_id = NULL, validation_pid = NULL,
+          failure_signature = 'cancelled-during-validation', quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(attempt.id);
+      } else {
+        this.db.prepare(`UPDATE attempts SET terminal_state = 'CANCELLED', finished_at = ?,
+          executor_intent_id = NULL, executor_pid = NULL, quarantined = 1, worktree_locked = 1
+          WHERE id = ?`).run(now(), attempt.id);
+      }
+      this.db.prepare("UPDATE jobs SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
+        .run(now(), current.job_id);
+      recordEvent(this.db, {
+        kind: "ATTEMPT_CANCELLED", entityType: "attempt", entityId: attempt.id, epoch,
+        payload: { intentId, killedPid, family: true, phase: stillValidating ? "validation" : "executor" },
+      });
+    });
+    return { attempt_id: attempt.id, killed_pid: killedPid };
   }
 
   async failAttempt({ attemptId, jobId, epoch, project, worktreePath, executorIntentId = null, error }) {
@@ -1791,8 +2720,13 @@ export class Dispatcher {
           executor_intent_id = NULL, executor_pid = NULL, failure_signature = ?,
           quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), signature, attemptId);
       } else if (attempt.terminal_state === 'SUCCEEDED' && attempt.validation_state === 'PENDING') {
-        this.db.prepare(`UPDATE attempts SET validation_state = 'FAILED',
-          failure_signature = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(signature, attemptId);
+        // A check that could not be executed produced no evidence about this candidate. The attempt
+        // still fails -- an unverifiable candidate cannot be offered -- but it fails as a system
+        // fault, and the candidate is left unjudged rather than recorded as having failed its tests.
+        this.db.prepare(`UPDATE attempts SET validation_state = ?,
+          failure_signature = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(
+          error?.validationDidNotRun ? 'NOT_RUN' : 'FAILED', signature, attemptId,
+        );
       } else return false;
       const count = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
       const job = this.getJob(jobId);
@@ -1814,7 +2748,30 @@ export class Dispatcher {
     const attempts = this.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(jobId);
     const validations = this.db.prepare(`SELECT v.* FROM validation_runs v
       JOIN attempts a ON a.id = v.attempt_id WHERE a.job_id = ? ORDER BY v.started_at`).all(jobId);
-    return { job, attempts, validations };
+    return { job, attempts, validations, family: this.jobFamily(jobId) };
+  }
+
+  // The detailed view: a root with the work it commissioned, and what the whole thing cost.
+  //
+  // A separate projection rather than an `includeInternal` flag on listJobs, because these are
+  // different questions rather than the same question with a wider filter. "What am I working on"
+  // wants roots; "what did this job actually do" wants a root and its children. A boolean would let
+  // a caller ask the first question and receive an answer to the second.
+  //
+  // A direct job's family is simply empty, so callers do not branch on strategy.
+  jobFamily(jobId) {
+    const children = this.db.prepare(
+      "SELECT * FROM jobs WHERE parent_job_id = ? ORDER BY created_at",
+    ).all(jobId).map((child) => ({
+      id: child.id,
+      internal_kind: child.internal_kind,
+      goal: child.goal,
+      mode: child.mode,
+      status: child.status,
+      attempts: this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(child.id).count,
+      cost: this.jobSpend(child.id),
+    }));
+    return { children, aggregate_cost: this.familySpend(jobId) };
   }
 
   planDigest(commands) {
@@ -1844,6 +2801,67 @@ export class Dispatcher {
     return this.db.prepare("SELECT * FROM approval_receipts ORDER BY granted_at").all();
   }
 
+  // Direct work has exactly one passing candidate by construction: attempts stop at the first
+  // success. More than one means the lifecycle was violated, and picking among them would be an
+  // invention.
+  soleCandidate(jobId) {
+    const candidates = this.db.prepare(
+      "SELECT * FROM attempts WHERE job_id = ? AND terminal_state = 'SUCCEEDED' AND validation_state = 'PASSED' ORDER BY ordinal",
+    ).all(jobId);
+    if (candidates.length !== 1) {
+      throw new Error(`Job ${jobId} must have exactly one SUCCEEDED/PASSED candidate attempt, found ${candidates.length}`);
+    }
+    return candidates[0];
+  }
+
+  // Managed work routinely has SEVERAL passing candidates: a revision that fixes a semantic problem
+  // leaves the attempt it corrected behind as evidence, still SUCCEEDED and still PASSED. "The
+  // passed attempt" therefore stops describing anything, and the only sound answer is the one a
+  // review turn actually bound itself to.
+  //
+  // Every link is re-checked here rather than trusted, because this is the last gate before a human
+  // is asked to make something permanent:
+  //
+  //   the run accepted            status ACCEPTED with an accepted_attempt_id
+  //   a review said so            a COMPLETED REVIEW turn with action ACCEPT
+  //   about THAT attempt          its subject_attempt_id equals the accepted attempt
+  //   which belongs here          the attempt's job_id equals this job
+  //   and actually passed         SUCCEEDED, PASSED, with a result commit
+  //
+  // The foreign key proves the subject is an attempt. It does not prove it is an attempt of THIS
+  // job, which is why that is checked explicitly.
+  acceptedCandidate(jobId) {
+    const run = this.db.prepare("SELECT * FROM manager_runs WHERE job_id = ?").get(jobId);
+    if (!run) throw new Error(`Managed job ${jobId} has no manager run`);
+    if (run.status !== "ACCEPTED" || !run.accepted_attempt_id) {
+      throw new Error(
+        `Managed job ${jobId} has no accepted candidate: its manager run is ${run.status}. `
+        + "A managed candidate is offered for integration only after semantic review accepts it.",
+      );
+    }
+    const review = this.db.prepare(`SELECT * FROM manager_turns
+      WHERE manager_run_id = ? AND phase = 'REVIEW' AND state = 'COMPLETED' AND action = 'ACCEPT'
+        AND subject_attempt_id = ? ORDER BY ordinal DESC LIMIT 1`).get(run.id, run.accepted_attempt_id);
+    if (!review) {
+      throw new Error(
+        `Managed job ${jobId} names accepted attempt ${run.accepted_attempt_id} but no completed `
+        + "REVIEW turn accepted that attempt",
+      );
+    }
+    const candidate = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(run.accepted_attempt_id);
+    if (!candidate) throw new Error(`Accepted attempt ${run.accepted_attempt_id} does not exist`);
+    if (candidate.job_id !== jobId) {
+      throw new Error(`Accepted attempt ${candidate.id} belongs to job ${candidate.job_id}, not ${jobId}`);
+    }
+    if (candidate.terminal_state !== "SUCCEEDED" || candidate.validation_state !== "PASSED") {
+      throw new Error(
+        `Accepted attempt ${candidate.id} is ${candidate.terminal_state}/${candidate.validation_state}; `
+        + "semantic acceptance cannot substitute for deterministic validation",
+      );
+    }
+    return candidate;
+  }
+
   async proposeIntegration({ jobId }) {
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
@@ -1851,13 +2869,9 @@ export class Dispatcher {
     if (job.status !== "READY_FOR_INTEGRATION") {
       throw new Error(`Job ${jobId} is ${job.status}, expected READY_FOR_INTEGRATION`);
     }
-    const candidates = this.db.prepare(
-      "SELECT * FROM attempts WHERE job_id = ? AND terminal_state = 'SUCCEEDED' AND validation_state = 'PASSED' ORDER BY ordinal",
-    ).all(jobId);
-    if (candidates.length !== 1) {
-      throw new Error(`Job ${jobId} must have exactly one SUCCEEDED/PASSED candidate attempt, found ${candidates.length}`);
-    }
-    const candidate = candidates[0];
+    const candidate = job.strategy === "managed"
+      ? this.acceptedCandidate(jobId)
+      : this.soleCandidate(jobId);
     if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
     const project = this.getProject(job.project_id);
     const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);

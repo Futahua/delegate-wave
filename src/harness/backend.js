@@ -129,20 +129,31 @@ export function wireModel(model) {
 // The line that belongs in BOTH prompts is the one about acceptance. A worker may use the machine
 // freely; what it may not do is treat its own claims as the verdict. That is the invariant, and it
 // is stated to the worker rather than left implicit.
-export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+export function workerPrompt({ instruction, mode, profile = DEFAULT_CAPABILITY_PROFILE }) {
+  // Required, with no fallback to the objective.
+  //
+  // A fallback here would be invisible exactly when it matters: a managed attempt whose brief failed
+  // to arrive would run against the human's sentence instead, produce a plausible candidate, and pass
+  // review -- with nothing in the record showing the manager's instruction never reached anyone. The
+  // dispatcher resolves direct mode's objective-as-instruction explicitly before calling, so by the
+  // time execution reaches here there is exactly one right answer.
+  if (typeof instruction !== "string" || !instruction.trim()) {
+    throw new Error("workerPrompt requires an explicit instruction; the dispatcher must resolve one");
+  }
+  const task = instruction;
   const capabilities = capabilityProfile(profile);
   const acceptance = "Do not treat your own claims as acceptance: delegate-wave validates the result "
     + "afterwards and decides independently what is integrated.";
 
   if (mode === "read") {
     return "Investigate this task without modifying files. Return concise findings with exact file "
-      + `paths and evidence.\n\nTask: ${goal}`;
+      + `paths and evidence.\n\nTask: ${task}`;
   }
 
   if (capabilities.fenced) {
     return "Implement this bounded task in the current worktree. Do not commit, push, modify Git "
       + "metadata, or access files outside this worktree. Shell access is intentionally disabled; "
-      + `edit only the necessary files. ${acceptance}\n\nTask: ${goal}`;
+      + `edit only the necessary files. ${acceptance}\n\nTask: ${task}`;
   }
 
   return "Implement this task, working from the current attempt worktree. Use the machine and "
@@ -151,7 +162,7 @@ export function workerPrompt({ goal, mode, profile = DEFAULT_CAPABILITY_PROFILE 
     + "yours to use as well -- status, diff, log, blame, bisect, temporary branches, local commits. "
     + "Do not push. Your Git history is workspace activity, not integration: delegate-wave captures "
     + `the resulting tree relative to the base commit and builds its own candidate. ${acceptance}`
-    + `\n\nTask: ${goal}`;
+    + `\n\nTask: ${task}`;
 }
 
 // Builds the profile patch for one attempt.
@@ -319,7 +330,7 @@ export class HarnessBackend {
     }
   }
 
-  async run({ attemptId, worktreePath, goal, model, artifactDir, mode, onSpawn }) {
+  async run({ attemptId, worktreePath, instruction, goal, model, artifactDir, mode, onSpawn }) {
     if (!model) throw new Error("HarnessBackend requires an explicit model; the dispatcher must resolve one");
     if (!fs.existsSync(this.entry)) {
       throw new Error(`Harness is not installed at ${this.entry}; expected ${HARNESS_PACKAGE}@${HARNESS_VERSION}`);
@@ -353,7 +364,7 @@ export class HarnessBackend {
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "wx" });
     const stderrStream = fs.createWriteStream(stderrPath, { flags: "wx" });
 
-    const prompt = workerPrompt({ goal, mode, profile: this.profile });
+    const prompt = workerPrompt({ instruction, mode, profile: this.profile });
 
     const result = await runProcess(process.execPath, [
       this.entry, "--profile", "headless", "--patch", patchPath, prompt,
@@ -382,6 +393,26 @@ export class HarnessBackend {
       ...result, stdoutPath, stderrPath,
       sessionLogPath: this.sessionLogPath(artifactDir),
       capabilityProfile: this.profile,
+      // The strongest LOCAL provenance available, and precisely bounded: delegate-wave writes this
+      // patch itself, so what it SUPPLIED TO HARNESS AT LAUNCH is mechanically known.
+      //
+      // Not "composed". This file already documents that the loader skips patch entries it does not
+      // accept and merely warns -- which is exactly why assertFenceComposed() exists for the fenced
+      // profile. Without a config dump or runtime evidence, the patch proves the invocation, not
+      // that every entry survived composition. `harness-profile-patch` names that weaker claim
+      // honestly; a `--dump-config` run would be needed to name the stronger one.
+      //
+      // Every field is APPLIED, never observed. The session log is parsed for usage and for the
+      // turn/end marker and reports no model identity, so nothing here may claim what DeepSeek
+      // actually served -- observed_* stays null and the receipt reads UNVERIFIED, which is the
+      // honest description of a local executor whose provider reports no identity.
+      provenance: {
+        appliedModel: wireModel(model),
+        appliedEffort: this.reasoningEffort,
+        appliedExecutor: "harness",
+        appliedCapabilityProfile: this.profile,
+        appliedSource: fs.existsSync(patchPath) ? "harness-profile-patch" : null,
+      },
     };
   }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import path from "node:path";
 import { ControlClient } from "./control/client.js";
 
 function parseArgs(argv) {
@@ -108,6 +109,95 @@ async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   if (!positional[0] || options.help) { help(); return; }
   if (positional[0] === "serve") { await serve(); return; }
+
+  // Drives a managed job with the real Codex manager.
+  //
+  // Deliberately a separate command rather than a Control API route. Advancing a
+  // managed job spends scarce quota and can run cheap workers, and the Control
+  // API is what the Papers relay reaches -- putting this behind a route would
+  // hand that authority to a surface that is meant to observe and decide, not to
+  // Describes one OpenAI-compatible provider well enough for Codex to use it.
+  //
+  // Read from the executor's own registry rather than hardcoded: the base URL and the environment
+  // variable name are the provider's facts, not delegate-wave's, and a stale copy here would send
+  // the manager's turns somewhere that no longer exists.
+  //
+  // The key is looked up but never logged, never written to config, and never passed to anything
+  // except the one child process that needs it.
+  async function resolveManagerProvider(id) {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const home = os.homedir();
+    const registryPath = path.join(home, ".cache", "opencode", "models.json");
+    let entry = null;
+    try { entry = JSON.parse(fs.readFileSync(registryPath, "utf8"))[id] ?? null; } catch { entry = null; }
+    if (!entry?.api) {
+      throw new Error(
+        `Unknown manager provider "${id}": no entry with an api URL in ${registryPath}. `
+        + "Pass a bare model name to use the Codex plan instead.",
+      );
+    }
+    const envKey = entry.env?.[0] ?? "OPENCODE_API_KEY";
+    let apiKey = process.env[envKey] ?? null;
+    if (!apiKey) {
+      try {
+        const auth = JSON.parse(fs.readFileSync(path.join(home, ".local", "share", "opencode", "auth.json"), "utf8"));
+        apiKey = auth[id]?.key ?? null;
+      } catch { apiKey = null; }
+    }
+    if (!apiKey) {
+      throw new Error(`No credential for provider "${id}": set ${envKey}, or authenticate it in OpenCode.`);
+    }
+    return { id, name: entry.name ?? id, baseUrl: entry.api, envKey, wireApi: "responses", apiKey };
+  }
+
+  // commission strong-model work.
+  if (positional[0] === "manage") {
+    const jobId = positional[1];
+    if (!jobId) throw new Error("usage: delegate-wave manage <jobId> [--model <id>] [--effort <level>]");
+    const [{ Dispatcher }, { ManagerService }, { CodexManagerBackend }, { dataRoot }] = await Promise.all([
+      import("./service.js"), import("./manager/service.js"),
+      import("./manager/backend.js"), import("./paths.js"),
+    ]);
+    const { BackendRouter } = await import("./harness/select.js");
+    const { initializeDataRoot } = await import("./db.js");
+    const root = dataRoot();
+    initializeDataRoot(root);
+    // Same construction the served runtime uses: the router decides per attempt
+    // from the resolved model, never inside one.
+    const router = new BackendRouter({
+      apiKey: process.env.DELEGATE_WAVE_EXECUTOR_API_KEY || null,
+      prefer: process.env.DELEGATE_WAVE_BACKEND || "harness",
+    });
+    const dispatcher = new Dispatcher({ root, backend: null, router });
+    // A NEUTRAL working directory. The manager reasons from evidence packs
+    // delegate-wave assembles, never by exploring the repository itself -- that
+    // is what the cheap investigations are for, and pointing the most expensive
+    // model at a codebase is the substitution this design exists to prevent.
+    const workingDirectory = path.join(root, "tmp", "manager");
+    // A provider-prefixed model selects an OpenAI-compatible route; a bare one uses the Codex plan.
+    //
+    // Both go through the SAME manager. Codex already knows how to talk to another provider --
+    // model_providers is its own configuration surface -- so a second supplier is configuration,
+    // not a second code path to keep in step.
+    const [providerId, providerModel] = String(options.model ?? "").includes("/")
+      ? options.model.split("/", 2)
+      : [null, options.model ?? null];
+    const manager = new CodexManagerBackend({
+      model: providerModel,
+      effort: options.effort ?? "high",
+      workingDirectory,
+      ...(providerId ? { provider: await resolveManagerProvider(providerId) } : {}),
+    });
+    const service = new ManagerService({ dispatcher, backend: manager, workerModel: options.workerModel ?? null });
+    try {
+      print(await service.advance(jobId));
+    } finally {
+      await manager.close();
+      dispatcher.close();
+    }
+    return;
+  }
   if (positional[0] === "supervisor") {
     const { WindowsSupervisor } = await import("./supervisor.js");
     const supervisor = new WindowsSupervisor();

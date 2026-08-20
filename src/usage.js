@@ -7,6 +7,23 @@ import fs from "node:fs";
 import { referenceCostUsd } from "./pricing.js";
 
 export const USAGE_UNKNOWN = "UNKNOWN";
+// The executor is POSITIVELY KNOWN to have failed before a provider request was possible.
+//
+// This is not "we found no usage" -- that is UNKNOWN, and it must stay blocking, because an executor
+// that reached a provider and then lost its accounting really did spend money. This status means
+// something stronger and narrower: the process died during its own local initialization, so a
+// billable call could not have been made. Zero here is DERIVED from that positive evidence, not
+// assumed from an absence -- and it is not measured either: nothing observed provider usage, because
+// no provider was reached. The three ledger meanings must stay disjoint:
+//
+//   COMPLETE / PARTIAL    provider-side usage evidence exists
+//   UNKNOWN               provider contact may have happened; cost cannot be established
+//   NO_PROVIDER_CONTACT   local evidence proves execution stopped before provider contact; cost $0
+//
+// Only an executor adapter may assert this, and only from a signature it recognises. Empty logs, a
+// null exit code, and generic process failure are all insufficient -- each is equally consistent with
+// a worker that ran, spent, and crashed while writing its report.
+export const USAGE_NO_PROVIDER_CONTACT = "NO_PROVIDER_CONTACT";
 export const USAGE_PARTIAL = "PARTIAL";
 export const USAGE_COMPLETE = "COMPLETE";
 
@@ -167,6 +184,31 @@ export function parseOpenCodeUsage(text) {
   };
 }
 
+// An observation asserting the executor died before it could contact a provider.
+//
+// `evidence` is required and recorded verbatim, so the zero can be audited against the reason it
+// was believed rather than taken on trust.
+export function noProviderContactObservation({ evidence, artifact = null, format = "none" }) {
+  if (typeof evidence !== "string" || !evidence.trim()) {
+    throw new Error("noProviderContactObservation requires evidence for the pre-provider claim");
+  }
+  return {
+    status: USAGE_NO_PROVIDER_CONTACT,
+    input_tokens: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    provider_steps: 0,
+    reported_cost_usd: null,
+    reported_cost_source: null,
+    malformed_events: 0,
+    pre_provider_evidence: evidence.trim(),
+    source_artifact: artifact,
+    source_format: format,
+  };
+}
+
 // An observation carrying no usable evidence. Used whenever a backend supplies nothing.
 export function unknownObservation({ artifact = null, format = "none", malformed = 0 } = {}) {
   return {
@@ -209,7 +251,7 @@ const TOKEN_FIELDS = Object.freeze([
 export function assertValidObservation(observed) {
   const fail = (reason) => { throw new Error(`Invalid usage observation: ${reason}`); };
   if (!observed || typeof observed !== "object") fail("not an object");
-  if (![USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN].includes(observed.status)) {
+  if (![USAGE_COMPLETE, USAGE_PARTIAL, USAGE_UNKNOWN, USAGE_NO_PROVIDER_CONTACT].includes(observed.status)) {
     fail(`unknown status ${observed.status}`);
   }
 
@@ -225,6 +267,19 @@ export function assertValidObservation(observed) {
     if (observed.reported_cost_usd !== null && observed.reported_cost_usd !== undefined) {
       fail("reported_cost_usd set under UNKNOWN");
     }
+  } else if (observed.status === USAGE_NO_PROVIDER_CONTACT) {
+    // Every number is a derived zero. NULL would make this indistinguishable from UNKNOWN in the
+    // stored row, and any nonzero figure would contradict the claim the status is making.
+    for (const field of TOKEN_FIELDS) {
+      if (observed[field] !== 0) fail(`${field} must be 0 under NO_PROVIDER_CONTACT`);
+    }
+    if (observed.provider_steps !== 0) fail("provider_steps must be 0 under NO_PROVIDER_CONTACT");
+    if (observed.reported_cost_usd !== null && observed.reported_cost_usd !== undefined) {
+      fail("reported_cost_usd set under NO_PROVIDER_CONTACT: the executor reported nothing");
+    }
+    // The claim "this cost nothing" must carry the reason it is believable, or it is an assumption
+    // wearing a status column.
+    if (!observed.pre_provider_evidence) fail("NO_PROVIDER_CONTACT requires pre_provider_evidence");
   } else {
     for (const field of TOKEN_FIELDS) {
       if (!wholeNonNegative(observed[field])) fail(`${field} must be a non-negative integer`);
@@ -262,7 +317,12 @@ export function finalizeUsageReceipt({
   assertValidObservation(observed);
   const priced = observed.status === USAGE_UNKNOWN
     ? { reference_cost_usd: null, pricing_basis_id: null }
-    : referenceCostUsd(observed, { model, ...(basisId ? { basisId } : {}) });
+    // A run that never reached a provider has a reference cost of exactly zero. It is PRICED, which
+    // is what keeps it out of the unaccounted-spend count, but names no pricing basis, because no
+    // tokens were bought at any rate.
+    : observed.status === USAGE_NO_PROVIDER_CONTACT
+      ? { reference_cost_usd: 0, pricing_basis_id: null }
+      : referenceCostUsd(observed, { model, ...(basisId ? { basisId } : {}) });
 
   return {
     attempt_id: attemptId,

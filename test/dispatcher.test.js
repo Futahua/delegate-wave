@@ -140,9 +140,17 @@ test("child processes exclude every Control API authority credential unless expl
 
   // A validation command, which runs repository-controlled content through the shell. Probe by
   // environment name rather than by embedding a script, so quoting cannot mask a leak.
+  //
+  // Written for the shell runShell actually launches. The probe was PowerShell-only, which on a
+  // POSIX runner produced no output at all -- and an empty answer is indistinguishable from a
+  // silent pass unless something asserts otherwise, which is exactly how a credential-isolation
+  // check could have gone green while testing nothing.
   const validated = await runShell(
-    "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
-    + " { 'leaked' } else { 'absent' }",
+    process.platform === "win32"
+      ? "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
+        + " { 'leaked' } else { 'absent' }"
+      : 'if [ -n "$DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN" ] || [ -n "$DELEGATE_WAVE_CONTROL_TOKEN" ];'
+        + ' then echo leaked; else echo absent; fi',
   );
   assert.equal(validated.stdout.trim(), "absent");
 
@@ -251,7 +259,13 @@ test("validation failure rejects but preserves a completed executor attempt", as
   });
   const service = new Dispatcher({ root, backend });
   t.after(async () => { service.close(); await cleanup(); });
-  const project = await service.addProject({ name: "Fixture", repoPath: repo, validation: ["exit 9"] });
+  // `exit 9` was a shell builtin, which only ever meant anything because validation went through an
+  // interpreter. Validation now runs one program with an argument vector, so a failing check has to
+  // be a program that fails -- which is also the only kind whose nonzero status says anything about
+  // the candidate.
+  const project = await service.addProject({
+    name: "Fixture", repoPath: repo, validation: ['node -e "process.exit(9)"'],
+  });
   const job = await service.createJob({ projectId: project.id, goal: "invalid candidate", maxAttempts: 1 });
   const result = await service.runJob(job.id);
   assert.equal(result.job.status, "NEEDS_ATTENTION");
