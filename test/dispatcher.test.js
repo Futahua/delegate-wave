@@ -140,9 +140,17 @@ test("child processes exclude every Control API authority credential unless expl
 
   // A validation command, which runs repository-controlled content through the shell. Probe by
   // environment name rather than by embedding a script, so quoting cannot mask a leak.
+  //
+  // Written for the shell runShell actually launches. The probe was PowerShell-only, which on a
+  // POSIX runner produced no output at all -- and an empty answer is indistinguishable from a
+  // silent pass unless something asserts otherwise, which is exactly how a credential-isolation
+  // check could have gone green while testing nothing.
   const validated = await runShell(
-    "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
-    + " { 'leaked' } else { 'absent' }",
+    process.platform === "win32"
+      ? "if ($env:DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN -or $env:DELEGATE_WAVE_CONTROL_TOKEN)"
+        + " { 'leaked' } else { 'absent' }"
+      : 'if [ -n "$DELEGATE_WAVE_CONTROL_PROPOSER_TOKEN" ] || [ -n "$DELEGATE_WAVE_CONTROL_TOKEN" ];'
+        + ' then echo leaked; else echo absent; fi',
   );
   assert.equal(validated.stdout.trim(), "absent");
 
