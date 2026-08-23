@@ -26,7 +26,10 @@ const git = async (repo, ...args) => {
 };
 
 // A world with a real repository, a real candidate commit, and a fake worker that produced it.
-async function world(t, { validation = [], seed = "line one\n" } = {}) {
+// detach controls the repository ARRANGEMENT under test: a target branch nobody has checked out
+// (published by compare-and-swap) versus the ordinary clone with it checked out (published by
+// fast-forward, so git moves ref, index and files together).
+async function world(t, { validation = [], seed = "line one\n", detach = true } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-si-"));
   const root = path.join(temp, "data");
   const repo = path.join(temp, "repo");
@@ -42,7 +45,7 @@ async function world(t, { validation = [], seed = "line one\n" } = {}) {
   // under a working tree desynchronises its index, and git's own receive-pack refuses it. Detaching
   // here is the arrangement in which auto-integration is safe at all -- test 9 covers what happens
   // when it is not.
-  await git(repo, "checkout", "--detach", "HEAD");
+  if (detach) await git(repo, "checkout", "--detach", "HEAD");
   initializeDataRoot(root);
 
   const dispatcher = new Dispatcher({
@@ -235,27 +238,76 @@ test("8. death after CAS: a restart does not publish twice", async (t) => {
   assert.equal(await w.head(), headAfterPublish, "the ref did not move a second time");
 });
 
-test("9. a checked-out target refuses mechanically rather than touching a working tree", async (t) => {
-  // The way an automatic integrator silently eats uncommitted work is by moving a ref out from
-  // under a working tree. Refused, never stashed, reset or checked out over.
-  const w = await world(t, { validation: [] });
+test("9a. a clean checked-out target publishes by fast-forward, coherently", async (t) => {
+  // The ordinary shape of a working repository. A raw ref update would leave this worktree's index
+  // and files describing a commit that is no longer its head, so git performs the move instead and
+  // ref, index and files land together.
+  const w = await world(t, { validation: [], detach: false });
+  const before = await w.head();
   const staged = await w.integrator.prepare({
     job: w.dispatcher.getJob(w.job.id), project: w.project, candidate: w.candidate,
   });
-  const before = await w.head();
 
-  const checkout = path.join(os.tmpdir(), `human-${Date.now()}`);
-  await git(w.repo, "worktree", "add", checkout, "main");
-  // main is now checked out with a human's uncommitted edit sitting in it.
-  fs.writeFileSync(path.join(checkout, "shared.txt"), "MY UNCOMMITTED EDIT\n");
-  try {
-    await assert.rejects(w.integrator.publish(staged.id), /checked out/);
-    assert.equal(await w.head(), before, "the ref did not move");
-    assert.equal(fs.readFileSync(path.join(checkout, "shared.txt"), "utf8"), "MY UNCOMMITTED EDIT\n",
-      "the human's uncommitted work is exactly as they left it");
-  } finally {
-    await runProcess("git", ["-C", w.repo, "worktree", "remove", "--force", checkout]);
-  }
+  const published = await w.integrator.publish(staged.id);
+  assert.equal(published.published, true, "a clean checkout is not permanently ineligible for Auto");
+
+  const after = await w.head();
+  assert.equal(after, staged.prepared_commit);
+  assert.notEqual(after, before);
+  // The working tree really moved with the ref, rather than being left describing the old commit.
+  assert.equal(fs.existsSync(path.join(w.repo, "feature.txt")), true);
+  assert.equal((await git(w.repo, "status", "--porcelain")).trim(), "",
+    "the checkout is clean afterwards, not desynchronised");
+});
+
+test("9b. a dirty checked-out target refuses, and the human's edit is untouched", async (t) => {
+  // Never stash, reset or check out over somebody mid-thought. The candidate is preserved and
+  // whether this genuinely needs the person is a judgment made above this layer.
+  const w = await world(t, { validation: [], detach: false });
+  const before = await w.head();
+  const staged = await w.integrator.prepare({
+    job: w.dispatcher.getJob(w.job.id), project: w.project, candidate: w.candidate,
+  });
+  fs.writeFileSync(path.join(w.repo, "shared.txt"), "MY UNCOMMITTED EDIT\n");
+
+  const published = await w.integrator.publish(staged.id);
+  assert.equal(published.published, false);
+  assert.equal(published.reason, "TARGET_DIRTY");
+  assert.equal(await w.head(), before, "the ref did not move");
+  assert.equal(fs.readFileSync(path.join(w.repo, "shared.txt"), "utf8"), "MY UNCOMMITTED EDIT\n",
+    "exactly as they left it");
+  assert.ok(w.integrator.record(staged.id).prepared_commit, "the candidate work is preserved");
+});
+
+test("10. reconciliation cannot smuggle in a protected-path change", async (t) => {
+  // The new way to circumvent a protection without breaking it: let a conflict resolution touch
+  // something the original worker was never allowed to touch.
+  const w = await world(t, { validation: [] });
+  const observed = await w.head();
+  const staged = await w.integrator.prepare({
+    job: w.dispatcher.getJob(w.job.id), project: w.project, candidate: w.candidate,
+  });
+  assert.equal(staged.validation_state, "PASSED", "the honest candidate integrates fine");
+
+  // Now a candidate that reaches into a protected path.
+  const wt = path.join(os.tmpdir(), `smuggle-${Date.now()}`);
+  await git(w.repo, "worktree", "add", "--detach", wt, observed);
+  fs.writeFileSync(path.join(wt, "protected.txt"), "smuggled\n");
+  await git(wt, "add", ".");
+  await git(wt, "-c", "user.name=W", "-c", "user.email=w@e.invalid", "commit", "-m", "reach into protected");
+  const smuggled = await git(wt, "rev-parse", "HEAD");
+  await runProcess("git", ["-C", w.repo, "worktree", "remove", "--force", wt]);
+
+  w.dispatcher.db.prepare("UPDATE attempts SET result_commit = ? WHERE id = ?")
+    .run(smuggled, w.candidate.id);
+  const candidate = w.dispatcher.db.prepare("SELECT * FROM attempts WHERE id = ?").get(w.candidate.id);
+
+  const attempt = await w.integrator.prepare({
+    job: w.dispatcher.getJob(w.job.id), project: w.project, candidate,
+  });
+  assert.equal(attempt.publish_state, "FAILED");
+  assert.match(attempt.outcome, /Protected path changed: protected\.txt/);
+  assert.equal(await w.head(), observed, "nothing was published");
 });
 
 test("11. the validated tree is the published tree, and a different tree is refused", async (t) => {

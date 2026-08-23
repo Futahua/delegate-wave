@@ -121,6 +121,12 @@ export class SafeIntegrator {
       const prepared = await this.reconcile({ worktree, project, candidate, observed, attemptId });
       const tree = (await runProcess("git", ["-C", worktree, "rev-parse", `${prepared}^{tree}`])).stdout.trim();
 
+      // A reconciliation must not introduce a protected-path change the original worker could not
+      // have made. Measured as the delta from the OBSERVED TARGET to the prepared tree, so a
+      // protected file the target itself already changed concurrently is not blamed on this session
+      // -- only what this integration would newly impose.
+      await this.assertReconciliationRespectsProtectedPaths({ project, observed, prepared, worktree });
+
       const plan = JSON.parse(project.validation_json || "[]");
       const planDigest = crypto.createHash("sha256").update(JSON.stringify(plan)).digest("hex");
       this.update(attemptId, {
@@ -220,12 +226,21 @@ export class SafeIntegrator {
     // work. Refused mechanically rather than stashed, reset or checked out over.
     const checkedOut = (await listWorktrees(project.repo_path))
       .find((entry) => entry.branch === `refs/heads/${staged.target_ref}` || entry.branch === staged.target_ref);
+
     if (checkedOut) {
-      this.update(attemptId, { publish_state: "FAILED", outcome: `target ${staged.target_ref} is checked out` });
-      throw new Error(
-        `refusing to publish onto ${staged.target_ref}: it is checked out at ${checkedOut.path}, `
-        + "and moving it could discard uncommitted work",
-      );
+      // The ordinary shape of a working repository: a clone with the target branch checked out.
+      //
+      // A raw ref update here would leave that worktree's index and files describing a commit that
+      // is no longer its head, which is how an automatic integrator quietly corrupts someone's
+      // checkout -- and git's own receive-pack refuses it for exactly that reason. But refusing
+      // outright would make the commonest repository arrangement permanently ineligible for
+      // automatic integration, so a fast-forward that git performs coherently is used instead.
+      //
+      // Only a fast-forward, and only into a clean worktree. Anything else would mean resolving or
+      // discarding work that is not ours.
+      const published = await this.publishByFastForward({ staged, project, worktree: checkedOut.path });
+      if (!published.published) return published;
+      return this.recordPublication(staged);
     }
 
     try {
@@ -238,8 +253,12 @@ export class SafeIntegrator {
       return { published: false, reason: "CAS_REFUSED", detail: error.message };
     }
 
+    return this.recordPublication(staged);
+  }
+
+  recordPublication(staged) {
     transaction(this.db, () => {
-      this.update(attemptId, {
+      this.update(staged.id, {
         publish_state: "PUBLISHED",
         published_from_sha: staged.observed_target_sha,
         published_to_sha: staged.prepared_commit,
@@ -247,12 +266,77 @@ export class SafeIntegrator {
       recordEvent(this.db, {
         kind: "STAGED_INTEGRATION_PUBLISHED", entityType: "job", entityId: staged.job_id,
         payload: {
-          attemptId, targetRef: staged.target_ref,
+          attemptId: staged.id, targetRef: staged.target_ref,
           from: staged.observed_target_sha, to: staged.prepared_commit, tree: staged.prepared_tree,
         },
       });
     });
     return { published: true, reason: "PUBLISHED" };
+  }
+
+  // Publication into a live checkout, performed by git so ref, index and files move together.
+  async publishByFastForward({ staged, project, worktree }) {
+    // Dirty means somebody is mid-thought in there. Never stash, reset or check out over it: the
+    // candidate is preserved and whether this genuinely needs the person is a judgment above here.
+    const dirty = (await runProcess("git", ["-C", worktree, "status", "--porcelain"])).stdout.trim();
+    if (dirty) {
+      this.update(staged.id, {
+        publish_state: "FAILED",
+        outcome: `target ${staged.target_ref} is checked out at ${worktree} with uncommitted changes`,
+      });
+      return { published: false, reason: "TARGET_DIRTY", detail: worktree };
+    }
+
+    // The head must still be what was validated against, and the prepared commit must genuinely
+    // descend from it -- otherwise "fast-forward" would be discarding something.
+    const head = await resolveRevision(worktree, "HEAD");
+    if (head !== staged.observed_target_sha) return { published: false, reason: "CAS_REFUSED", detail: head };
+    if (!await isAncestor(project.repo_path, head, staged.prepared_commit)) {
+      return { published: false, reason: "NOT_FAST_FORWARDABLE", detail: head };
+    }
+
+    const merged = await runProcess("git", ["-C", worktree, "merge", "--ff-only", staged.prepared_commit]);
+    if (merged.exitCode !== 0) {
+      return { published: false, reason: "CAS_REFUSED", detail: merged.stderr.trim() };
+    }
+    // Believe git, not the exit code: confirm the head is exactly the proven commit.
+    const landed = await resolveRevision(worktree, "HEAD");
+    if (landed !== staged.prepared_commit) {
+      return { published: false, reason: "CAS_REFUSED", detail: landed };
+    }
+    return { published: true, reason: "PUBLISHED" };
+  }
+
+  // What this integration would NEWLY impose on protected paths.
+  //
+  // Measured from the observed target to the prepared tree, not from the candidate's own base. A
+  // protected file that the target itself changed concurrently is that commit's business and is
+  // already in the branch; blaming this session for it would refuse integrations for other people's
+  // changes. What must not happen is a reconciliation introducing a protected-path modification the
+  // original worker was never allowed to make -- resolving a conflict is not a licence to edit
+  // whatever the resolution touches.
+  //
+  // Rename sources count. A rule that only saw destinations would let a protected file be moved
+  // away, which changes it as surely as editing it.
+  async assertReconciliationRespectsProtectedPaths({ project, observed, prepared, worktree }) {
+    const protectedPaths = JSON.parse(project.protected_json || "[]");
+    if (!protectedPaths.length) return;
+    const diff = await runProcess("git", [
+      "-C", worktree, "diff", "--name-status", "-M", `${observed}..${prepared}`,
+    ]);
+    if (diff.exitCode !== 0) throw new Error(`could not read the integration delta: ${diff.stderr.trim()}`);
+
+    const touched = new Set();
+    for (const raw of diff.stdout.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      // A rename line carries status, source and destination; every other status carries one path.
+      const parts = line.split(/\t/);
+      if (parts.length >= 3) { touched.add(parts[1]); touched.add(parts[2]); }
+      else if (parts.length === 2) touched.add(parts[1]);
+    }
+    // The same rule the worker's own diff is held to, so reconciliation cannot be a way around it.
+    this.dispatcher.assertAllowedDiff([...touched], protectedPaths);
   }
 
   // What a restart makes of an interrupted publication.
