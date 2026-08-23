@@ -15,7 +15,10 @@ export const SCOPES = Object.freeze({
 });
 
 export const PRINCIPAL_SCOPES = Object.freeze({
-  operator: Object.freeze([SCOPES.READ, SCOPES.PROPOSE, SCOPES.OPERATE]),
+  // The operator holds SESSION too. Hermes may start autonomous sessions, so a human at the CLI
+  // must not be the one principal that cannot -- an authority model where the delegate outranks the
+  // person is a mistake, not a safety property.
+  operator: Object.freeze([SCOPES.READ, SCOPES.PROPOSE, SCOPES.OPERATE, SCOPES.SESSION]),
   observer: Object.freeze([SCOPES.READ]),
   // Proposal authority is deliberately READ + PROPOSE: Hermes may see enough to propose bounded work
   // and may create a proposal, but holds no OPERATE scope, so it can never approve, run, integrate,
