@@ -346,7 +346,12 @@ export class ManagerService {
   }
 
   // Drives a managed job as far as it can go without a person.
-  async advance(jobId) {
+  async advance(jobId, { clarifications = [] } = {}) {
+    // What the person who owns the intent has already told us.
+    //
+    // Held for the duration of this call rather than passed through every frame: the manager reads
+    // it wherever it builds a pack, and a caller that supplies nothing behaves exactly as before.
+    this.clarifications = clarifications;
     const job = this.dispatcher.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     if (job.strategy !== "managed") throw new Error(`Job ${jobId} is a ${job.strategy} job`);
@@ -429,6 +434,7 @@ export class ManagerService {
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       workerCapabilities: this.workerCapabilities(job),
+      clarifications: this.clarifications ?? [],
     });
     const { decision } = await this.runTurn(run, { phase: "PLAN", prompt: renderEvidence(pack) });
 
@@ -684,6 +690,7 @@ export class ManagerService {
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       explorations: reports,
       priorCandidate: this.priorCandidate(run),
+      clarifications: this.clarifications ?? [],
       // The envelope for the work being PLANNED, which is implementation. Investigation children run
       // read-only, but the manager is deciding what to build, not what to read.
       workerCapabilities: this.workerCapabilities(job),
@@ -974,6 +981,32 @@ export class ManagerService {
       refused,
       totalCostUsd: priced.reduce((acc, entry) => acc + entry.cost, 0),
     };
+  }
+
+  // Returns an escalated run to work, carrying whatever settled the question.
+  //
+  // A run that escalated is parked in AWAITING_HUMAN, which advance() treats as terminal -- rightly,
+  // because nothing should resume a run whose blocking question is still open. Answering it is a
+  // real state change and needs to be recorded as one: the question was asked, something answered
+  // it, and the run may proceed.
+  //
+  // It resumes at PLANNING rather than where it stopped. The escalation means the manager could not
+  // decide with what it had; now it has more, so re-deciding is the honest next step, and the
+  // answer travels in the evidence pack rather than in whatever thread happened to be open.
+  resumeFromEscalation(jobId, { reason = "answered" } = {}) {
+    const run = this.getRun(jobId);
+    if (!run) throw new Error(`Unknown managed job: ${jobId}`);
+    if (run.status !== "AWAITING_HUMAN") return run;
+    transaction(this.db, () => {
+      this.setRun(run.id, { status: "PLANNING", escalation_question: null });
+      this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?")
+        .run(now(), jobId);
+      recordEvent(this.db, {
+        kind: "MANAGER_ESCALATION_RESOLVED", entityType: "job", entityId: jobId,
+        payload: { runId: run.id, question: run.escalation_question, reason },
+      });
+    });
+    return this.getRun(jobId);
   }
 
   // What a reboot makes of an interrupted run.

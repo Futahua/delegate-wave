@@ -97,7 +97,7 @@ function readArtifact(artifactPath, limit, options) {
 // prevent.
 export function buildPlanEvidence({
   objective, baseSha, validationCommands, protectedPaths, explorations = [], workerCapabilities = null,
-  priorCandidate = null,
+  priorCandidate = null, clarifications = [],
 }) {
   return {
     kind: "PLAN",
@@ -121,6 +121,14 @@ export function buildPlanEvidence({
     // state, which is what makes thread rollover a correctness-preserving property rather than a
     // transport patch.
     prior_candidate: priorCandidate,
+    // What the person who owns the intent has already settled.
+    //
+    // delegate-wave never sees the conversation the objective came from, so when the manager asks a
+    // question and gets an answer, that answer is the ONLY record that the ambiguity was resolved
+    // and how. Carried in the pack rather than the thread for the usual reason: a fresh thread must
+    // reach the same decision, and re-asking a question the user already answered spends a scarce
+    // turn to learn something already known.
+    clarifications,
     // Who executes the deterministic checks. Not the worker.
     validation_owner: "delegate-wave",
     // Present only after an exploration round; empty on the first turn.
@@ -343,6 +351,17 @@ function renderPriorCandidate(lines, candidate) {
   );
 }
 
+// Answers already given, oldest first. Settled questions, not suggestions.
+function renderClarifications(lines, clarifications) {
+  if (!clarifications?.length) return;
+  lines.push("", "Already settled with the person who asked for this:");
+  for (const item of clarifications) {
+    lines.push(`  asked: ${item.question}`);
+    lines.push(`  answered: ${item.answer}`);
+  }
+  lines.push("", "These are decisions, not opinions. Do not re-ask them.");
+}
+
 export function renderEvidence(pack) {
   const lines = [];
   const section = (title) => { lines.push("", `## ${title}`, ""); };
@@ -387,6 +406,7 @@ export function renderEvidence(pack) {
     }
     renderCapabilities(lines, pack.worker_capabilities);
     renderPriorCandidate(lines, pack.prior_candidate);
+    renderClarifications(lines, pack.clarifications);
     if (pack.protected_paths.length) {
       lines.push(`Paths a worker may not touch: ${pack.protected_paths.join(", ")}`);
     }

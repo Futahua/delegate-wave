@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "28";
+export const SCHEMA_VERSION = "29";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -698,6 +698,64 @@ CREATE TABLE IF NOT EXISTS manager_receipt_pricings (
   derived_at TEXT NOT NULL,
   PRIMARY KEY (manager_turn_id, pricing_basis, pricing_basis_version)
 );
+
+-- One autonomous task, from the user's words to a finished result.
+--
+-- The layer Hermes talks to. It holds three things delegate-wave has never had a home for: the
+-- user's ORIGINAL intent in their own words, the autonomy mode they granted, and the semantic
+-- conversation between Hermes and the manager.
+--
+-- mode is a permission ENVELOPE, not a workflow state. It says what this session is allowed to do;
+-- state says what is currently happening. Keeping them in separate columns is deliberate -- the
+-- moment a mode starts meaning "which step comes next" it has become the ceremony this design
+-- exists to remove.
+--
+-- BYPASS suppresses QUESTIONS, never INVARIANTS. Protected paths, deterministic validation, CAS
+-- integration, budget admission, worktree and credential isolation are mechanical and refuse under
+-- every mode including this one.
+CREATE TABLE IF NOT EXISTS autonomous_sessions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  -- Null until the session commissions work. PLAN sessions may never acquire one.
+  job_id TEXT REFERENCES jobs(id),
+  -- The user's own words, kept verbatim. delegate-wave never sees their conversation with Hermes,
+  -- so this is the only record of what was actually asked for.
+  intent TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('AUTO', 'MANUAL', 'ACCEPT_EDITS', 'PLAN', 'BYPASS')),
+  state TEXT NOT NULL CHECK (state IN (
+    'WORKING', 'WAITING_FOR_HERMES', 'SEMANTICALLY_ACCEPTED', 'COMPLETED', 'FAILED'
+  )),
+  -- Why the session stopped, when it stopped for a reason worth reporting.
+  outcome TEXT,
+  maximum_cost REAL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (maximum_cost IS NULL OR maximum_cost > 0)
+);
+
+-- The semantic exchange, append-only.
+--
+-- Durable because it is EVIDENCE, not conversation. A manager question and the answer Hermes gave
+-- it are what the next turn reasons from, so they must survive a restart, a dropped stdio pipe and
+-- an expired provider thread. Conversation continuity stays an optimisation; this is the record.
+CREATE TABLE IF NOT EXISTS autonomous_session_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES autonomous_sessions(id),
+  ordinal INTEGER NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('TO_HERMES', 'FROM_HERMES')),
+  -- A question carries its own stakes: what was asked, why it matters, what was already found.
+  body TEXT NOT NULL,
+  why_it_matters TEXT,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  -- Set when a TO_HERMES question has been answered, naming the message that answered it.
+  answered_by TEXT REFERENCES autonomous_session_messages(id),
+  created_at TEXT NOT NULL,
+  UNIQUE (session_id, ordinal)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_session_messages_immutable_delete
+BEFORE DELETE ON autonomous_session_messages
+BEGIN SELECT RAISE(ABORT, 'autonomous_session_messages is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_manager_receipt_pricings_immutable_update
 BEFORE UPDATE ON manager_receipt_pricings
