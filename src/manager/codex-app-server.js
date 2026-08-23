@@ -351,7 +351,14 @@ export class CodexAppServer {
         if (params?.turn?.error) collected.error = params.turn.error?.message ?? "turn failed";
         turn.settle({ ...collected });
       } else if (method === "error") {
-        collected.error = params?.message ?? "app-server reported an error";
+        // The whole payload when there is no message, rather than a sentence that says nothing.
+        //
+        // "app-server reported an error" with the detail discarded is unfalsifiable from the ledger:
+        // it names no cause, so every diagnosis becomes guesswork against a live provider. Whatever
+        // the server actually said is worth more than a tidy string.
+        collected.error = params?.message
+          ?? params?.error?.message
+          ?? (params ? `app-server error: ${JSON.stringify(params).slice(0, 500)}` : "app-server reported an error");
         turn.settle(null, Object.assign(new Error(collected.error), { uncertain: true }));
       }
     };

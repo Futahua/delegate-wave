@@ -110,6 +110,19 @@ export class CodexManagerBackend extends ManagerBackend {
   get name() { return "codex"; }
 
   async server_() {
+    // A dead app server is not a server.
+    //
+    // The connection was cached for the lifetime of the object, which is fine for a CLI invocation
+    // that builds one, uses it and exits. A served runtime holds the same backend for days: when the
+    // child exits -- recycled, timed out, crashed -- every thread opened on it afterwards fails with
+    // "thread not found", and the thread-rollover machinery then rolls over onto another dead
+    // connection and fails identically. Rebuilding is the difference between a transient provider
+    // hiccup and a manager that never works again until someone restarts the process.
+    if (this.server?.closed) {
+      const reason = this.server.exitReason;
+      this.server = null;
+      this.lastServerExit = reason;
+    }
     if (!this.server) {
       fs.mkdirSync(this.workingDirectory, { recursive: true });
       this.server = new CodexAppServer({
