@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "29";
+export const SCHEMA_VERSION = "30";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -752,6 +752,78 @@ CREATE TABLE IF NOT EXISTS autonomous_session_messages (
   created_at TEXT NOT NULL,
   UNIQUE (session_id, ordinal)
 );
+
+-- One attempt to publish an accepted candidate onto a real branch.
+--
+-- PREPARE, VALIDATE, PUBLISH -- in that order, and the branch moves only at the last step.
+--
+-- The obvious design is to integrate, test, and roll back if bad. This is not that. Rollback as a
+-- happy-path mechanism means every ordinary failure briefly moves a real branch, and "briefly" is
+-- indistinguishable from "permanently" to anything that read it, cloned it, or built from it in
+-- between. Here an ordinary failure never touches the branch at all: the integrated tree is
+-- constructed and proven in a disposable worktree first, and the ref moves once, by
+-- compare-and-swap, to a commit already known to be green.
+--
+-- The columns exist to answer one question after a crash, without inferring anything from Git
+-- history: WHAT EXACT TREE DID WE VALIDATE, WHAT TARGET DID WE BELIEVE EXISTED, AND DID THAT EXACT
+-- TREE ACTUALLY BECOME THE BRANCH HEAD?
+CREATE TABLE IF NOT EXISTS staged_integrations (
+  id TEXT PRIMARY KEY,
+  session_id TEXT REFERENCES autonomous_sessions(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  target_ref TEXT NOT NULL,
+  -- What was accepted, and the world it was accepted against.
+  candidate_commit TEXT NOT NULL,
+  candidate_base_sha TEXT NOT NULL,
+  -- The target head observed when this attempt began. Distinct from candidate_base_sha whenever
+  -- the branch advanced while the work was happening, which is ordinary concurrent activity rather
+  -- than an exceptional condition.
+  observed_target_sha TEXT NOT NULL,
+  -- The commit built in the disposable worktree, and the tree it names.
+  --
+  -- prepared_tree is recorded separately and deliberately: publishing a DIFFERENT tree than the one
+  -- validated is the failure this whole table exists to make impossible, and comparing commits
+  -- would not catch a rebuild that produced an identical tree under a new commit id, nor a swap to
+  -- a different tree under a reused id.
+  prepared_commit TEXT,
+  prepared_tree TEXT,
+  -- The exact plan proven against prepared_tree, by digest, so a plan that changed afterwards
+  -- cannot be mistaken for the one that passed.
+  validation_plan_digest TEXT,
+  validation_state TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK (validation_state IN ('PENDING', 'PASSED', 'FAILED')),
+  publish_state TEXT NOT NULL CHECK (publish_state IN (
+    'PREPARING', 'PREPARED', 'PUBLISHED', 'SUPERSEDED', 'FAILED'
+  )),
+  -- Only a published attempt has these, and it has both.
+  published_from_sha TEXT,
+  published_to_sha TEXT,
+  -- Why it ended, when it ended badly or was overtaken.
+  outcome TEXT,
+  attempt_number INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- Nothing is publishable until an exact tree has been proven.
+  CHECK (publish_state != 'PUBLISHED' OR (
+    prepared_commit IS NOT NULL AND prepared_tree IS NOT NULL
+    AND validation_state = 'PASSED'
+    AND published_from_sha IS NOT NULL AND published_to_sha IS NOT NULL
+  )),
+  -- A published attempt moved the ref from exactly the head it believed in, to exactly the commit
+  -- it prepared. Any other pairing means something published a tree nobody proved.
+  CHECK (publish_state != 'PUBLISHED' OR (
+    published_from_sha = observed_target_sha AND published_to_sha = prepared_commit
+  )),
+  CHECK (publish_state = 'PUBLISHED' OR (published_from_sha IS NULL AND published_to_sha IS NULL)),
+  CHECK (publish_state != 'PREPARED' OR (prepared_commit IS NOT NULL AND prepared_tree IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_staged_integrations_job ON staged_integrations(job_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_staged_integrations_immutable_delete
+BEFORE DELETE ON staged_integrations
+BEGIN SELECT RAISE(ABORT, 'staged_integrations is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_session_messages_immutable_delete
 BEFORE DELETE ON autonomous_session_messages
