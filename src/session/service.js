@@ -211,7 +211,21 @@ export class AutonomousSessionService {
   async tick(sessionId) {
     const session = this.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
-    if (["WAITING_FOR_HERMES", "SEMANTICALLY_ACCEPTED", "COMPLETED", "FAILED"].includes(session.state)) {
+    if (["WAITING_FOR_HERMES", "COMPLETED", "FAILED"].includes(session.state)) {
+      return this.poll(sessionId);
+    }
+
+    // SEMANTICALLY_ACCEPTED is terminal for a session that may not publish, and unfinished for one
+    // that may.
+    //
+    // AUTO records the acceptance durably and then publishes, so a crash in that window leaves a
+    // session that is genuinely mid-flight. Treating the state alone as terminal would strand it
+    // forever, having done all the expensive work and none of the cheap last step. The question
+    // asked on resume is the same PERMISSION question asked the first time -- may this session
+    // publish -- so the state still describes what happened and the mode still describes what is
+    // allowed. Neither has become a step counter.
+    if (session.state === "SEMANTICALLY_ACCEPTED") {
+      if (this.integrator && modePolicy(session.mode).mayPublish) return this.publishAccepted(sessionId);
       return this.poll(sessionId);
     }
 
@@ -337,7 +351,11 @@ export class AutonomousSessionService {
     // The run is ACCEPTED, and acceptance is a judgment about a candidate in a world that has since
     // moved. Reopening it is what lets the manager reconsider at all; without this the same
     // candidate would be handed to the integrator until the bound above stopped it.
-    this.manager.reopenForChangedWorld(session.job_id, { reason: "integration conflict" });
+    this.manager.reopenForChangedWorld(session.job_id, {
+      reason: "integration conflict",
+      // The head the conflict was measured against: the world the next attempt must be built for.
+      newBaseSha: conflict.detail.observedTargetSha,
+    });
     this.manager.resumeFromEscalation(session.job_id, { reason: "integration conflict" });
     this.setState(sessionId, { state: "WORKING", outcome: null });
     const conflictNote = {
@@ -352,6 +370,22 @@ export class AutonomousSessionService {
       await this.manager.advance(session.job_id, {
         clarifications: [...this.clarifications(sessionId), conflictNote],
       });
+      // advance() PARKS an escalation rather than rethrowing it, so the run has to be inspected.
+      // Reading it here is what lets the question keep its conflict-aware framing instead of falling
+      // through to tick()'s generic "the manager needs a decision".
+      const parked = this.manager.getRun(session.job_id);
+      if (parked?.status === "AWAITING_HUMAN") {
+        this.ask(sessionId, {
+          body: parked.escalation_question || "The manager stopped and needs a decision.",
+          whyItMatters: "The branch moved while this task was running, and the two behaviours cannot "
+            + "both be preserved. This is a decision about what the change should mean.",
+          evidence: [
+            { candidate_commit: conflict.detail.candidateCommit },
+            { target_head: conflict.detail.observedTargetSha },
+          ],
+        });
+        return this.poll(sessionId);
+      }
     } catch (error) {
       if (error instanceof ManagerStop && error.code === "ESCALATED") {
         // A genuine semantic dead end. NOW it is a question for Hermes, and it is phrased as the

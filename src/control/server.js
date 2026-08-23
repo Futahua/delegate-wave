@@ -1,13 +1,20 @@
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
-import { initializeDataRoot } from "../db.js";
+import { initializeDataRoot, recordEvent } from "../db.js";
 import { dataRoot } from "../paths.js";
 import { Dispatcher, DEFAULT_WORKER_MODEL, REVIEW_MODEL } from "../service.js";
 import { BackendRouter } from "../harness/select.js";
 import { matchRoute, PRINCIPAL_SCOPES, SCOPES } from "./contract.js";
 import { ControlError, asControlError } from "./errors.js";
 import { ControlService } from "./service.js";
+import { ManagerService } from "../manager/service.js";
+import { CodexManagerBackend } from "../manager/backend.js";
+import { AutonomousSessionService } from "../session/service.js";
+import { SessionDriver } from "../session/driver.js";
+import { SafeIntegrator } from "../integration/safe.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -119,14 +126,53 @@ export async function startControlServer({
   executorApiKey = process.env.DELEGATE_WAVE_EXECUTOR_API_KEY || null,
   preferBackend = process.env.DELEGATE_WAVE_BACKEND || "harness",
   backend = null,
+  // The scarce side's route. Named here rather than read at each turn so one served runtime uses one
+  // manager, and a change of mind is a restart rather than a drift mid-session.
+  managerModel = process.env.DELEGATE_WAVE_MANAGER_MODEL || "opencode-go/gpt-5.6-luna",
+  managerWorkingDirectory = null,
 } = {}) {
   initializeDataRoot(root);
+  // Neutral by construction: the data root is not any project's repository.
+  const neutralDirectory = managerWorkingDirectory ?? path.join(root, "manager-cwd");
+  fs.mkdirSync(neutralDirectory, { recursive: true });
   // Harness is preferred for the models it can run; OpenCode carries the review lane and is the
   // proven fallback. The router decides per attempt, from the resolved model -- never inside an
   // attempt, which would put two executors behind a single attempt identity.
   const router = backend ? null : new BackendRouter({ apiKey: executorApiKey, prefer: preferBackend });
   const dispatcher = new Dispatcher({ root, backend, router });
-  const service = new ControlService({ dispatcher });
+
+  // The autonomous runtime, assembled here because this is where the executor lanes are known.
+  //
+  // The driver is what makes a session autonomous: Hermes starts one, observes it and answers its
+  // questions, and never has to call anything to make it progress. Without a driver running in the
+  // served process, a session would sit in WORKING for as long as anyone kept asking.
+  const manager = new ManagerService({
+    dispatcher,
+    // A NEUTRAL working directory, never a project repository. The manager reasons from evidence
+    // packs delegate-wave assembles; pointing it at a repo would let it explore with the most
+    // expensive tokens in the system, which is the substitution this whole layer exists to prevent.
+    backend: new CodexManagerBackend({
+      model: managerModel,
+      workingDirectory: neutralDirectory,
+    }),
+    workerModel: DEFAULT_WORKER_MODEL,
+  });
+  const sessions = new AutonomousSessionService({
+    dispatcher, manager, integrator: new SafeIntegrator({ dispatcher }),
+  });
+  const driver = new SessionDriver({
+    sessions,
+    onError: (error, sessionId) => {
+      // A driver that threw would take the serving process with it. Recorded and moved past: the
+      // session's own state already carries what happened to it.
+      recordEvent(dispatcher.db, {
+        kind: "AUTONOMOUS_SESSION_DRIVER_ERROR", entityType: "job", entityId: sessionId,
+        payload: { message: error.message },
+      });
+    },
+  }).start();
+
+  const service = new ControlService({ dispatcher, sessions });
   const server = createControlServer({
     service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
   });
@@ -146,7 +192,10 @@ export async function startControlServer({
       reason: router.select(DEFAULT_WORKER_MODEL).reason,
     } : { default: "supplied", review: "supplied", reason: "backend supplied by the caller" },
     url: `http://${host}:${address.port}`,
+    sessions,
+    driver,
     async close() {
+      driver.stop();
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       server.closeAllConnections();
       await closed;

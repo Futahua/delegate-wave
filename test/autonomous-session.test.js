@@ -20,6 +20,7 @@ import { FakeManagerBackend } from "../src/manager/backend.js";
 import { ManagerService } from "../src/manager/service.js";
 import { AutonomousSessionService, modePolicy, SESSION_MODES } from "../src/session/service.js";
 import { SafeIntegrator } from "../src/integration/safe.js";
+import { SessionDriver } from "../src/session/driver.js";
 import { runProcess } from "../src/process.js";
 
 const BRIEF = (extra = {}) => ({
@@ -504,7 +505,15 @@ test("a merge conflict goes to the manager, not to Hermes", async (t) => {
   ).all();
   assert.ok(handed.length >= 1, "the conflict went to the manager");
   assert.ok(handed.length <= 2, "and handing it back is bounded rather than churning");
-  assert.ok(["completed", "semantically_accepted", "working", "failed"].includes(finished.state));
+  // Handed the conflict, the manager rebuilt against the branch as it now stands and the result
+  // landed -- without anyone being asked anything. That is the whole point of routing a mechanical
+  // conflict to the machinery that reasons about repositories.
+  assert.equal(finished.state, "completed");
+  assert.ok(finished.integration, "it recovered and published");
+  const rebased = w.dispatcher.db.prepare(
+    "SELECT * FROM events WHERE kind = 'MANAGER_REBASED_AUTHORIZED_WORLD'",
+  ).all();
+  assert.equal(rebased.length, 1, "the job was re-authorised against the world that now exists");
 });
 
 test("a semantic dead end reaches Hermes as a choice, not as a merge conflict", async (t) => {
@@ -530,4 +539,115 @@ test("a semantic dead end reaches Hermes as a choice, not as a merge conflict", 
   assert.equal(w.dispatcher.db.prepare(
     "SELECT COUNT(*) c FROM staged_integrations WHERE publish_state = 'PUBLISHED'",
   ).get().c, 0, "the branch is untouched while the question is open");
+});
+
+// --- The autonomous runtime: nobody has to call a fourth operation ------------------------------
+
+test("the driver moves a WORKING session to completion with no further calls", async (t) => {
+  // Without this, session_start creates a session and nothing ever advances it: Hermes would poll
+  // WORKING forever. The durable runtime owns progression.
+  const w = await integrating(t, ACCEPTING, "AUTO");
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+
+  assert.equal(w.sessions.poll(w.started.session_id).state, "working");
+  await driver.drain();
+
+  const finished = w.sessions.poll(w.started.session_id);
+  assert.equal(finished.state, "completed");
+  assert.ok(finished.integration, "and it published, unattended");
+});
+
+test("a session accepted but not yet published is resumed after a crash", async (t) => {
+  // The window: AUTO records the acceptance durably, then publishes. A crash in between leaves work
+  // that is finished except for its cheapest step, and treating the state alone as terminal would
+  // strand it forever.
+  const w = await integrating(t, ACCEPTING, "AUTO");
+  const before = await w.head();
+
+  // Reach acceptance without publishing, exactly as a crash there would leave it.
+  const stalled = new AutonomousSessionService({
+    dispatcher: w.dispatcher, manager: w.sessions.manager, integrator: null,
+  });
+  await stalled.tick(w.started.session_id);
+  assert.equal(stalled.poll(w.started.session_id).state, "semantically_accepted");
+  assert.equal(await w.head(), before, "nothing was published before the crash");
+
+  // Restart: a new driver over the same database finds it and finishes the job.
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+  await driver.drain();
+
+  const finished = w.sessions.poll(w.started.session_id);
+  assert.equal(finished.state, "completed");
+  assert.equal(await w.head(), finished.integration.to);
+});
+
+test("a MANUAL session accepted before a crash stays put", async (t) => {
+  // The same state, the opposite meaning, decided by the same permission question. MANUAL is
+  // genuinely finished at acceptance and a restart must not turn its result into a publication.
+  const w = await integrating(t, ACCEPTING, "MANUAL");
+  const before = await w.head();
+  await w.sessions.tick(w.started.session_id);
+  assert.equal(w.sessions.poll(w.started.session_id).state, "semantically_accepted");
+
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+  await driver.drain({ maxPasses: 10 });
+
+  assert.equal(w.sessions.poll(w.started.session_id).state, "semantically_accepted");
+  assert.equal(await w.head(), before, "a restart is not a licence to publish");
+  assert.equal(w.dispatcher.db.prepare("SELECT COUNT(*) c FROM staged_integrations").get().c, 0);
+});
+
+test("an answered session continues without Hermes calling anything else", async (t) => {
+  // answer() reopens the manager but does not advance it. If the driver did not exist, a session
+  // would sit in WORKING immediately after being answered -- unblocked and going nowhere.
+  const w = await integrating(t, [
+    { action: "ESCALATE", reason: "needs judgment", question: "Which route?" },
+    { action: "IMPLEMENT", reason: "the route Hermes chose", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ], "AUTO");
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+
+  await driver.drain({ maxPasses: 20 });
+  assert.equal(w.sessions.poll(w.started.session_id).state, "waiting_for_hermes");
+
+  // Hermes answers, and then does nothing further.
+  w.sessions.answer(w.started.session_id, "Take the export-layer route.");
+  await driver.drain();
+
+  const finished = w.sessions.poll(w.started.session_id);
+  assert.equal(finished.state, "completed");
+  assert.ok(finished.integration);
+});
+
+test("a long session does not starve the others", async (t) => {
+  // A pass that awaited its work would serialise every session behind the slowest one. Each is
+  // claimed and driven independently instead, bounded by concurrency rather than by order.
+  const w = await integrating(t, ACCEPTING, "AUTO");
+  const order = [];
+  const slowSessions = new AutonomousSessionService({
+    dispatcher: w.dispatcher, manager: w.sessions.manager, integrator: w.sessions.integrator,
+  });
+  slowSessions.tick = async (sessionId) => {
+    const slow = sessionId === w.started.session_id;
+    await new Promise((resolve) => { setTimeout(resolve, slow ? 200 : 5); });
+    order.push(slow ? "slow" : "fast");
+    return AutonomousSessionService.prototype.tick.call(slowSessions, sessionId);
+  };
+
+  const second = await slowSessions.start({
+    projectId: w.dispatcher.getProject(w.started.job_id ? w.sessions.get(w.started.session_id).project_id : null).id,
+    intent: "something quick", mode: "MANUAL",
+  });
+  const driver = new SessionDriver({ sessions: slowSessions, intervalMs: 5, concurrency: 4 });
+  t.after(() => driver.stop());
+
+  driver.pass();
+  await new Promise((resolve) => { setTimeout(resolve, 120); });
+  assert.ok(order.includes("fast"),
+    "the quick session ran while the slow one was still working");
+  assert.ok(second.session_id);
 });

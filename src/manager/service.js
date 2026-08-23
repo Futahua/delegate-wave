@@ -1019,18 +1019,34 @@ export class ManagerService {
   // The candidate survives as a revision base: this is the post-candidate rethink shape, arrived at
   // from the other direction. accepted_attempt_id is cleared because an acceptance naming a base
   // that has moved is a claim about a world nobody can inspect any more.
-  reopenForChangedWorld(jobId, { reason }) {
+  reopenForChangedWorld(jobId, { reason, newBaseSha = null }) {
     const run = this.getRun(jobId);
     if (!run) throw new Error(`Unknown managed job: ${jobId}`);
     if (run.status !== "ACCEPTED") return run;
+    const job = this.dispatcher.getJob(jobId);
     transaction(this.db, () => {
       this.setRun(run.id, {
         status: "PLANNING",
         accepted_attempt_id: null,
         last_candidate_attempt_id: run.accepted_attempt_id,
       });
-      this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?")
-        .run(now(), jobId);
+      // Re-based onto the world that now exists, when the caller knows what that is.
+      //
+      // Without this the next attempt is built against a base that has already moved, so every
+      // reconciliation reproduces the same conflict and the bounded retry is guaranteed to exhaust
+      // itself. Re-authorising is a real authority change and is recorded as one -- it is only ever
+      // done for a session whose standing permission envelope already covers unattended work.
+      if (newBaseSha && newBaseSha !== job.base_sha) {
+        this.db.prepare("UPDATE jobs SET base_sha = ?, status = 'RUNNING', updated_at = ? WHERE id = ?")
+          .run(newBaseSha, now(), jobId);
+        recordEvent(this.db, {
+          kind: "MANAGER_REBASED_AUTHORIZED_WORLD", entityType: "job", entityId: jobId,
+          payload: { runId: run.id, from: job.base_sha, to: newBaseSha, reason },
+        });
+      } else {
+        this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?")
+          .run(now(), jobId);
+      }
       recordEvent(this.db, {
         kind: "MANAGER_REOPENED_FOR_CHANGED_WORLD", entityType: "job", entityId: jobId,
         payload: { runId: run.id, wasAccepted: run.accepted_attempt_id, reason },
