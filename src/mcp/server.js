@@ -174,12 +174,15 @@ export class HermesMcpAdapter {
     if (name === "get_attention_needed") return this.client.get("/v1/attention");
     if (name === "get_integration") return this.client.get(`/v1/proposals/${encodeURIComponent(requiredString(args, "proposal_id"))}`);
     if (name === "session_start") {
+      // A fresh request id per call, as every mutation through this API requires. Starting a session
+      // is a new intent each time rather than a retry of a previous one, so the id is generated here
+      // rather than asked of the caller -- an agent has nothing meaningful to derive one from.
       return this.client.post("/v1/sessions", {
         projectId: requiredString(args, "project_id"),
         intent: requiredString(args, "intent"),
         mode: args.mode || "AUTO",
         maximumCost: args.maximum_cost ?? null,
-      });
+      }, `req_${randomUUID()}`);
     }
     if (name === "session_poll") {
       return this.client.get(`/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}`);
@@ -188,6 +191,7 @@ export class HermesMcpAdapter {
       return this.client.post(
         `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/answer`,
         { answer: requiredString(args, "answer") },
+        `req_${randomUUID()}`,
       );
     }
     if (name === "propose_work") {

@@ -137,3 +137,29 @@ test("the Hermes MCP adapter cannot reach any operator-scoped route", async () =
   assert.equal(attempted.some((call) => /approvals|\/run|reconcile|\/authorize|\/reject/.test(call)), false);
   assert.equal(attempted.some((call) => /\/approve|\/decline|\/integration|\/backups/.test(call)), false);
 });
+
+test("every mutation the adapter performs carries a request id", async () => {
+  // The Control API refuses a mutation without one. session_start shipped without it and passed the
+  // whole suite, because nothing asserted the third argument -- the failure only appeared against a
+  // live server, from inside Hermes, after the credential work was already done.
+  const posts = [];
+  const client = {
+    get: async (p) => (p === "/v1/projects" ? [{ id: "p" }] : []),
+    post: async (p, body, requestId) => { posts.push({ path: p, requestId }); return {}; },
+  };
+  const adapter = new HermesMcpAdapter({ client });
+  for (const tool of adapter.listTools()) {
+    await adapter.callTool(tool.name, {
+      project_id: "p", job_id: "j", proposal_id: "x", goal: "g", idempotency_key: "k",
+      intent: "do the thing", session_id: "s", answer: "yes",
+    });
+  }
+  assert.ok(posts.length >= 3, "the mutating tools were exercised");
+  for (const post of posts) {
+    assert.equal(typeof post.requestId, "string",
+      `${post.path} was posted without a request id and would be refused`);
+    assert.ok(post.requestId.length > 8, `${post.path} sent an implausible request id`);
+  }
+  // Distinct per call: a reused id would read as a retry of a different operation.
+  assert.equal(new Set(posts.map((p) => p.requestId)).size, posts.length);
+});
