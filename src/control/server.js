@@ -15,6 +15,7 @@ import { CodexManagerBackend } from "../manager/backend.js";
 import { AutonomousSessionService } from "../session/service.js";
 import { SessionDriver } from "../session/driver.js";
 import { SafeIntegrator } from "../integration/safe.js";
+import { providerForModel } from "../manager/provider.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -146,14 +147,28 @@ export async function startControlServer({
   // The driver is what makes a session autonomous: Hermes starts one, observes it and answers its
   // questions, and never has to call anything to make it progress. Without a driver running in the
   // served process, a session would sit in WORKING for as long as anyone kept asking.
+  // A custom provider when the model names one. Without this every session's first turn reached the
+  // app server unconfigured and was lost -- the CLI resolved a provider and the served runtime did
+  // not, which is precisely the drift that sharing the resolver removes.
+  const { provider: managerProvider, reason: providerReason } = await providerForModel(managerModel);
+  if (providerReason && managerModel.includes("/")) {
+    recordEvent(dispatcher.db, {
+      kind: "MANAGER_PROVIDER_UNRESOLVED", entityType: "job", entityId: "runtime",
+      payload: { model: managerModel, reason: providerReason },
+    });
+  }
   const manager = new ManagerService({
     dispatcher,
     // A NEUTRAL working directory, never a project repository. The manager reasons from evidence
     // packs delegate-wave assembles; pointing it at a repo would let it explore with the most
     // expensive tokens in the system, which is the substitution this whole layer exists to prevent.
     backend: new CodexManagerBackend({
-      model: managerModel,
+      // The BARE model name. A provider-prefixed string selects the route; the app server is then
+      // told a model it recognises, with the provider supplied alongside it. Passing the prefixed
+      // name straight through is what lost every session's first turn.
+      model: managerProvider ? managerModel.slice(managerModel.indexOf("/") + 1) : managerModel,
       workingDirectory: neutralDirectory,
+      provider: managerProvider,
     }),
     workerModel: DEFAULT_WORKER_MODEL,
   });
@@ -186,6 +201,7 @@ export async function startControlServer({
     dispatcher,
     // Reported, not inferred from which executor's artifacts turn up. Routing is per model, so the
     // report names each lane rather than pretending one executor serves everything.
+    managerProvider: managerProvider ? managerProvider.id : null,
     executor: router ? {
       default: router.select(DEFAULT_WORKER_MODEL).selected,
       review: router.select(REVIEW_MODEL).selected,

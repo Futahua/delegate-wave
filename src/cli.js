@@ -116,40 +116,8 @@ async function main() {
   // managed job spends scarce quota and can run cheap workers, and the Control
   // API is what the Papers relay reaches -- putting this behind a route would
   // hand that authority to a surface that is meant to observe and decide, not to
-  // Describes one OpenAI-compatible provider well enough for Codex to use it.
-  //
-  // Read from the executor's own registry rather than hardcoded: the base URL and the environment
-  // variable name are the provider's facts, not delegate-wave's, and a stale copy here would send
-  // the manager's turns somewhere that no longer exists.
-  //
-  // The key is looked up but never logged, never written to config, and never passed to anything
-  // except the one child process that needs it.
-  async function resolveManagerProvider(id) {
-    const fs = await import("node:fs");
-    const os = await import("node:os");
-    const home = os.homedir();
-    const registryPath = path.join(home, ".cache", "opencode", "models.json");
-    let entry = null;
-    try { entry = JSON.parse(fs.readFileSync(registryPath, "utf8"))[id] ?? null; } catch { entry = null; }
-    if (!entry?.api) {
-      throw new Error(
-        `Unknown manager provider "${id}": no entry with an api URL in ${registryPath}. `
-        + "Pass a bare model name to use the Codex plan instead.",
-      );
-    }
-    const envKey = entry.env?.[0] ?? "OPENCODE_API_KEY";
-    let apiKey = process.env[envKey] ?? null;
-    if (!apiKey) {
-      try {
-        const auth = JSON.parse(fs.readFileSync(path.join(home, ".local", "share", "opencode", "auth.json"), "utf8"));
-        apiKey = auth[id]?.key ?? null;
-      } catch { apiKey = null; }
-    }
-    if (!apiKey) {
-      throw new Error(`No credential for provider "${id}": set ${envKey}, or authenticate it in OpenCode.`);
-    }
-    return { id, name: entry.name ?? id, baseUrl: entry.api, envKey, wireApi: "responses", apiKey };
-  }
+  // Shared with the served runtime so a provider is resolved identically in both.
+  const { resolveManagerProvider } = await import("./manager/provider.js");
 
   // commission strong-model work.
   if (positional[0] === "manage") {

@@ -4,12 +4,13 @@ import { ControlError, asControlError } from "./errors.js";
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const MUTATION_COMMANDS = new Set([
+export const MUTATION_COMMANDS = new Set([
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
   "backup.create", "backup.restore", "restore.resolve", "integration.rollback", "job.advance", "integration.approve",
   "integration.decline", "project.retire", "project.restore",
+  "session.start", "session.answer", "session.tick",
 ]);
 
 function canonical(value) {
@@ -76,6 +77,7 @@ export class ControlService {
       "backup.list": () => this.dispatcher.listBackups(),
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
+      "session.poll": () => this.sessions.poll(args.sessionId),
       attention: () => this.dispatcher.attention(),
       briefing: () => this.dispatcher.briefing(),
     };
@@ -234,7 +236,6 @@ export class ControlService {
         mode: args.mode || "AUTO",
         maximumCost: args.maximumCost ?? null,
       }),
-      "session.poll": () => this.sessions.poll(args.sessionId),
       "session.answer": () => this.sessions.answer(args.sessionId, args.answer),
       "session.tick": () => this.sessions.tick(args.sessionId),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),

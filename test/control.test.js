@@ -565,3 +565,22 @@ test("intent with no receipt and no live execution is still UNCERTAIN", async (t
   assert.notEqual(result.code, "REQUEST_IN_PROGRESS",
     "nothing is executing, so claiming progress would be the opposite lie");
 });
+
+test("the mutation list and the route contract cannot drift apart", async () => {
+  // Two independent statements of the same fact: ROUTES marks a command mutation:true, and
+  // ControlService keeps a set deciding which commands take the mutation path. A command present in
+  // one and missing from the other is silently misrouted -- which is exactly how session.start
+  // reached a live server as "Unknown query command" after passing every unit test.
+  const { ROUTES } = await import("../src/control/contract.js");
+  const { MUTATION_COMMANDS } = await import("../src/control/service.js");
+
+  const declared = new Set(ROUTES.filter((route) => route.mutation).map((route) => route.command));
+  for (const command of declared) {
+    assert.ok(MUTATION_COMMANDS.has(command),
+      `${command} is declared a mutation by its route but would be dispatched as a query`);
+  }
+  for (const command of MUTATION_COMMANDS) {
+    assert.ok(declared.has(command),
+      `${command} takes the mutation path but no route declares it one`);
+  }
+});
