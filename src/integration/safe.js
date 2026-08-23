@@ -274,11 +274,22 @@ export class SafeIntegrator {
     return { published: true, reason: "PUBLISHED" };
   }
 
+  // Whether somebody is mid-thought in that worktree.
+  //
+  // A preflight check, not a lock. Nothing can lock an arbitrary filesystem against a person with an
+  // editor open, so there is an unavoidable window between asking and acting. The invariant that
+  // matters is therefore not "we checked" but "we never silently destroy what we find": the actual
+  // move is a fast-forward, which git itself refuses when it would overwrite local modifications.
+  // Its own seam so the race can be tested rather than assumed away.
+  async targetDirtiness(worktree) {
+    return (await runProcess("git", ["-C", worktree, "status", "--porcelain"])).stdout.trim();
+  }
+
   // Publication into a live checkout, performed by git so ref, index and files move together.
   async publishByFastForward({ staged, project, worktree }) {
     // Dirty means somebody is mid-thought in there. Never stash, reset or check out over it: the
     // candidate is preserved and whether this genuinely needs the person is a judgment above here.
-    const dirty = (await runProcess("git", ["-C", worktree, "status", "--porcelain"])).stdout.trim();
+    const dirty = await this.targetDirtiness(worktree);
     if (dirty) {
       this.update(staged.id, {
         publish_state: "FAILED",

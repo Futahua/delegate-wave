@@ -16,7 +16,8 @@ test("Hermes adapter exposes only bounded read tools", async () => {
   assert.deepEqual(adapter.listTools().map((tool) => tool.name), [
     "get_status",
     "get_overview", "list_projects", "get_project_summary", "get_job", "get_attention_needed", "get_integration",
-    "propose_work", "list_work_proposals", "get_work_proposal",
+    "propose_work", "session_start", "session_poll", "session_answer",
+    "list_work_proposals", "get_work_proposal",
   ]);
   // Hermes may propose bounded work, but exposes no tool that approves, runs, integrates, or
   // reconciles. propose_work creates a request that a human must authorize before anything runs.
@@ -101,7 +102,7 @@ test("stdio MCP lifecycle and tool calls use newline-delimited JSON-RPC", async 
   assert.equal(responses.length, 4);
   assert.equal(responses[0].result.protocolVersion, "2025-06-18");
   assert.equal(responses[0].result.capabilities.tools.listChanged, false);
-  assert.equal(responses[1].result.tools.length, 10);
+  assert.equal(responses[1].result.tools.length, 13);
   assert.deepEqual(responses[2].result.structuredContent, { result: [{ id: "project-one" }] });
   assert.equal(
     responses[3].result.content[0].text,
@@ -121,11 +122,18 @@ test("the Hermes MCP adapter cannot reach any operator-scoped route", async () =
   for (const tool of adapter.listTools()) {
     const args = {
       project_id: "p", job_id: "j", proposal_id: "x", goal: "g", idempotency_key: "k",
+      intent: "do the thing", session_id: "s", answer: "yes",
     };
     await adapter.callTool(tool.name, args);
   }
-  // The only mutation the adapter can perform is creating a work proposal.
+  // Two mutations, and both are bounded. A work proposal decides nothing on its own, and a session
+  // acts only inside the envelope the user granted it -- neither can approve an arbitrary proposal,
+  // run an arbitrary job, reconcile, or change policy.
   const posts = attempted.filter((call) => call.startsWith("POST "));
-  assert.deepEqual(posts, ["POST /v1/work/proposals"]);
+  assert.deepEqual(posts.sort(), [
+    "POST /v1/sessions", "POST /v1/sessions/s/answer", "POST /v1/work/proposals",
+  ]);
+  // The operator-scoped surface stays unreachable, which is the property this test exists for.
   assert.equal(attempted.some((call) => /approvals|\/run|reconcile|\/authorize|\/reject/.test(call)), false);
+  assert.equal(attempted.some((call) => /\/approve|\/decline|\/integration|\/backups/.test(call)), false);
 });

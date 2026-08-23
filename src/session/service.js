@@ -22,9 +22,13 @@
 import crypto from "node:crypto";
 import { recordEvent, transaction } from "../db.js";
 import { ManagerStop } from "../manager/service.js";
+import { ConflictRequiresJudgment } from "../integration/safe.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
+
+// How many times a conflict may be handed back before the churn itself becomes the problem.
+export const MAX_RECONCILE_ROUNDS = 2;
 
 export const SESSION_MODES = Object.freeze(["AUTO", "MANUAL", "ACCEPT_EDITS", "PLAN", "BYPASS"]);
 
@@ -36,15 +40,18 @@ export const SESSION_MODES = Object.freeze(["AUTO", "MANUAL", "ACCEPT_EDITS", "P
 const MODE_POLICY = Object.freeze({
   // Investigate and reason; never modify anything. Enforced by commissioning a read-mode job, so
   // the refusal is mechanical rather than a promise this layer makes.
-  PLAN: Object.freeze({ mayWrite: false, mayProceedUnattended: true }),
-  MANUAL: Object.freeze({ mayWrite: true, mayProceedUnattended: false }),
-  ACCEPT_EDITS: Object.freeze({ mayWrite: true, mayProceedUnattended: true }),
-  AUTO: Object.freeze({ mayWrite: true, mayProceedUnattended: true }),
+  PLAN: Object.freeze({ mayWrite: false, mayProceedUnattended: true, mayPublish: false }),
+  // Full intelligence and delegation; the result waits for a person before it lands.
+  MANUAL: Object.freeze({ mayWrite: true, mayProceedUnattended: false, mayPublish: false }),
+  // Ordinary repository edits and their safe publication are permitted; anything broader is
+  // still a question, which is what distinguishes this from AUTO in spirit.
+  ACCEPT_EDITS: Object.freeze({ mayWrite: true, mayProceedUnattended: true, mayPublish: true }),
+  AUTO: Object.freeze({ mayWrite: true, mayProceedUnattended: true, mayPublish: true }),
   // Suppresses QUESTIONS, never INVARIANTS. Protected paths, deterministic validation, CAS
   // integration, budget admission, worktree and credential isolation are mechanical and refuse
   // under this mode exactly as under any other. Nothing in this file can switch them off, which is
   // the point: there is no flag to find.
-  BYPASS: Object.freeze({ mayWrite: true, mayProceedUnattended: true }),
+  BYPASS: Object.freeze({ mayWrite: true, mayProceedUnattended: true, mayPublish: true }),
 });
 
 export function modePolicy(mode) {
@@ -54,11 +61,13 @@ export function modePolicy(mode) {
 }
 
 export class AutonomousSessionService {
-  constructor({ dispatcher, manager }) {
+  constructor({ dispatcher, manager, integrator = null }) {
     if (!dispatcher) throw new Error("AutonomousSessionService requires a dispatcher");
     if (!manager) throw new Error("AutonomousSessionService requires a manager");
     this.dispatcher = dispatcher;
     this.manager = manager;
+    // Optional so the session layer can be exercised without any integration authority at all.
+    this.integrator = integrator;
     this.db = dispatcher.db;
   }
 
@@ -240,11 +249,128 @@ export class AutonomousSessionService {
       return this.poll(sessionId);
     }
     if (run?.status === "ACCEPTED") {
-      // Stops at the semantic result. Integration is a separate, more dangerous boundary and is
-      // deliberately not attempted here.
       this.setState(sessionId, { state: "SEMANTICALLY_ACCEPTED", outcome: null });
+      // Whether a validated result may land is the one thing a mode genuinely decides here, and it
+      // is a PERMISSION question -- not a step in a workflow. MANUAL stops with the candidate ready;
+      // the modes that permit publication publish. Nothing about review, revision or how many turns
+      // were spent is affected by the mode.
+      if (this.integrator && modePolicy(session.mode).mayPublish) {
+        return this.publishAccepted(sessionId);
+      }
     }
     return this.poll(sessionId);
+  }
+
+  // Publishes the accepted candidate, and routes a conflict back to the manager rather than to a
+  // person.
+  //
+  // A merge conflict is not a reason to interrupt anybody. It is a fact about the current state of
+  // the repository -- the same kind of fact as a failing test -- and the machinery that reasons
+  // about repository facts is the manager, which already holds the intent, the settled clarifications
+  // and the accepted candidate. Only a SEMANTIC dead end, where preserving the branch's new
+  // behaviour and the behaviour this session was asked for cannot both be done, is a question for
+  // Hermes.
+  //
+  // Deliberately no second "conflict manager": the conflict is fed back through the ordinary
+  // evidence machinery as another fact about the world.
+  async publishAccepted(sessionId) {
+    const session = this.get(sessionId);
+    const run = this.manager.getRun(session.job_id);
+    if (!run?.accepted_attempt_id) return this.poll(sessionId);
+
+    try {
+      const result = await this.integrator.integrate({
+        jobId: session.job_id, sessionId, candidateAttemptId: run.accepted_attempt_id,
+      });
+      if (result.published) {
+        this.setState(sessionId, { state: "COMPLETED", outcome: null });
+        return this.poll(sessionId);
+      }
+      // Prepared but not published: the branch is untouched and the candidate survives. Reported
+      // rather than retried here, because integrate() already exhausted its own bounded retries.
+      this.setState(sessionId, { state: "SEMANTICALLY_ACCEPTED", outcome: result.reason });
+      return this.poll(sessionId);
+    } catch (error) {
+      if (!(error instanceof ConflictRequiresJudgment)) {
+        this.setState(sessionId, { state: "FAILED", outcome: error.message });
+        return this.poll(sessionId);
+      }
+      return this.reconcileThroughManager(sessionId, error);
+    }
+  }
+
+  // Hands the conflict to the manager as evidence and lets it decide what to do about it.
+  async reconcileThroughManager(sessionId, conflict) {
+    const session = this.get(sessionId);
+
+    // Bounded, because a branch under active traffic can keep invalidating every reconciliation the
+    // manager produces. Without a bound this recurses until something else breaks, spending a scarce
+    // turn each round. Counted from the durable event log rather than a field, so a restart cannot
+    // reset it and start the churn over.
+    const alreadyTried = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE kind = 'INTEGRATION_CONFLICT_TO_MANAGER' AND entity_id = ?",
+    ).get(session.job_id).count;
+    if (alreadyTried >= MAX_RECONCILE_ROUNDS) {
+      this.ask(sessionId, {
+        body: "The target branch keeps changing under this work, and repeated attempts to rebuild "
+          + "against it have not produced something that applies cleanly. Should this keep trying, "
+          + "or wait until the branch settles?",
+        whyItMatters: `Reconciliation was attempted ${alreadyTried} times without converging. `
+          + "Continuing would spend more on a moving target rather than on the task.",
+        evidence: [{ candidate_commit: conflict.detail.candidateCommit }],
+      });
+      return this.poll(sessionId);
+    }
+
+    recordEvent(this.db, {
+      kind: "INTEGRATION_CONFLICT_TO_MANAGER", entityType: "job", entityId: session.job_id,
+      payload: {
+        sessionId,
+        candidateCommit: conflict.detail.candidateCommit,
+        observedTargetSha: conflict.detail.observedTargetSha,
+      },
+    });
+
+    // Returned to work with the conflict stated as a fact it must now account for. It arrives as a
+    // clarification alongside whatever Hermes already settled, because that is what it is: something
+    // about the world that the previous diagnosis did not know.
+    // The run is ACCEPTED, and acceptance is a judgment about a candidate in a world that has since
+    // moved. Reopening it is what lets the manager reconsider at all; without this the same
+    // candidate would be handed to the integrator until the bound above stopped it.
+    this.manager.reopenForChangedWorld(session.job_id, { reason: "integration conflict" });
+    this.manager.resumeFromEscalation(session.job_id, { reason: "integration conflict" });
+    this.setState(sessionId, { state: "WORKING", outcome: null });
+    const conflictNote = {
+      question: "The target branch changed while this work was happening, and the accepted "
+        + `candidate no longer applies cleanly (candidate ${String(conflict.detail.candidateCommit).slice(0, 8)} `
+        + `against ${String(conflict.detail.observedTargetSha).slice(0, 8)}).`,
+      answer: "Produce a revision that applies to the branch as it now stands and still satisfies "
+        + "the original request. If the branch's new behaviour and the requested behaviour cannot "
+        + "both be preserved, ESCALATE with the specific choice rather than picking one.",
+    };
+    try {
+      await this.manager.advance(session.job_id, {
+        clarifications: [...this.clarifications(sessionId), conflictNote],
+      });
+    } catch (error) {
+      if (error instanceof ManagerStop && error.code === "ESCALATED") {
+        // A genuine semantic dead end. NOW it is a question for Hermes, and it is phrased as the
+        // choice that actually has to be made rather than as "a merge conflict occurred".
+        this.ask(sessionId, {
+          body: error.question || error.message,
+          whyItMatters: "The branch moved while this task was running, and the two behaviours cannot "
+            + "both be preserved. This is a decision about what the change should mean.",
+          evidence: [
+            { candidate_commit: conflict.detail.candidateCommit },
+            { target_head: conflict.detail.observedTargetSha },
+          ],
+        });
+        return this.poll(sessionId);
+      }
+      this.setState(sessionId, { state: "FAILED", outcome: error.message });
+      return this.poll(sessionId);
+    }
+    return this.tick(sessionId);
   }
 
   // A small semantic state, never the ledger.
@@ -273,6 +399,10 @@ export class AutonomousSessionService {
     }
 
     if (["SEMANTICALLY_ACCEPTED", "COMPLETED"].includes(session.state)) {
+      const published = this.db.prepare(
+        `SELECT * FROM staged_integrations WHERE session_id = ? AND publish_state = 'PUBLISHED'
+         ORDER BY created_at DESC LIMIT 1`,
+      ).get(sessionId);
       const run = this.manager.getRun(session.job_id);
       const attempt = run?.accepted_attempt_id
         ? this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(run.accepted_attempt_id)
@@ -287,6 +417,15 @@ export class AutonomousSessionService {
             validation: attempt.validation_state,
           }
           : null,
+        integration: published
+          ? {
+            target: published.target_ref,
+            from: published.published_from_sha,
+            to: published.published_to_sha,
+            validated_tree: published.prepared_tree,
+          }
+          : null,
+        ...(session.outcome ? { outcome: session.outcome } : {}),
       };
     }
 

@@ -1009,6 +1009,36 @@ export class ManagerService {
     return this.getRun(jobId);
   }
 
+  // Reopens an accepted run because the world it was accepted against no longer exists.
+  //
+  // ACCEPT is a judgment about a candidate IN A WORLD. When the target branch moves underneath it,
+  // the judgment does not become wrong -- it becomes unanswered, because the question it settled was
+  // about a different tree. advance() rightly treats ACCEPTED as terminal, so without this the same
+  // candidate would be offered to the integrator forever.
+  //
+  // The candidate survives as a revision base: this is the post-candidate rethink shape, arrived at
+  // from the other direction. accepted_attempt_id is cleared because an acceptance naming a base
+  // that has moved is a claim about a world nobody can inspect any more.
+  reopenForChangedWorld(jobId, { reason }) {
+    const run = this.getRun(jobId);
+    if (!run) throw new Error(`Unknown managed job: ${jobId}`);
+    if (run.status !== "ACCEPTED") return run;
+    transaction(this.db, () => {
+      this.setRun(run.id, {
+        status: "PLANNING",
+        accepted_attempt_id: null,
+        last_candidate_attempt_id: run.accepted_attempt_id,
+      });
+      this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?")
+        .run(now(), jobId);
+      recordEvent(this.db, {
+        kind: "MANAGER_REOPENED_FOR_CHANGED_WORLD", entityType: "job", entityId: jobId,
+        payload: { runId: run.id, wasAccepted: run.accepted_attempt_id, reason },
+      });
+    });
+    return this.getRun(jobId);
+  }
+
   // What a reboot makes of an interrupted run.
   //
   // A turn left INTENDED means the process died between recording the intent and recording the

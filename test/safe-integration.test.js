@@ -369,3 +369,38 @@ test("12. the integrator holds no semantic authority", async (t) => {
   assert.ok(!/-X\s?(ours|theirs)|strategy-option/.test(code),
     "no automatic conflict resolution strategy: that would be an opinion about meaning");
 });
+
+test("9c. a checkout that turns dirty after the preflight check never loses the new bytes", async (t) => {
+  // There is an unavoidable window between asking whether a worktree is clean and acting on the
+  // answer: nothing can lock a filesystem against someone with an editor open. So the invariant
+  // under test is not "the check is a lock" -- it isn't -- but "we never silently destroy what we
+  // find". The real move is a fast-forward, which git itself refuses when it would overwrite local
+  // modifications.
+  const w = await world(t, { validation: [], detach: false });
+  const before = await w.head();
+  const staged = await w.integrator.prepare({
+    job: w.dispatcher.getJob(w.job.id), project: w.project, candidate: w.candidate,
+  });
+
+  // The race, made deterministic: the preflight reports clean, and the file is dirty by the time
+  // git is asked to move. feature.txt is exactly what the integration itself would write.
+  const racing = new (class extends w.integrator.constructor {
+    async targetDirtiness(worktree) {
+      fs.writeFileSync(path.join(worktree, "feature.txt"), "HUMAN WAS EDITING THIS\n");
+      return "";
+    }
+  })({ dispatcher: w.dispatcher });
+
+  const published = await racing.publish(staged.id);
+  const edit = fs.readFileSync(path.join(w.repo, "feature.txt"), "utf8");
+
+  if (published.published) {
+    // If git accepted the move, it can only be because those bytes were not in its way.
+    assert.equal(await w.head(), staged.prepared_commit);
+    assert.notEqual(edit, "HUMAN WAS EDITING THIS\n",
+      "publishing over the edit would mean it was silently destroyed");
+  } else {
+    assert.equal(await w.head(), before, "refused, and the ref did not move");
+    assert.equal(edit, "HUMAN WAS EDITING THIS\n", "the human's bytes survive exactly");
+  }
+});

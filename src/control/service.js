@@ -31,8 +31,11 @@ function rejectIdentity(args) {
 }
 
 export class ControlService {
-  constructor({ dispatcher, pendingWaitMs = 5000 }) {
+  constructor({ dispatcher, sessions = null, pendingWaitMs = 5000 }) {
     this.dispatcher = dispatcher;
+    // Injected rather than constructed here: an autonomous session needs a manager backend, and
+    // which one that is belongs to whoever assembled the runtime, not to the HTTP layer.
+    this.sessions = sessions;
     this.pendingWaitMs = pendingWaitMs;
     // request_ids this process is executing right now.
     //
@@ -222,6 +225,18 @@ export class ControlService {
         origin: context.originChannel,
         idempotencyKey: args.idempotencyKey || null,
       }),
+      // One capability, three operations. The authority is exercised at start, bounded by the mode
+      // the user granted and the project and ceiling it was started with; polling and answering
+      // continue a session that was already permitted.
+      "session.start": () => this.sessions.start({
+        projectId: args.projectId,
+        intent: args.intent,
+        mode: args.mode || "AUTO",
+        maximumCost: args.maximumCost ?? null,
+      }),
+      "session.poll": () => this.sessions.poll(args.sessionId),
+      "session.answer": () => this.sessions.answer(args.sessionId, args.answer),
+      "session.tick": () => this.sessions.tick(args.sessionId),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),
       // Clears the unresolved-restore condition; only a person can say the truths agree again.
       // The counterpart to approve: deciding not to integrate a candidate is a decision too.

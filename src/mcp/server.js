@@ -83,6 +83,48 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: "session_start",
+    description: "Start an autonomous coding session and return immediately. delegate-wave "
+      + "investigates, implements, validates, reviews and -- in the modes that permit it -- safely "
+      + "integrates, on its own. Poll for progress; it may come back with a question only a person "
+      + "who knows the original request can answer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string" },
+        intent: { type: "string", description: "What the user actually asked for, in their words." },
+        mode: {
+          type: "string",
+          enum: ["AUTO", "MANUAL", "ACCEPT_EDITS", "PLAN", "BYPASS"],
+          description: "The standing permission envelope. AUTO works and integrates unattended; "
+            + "MANUAL stops with a finished candidate; PLAN never writes.",
+        },
+        maximum_cost: { type: "number" },
+      },
+      required: ["project_id", "intent"],
+    },
+  },
+  {
+    name: "session_poll",
+    description: "How an autonomous session is going: working, waiting_for_hermes with a question, "
+      + "completed with the integrated result, or failed.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" } },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "session_answer",
+    description: "Answer the question a waiting session is asking, from the original conversation "
+      + "with the user. The answer becomes durable evidence and the work continues.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" }, answer: { type: "string" } },
+      required: ["session_id", "answer"],
+    },
+  },
+  {
     name: "list_work_proposals",
     description: "List work proposals and their decisions. Read-only.",
     inputSchema: {
@@ -131,6 +173,23 @@ export class HermesMcpAdapter {
     if (name === "get_job") return this.client.get(`/v1/jobs/${encodeURIComponent(requiredString(args, "job_id"))}`);
     if (name === "get_attention_needed") return this.client.get("/v1/attention");
     if (name === "get_integration") return this.client.get(`/v1/proposals/${encodeURIComponent(requiredString(args, "proposal_id"))}`);
+    if (name === "session_start") {
+      return this.client.post("/v1/sessions", {
+        projectId: requiredString(args, "project_id"),
+        intent: requiredString(args, "intent"),
+        mode: args.mode || "AUTO",
+        maximumCost: args.maximum_cost ?? null,
+      });
+    }
+    if (name === "session_poll") {
+      return this.client.get(`/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}`);
+    }
+    if (name === "session_answer") {
+      return this.client.post(
+        `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/answer`,
+        { answer: requiredString(args, "answer") },
+      );
+    }
     if (name === "propose_work") {
       // The Control API derives origin identity from the credential; the adapter never supplies it.
       return this.client.post("/v1/work/proposals", {

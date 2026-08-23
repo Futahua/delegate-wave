@@ -19,6 +19,7 @@ import { Dispatcher } from "../src/service.js";
 import { FakeManagerBackend } from "../src/manager/backend.js";
 import { ManagerService } from "../src/manager/service.js";
 import { AutonomousSessionService, modePolicy, SESSION_MODES } from "../src/session/service.js";
+import { SafeIntegrator } from "../src/integration/safe.js";
 import { runProcess } from "../src/process.js";
 
 const BRIEF = (extra = {}) => ({
@@ -95,13 +96,23 @@ async function world(t) {
 
 test("a mode is a permission envelope, and every mode has one", () => {
   // If a mode ever gains a "which step comes next" field, this is where it will show up.
+  // Every field must be a PERMISSION -- something the session may or may not do. The day one is
+  // added that means "which step comes next", it will not be in this vocabulary and this fails.
+  const permissions = ["mayWrite", "mayProceedUnattended", "mayPublish"];
   for (const mode of SESSION_MODES) {
     const policy = modePolicy(mode);
-    assert.equal(typeof policy.mayWrite, "boolean");
-    assert.equal(typeof policy.mayProceedUnattended, "boolean");
-    assert.deepEqual(Object.keys(policy).sort(), ["mayProceedUnattended", "mayWrite"]);
+    for (const key of Object.keys(policy)) {
+      assert.ok(permissions.includes(key), `${mode}.${key} is not a permission`);
+      assert.equal(typeof policy[key], "boolean", `${mode}.${key} must be a yes/no`);
+    }
+    for (const key of permissions) assert.equal(typeof policy[key], "boolean", `${mode} lacks ${key}`);
   }
   assert.equal(modePolicy("PLAN").mayWrite, false);
+  assert.equal(modePolicy("PLAN").mayPublish, false);
+  // MANUAL has the same intelligence and delegation as AUTO; it simply does not land the result.
+  assert.equal(modePolicy("MANUAL").mayWrite, true);
+  assert.equal(modePolicy("MANUAL").mayPublish, false);
+  assert.equal(modePolicy("AUTO").mayPublish, true);
   assert.equal(modePolicy("BYPASS").mayWrite, true);
   assert.throws(() => modePolicy("NONSENSE"), /Unknown autonomy mode/);
 });
@@ -265,7 +276,7 @@ test("poll returns a semantic state, not the ledger", async (t) => {
 
   // Hermes should never have to read manager turns, receipts or proposals to know what happened.
   assert.deepEqual(Object.keys(finished).sort(),
-    ["intent", "mode", "result", "session_id", "state"]);
+    ["integration", "intent", "mode", "result", "session_id", "state"]);
   for (const key of ["turns", "receipts", "attempts", "manager_run", "proposal"]) {
     assert.equal(finished[key], undefined, `poll must not leak ${key}`);
   }
@@ -325,4 +336,198 @@ test("tick is safe to call from any state, which is what makes resume free", asy
   // Calling again must not re-run anything or spend another scarce turn.
   const again = await sessions.tick(started.session_id);
   assert.deepEqual(again, finished);
+});
+
+// --- C2 / C4: what a mode permits, and where a conflict goes -------------------------------------
+
+// A session wired to a real integrator, on a repository whose target branch is publishable.
+async function integrating(t, script, mode = "AUTO") {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-c2-"));
+  const root = path.join(temp, "data");
+  const repo = path.join(temp, "repo");
+  fs.mkdirSync(repo);
+  await runProcess("git", ["init", "-b", "main", repo]);
+  await runProcess("git", ["-C", repo, "config", "user.name", "T"]);
+  await runProcess("git", ["-C", repo, "config", "user.email", "t@e.invalid"]);
+  fs.writeFileSync(path.join(repo, "parser.js"), "// do not touch\n");
+  await runProcess("git", ["-C", repo, "add", "."]);
+  await runProcess("git", ["-C", repo, "commit", "-m", "initial"]);
+  await runProcess("git", ["-C", repo, "checkout", "--detach", "HEAD"]);
+  initializeDataRoot(root);
+
+  const dispatcher = new Dispatcher({
+    root,
+    backend: new FakeBackend(async ({ artifactDir, mode: jobMode, worktreePath }) => {
+      fs.mkdirSync(artifactDir, { recursive: true });
+      const events = path.join(artifactDir, "opencode-events.jsonl");
+      fs.writeFileSync(events, JSON.stringify({
+        type: "step_finish",
+        part: { reason: "stop", tokens: { input: 5, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0.0001 },
+      }));
+      if (jobMode !== "read") fs.writeFileSync(path.join(worktreePath, "export.js"), "--json\n");
+      return { exitCode: 0, stdout: "ok", stderr: "", stdoutPath: events };
+    }),
+  });
+  t.after(async () => {
+    try { dispatcher.close(); } catch { /* closed */ }
+    const listed = await runProcess("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+    for (const worktree of listed.stdout.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter((worktree) => path.resolve(worktree) !== path.resolve(repo))) {
+      await runProcess("git", ["-C", repo, "worktree", "unlock", worktree]);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    }
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+
+  const manager = new ManagerService({
+    dispatcher, backend: new FakeManagerBackend(script),
+    workerModel: "opencode-go/deepseek-v4-flash",
+  });
+  const sessions = new AutonomousSessionService({
+    dispatcher, manager, integrator: new SafeIntegrator({ dispatcher }),
+  });
+  const project = await dispatcher.addProject({
+    name: "C2", repoPath: repo, branch: "main", validation: [], protectedPaths: ["parser.js"],
+  });
+  const started = await sessions.start({ projectId: project.id, intent: "Add a --json flag", mode });
+  return {
+    dispatcher, sessions, started, repo,
+    head: async () => (await runProcess("git", ["-C", repo, "rev-parse", "main"])).stdout.trim(),
+    land: async (file, content) => {
+      // Exit codes checked: a silently failed setup step would make a conflict test pass by never
+      // creating the conflict it claims to test.
+      const run = async (...args) => {
+        const result = await runProcess("git", args);
+        if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+        return result.stdout.trim();
+      };
+      const wt = path.join(temp, `other-${Math.floor(Math.random() * 1e6)}`);
+      await run("-C", repo, "worktree", "add", "--detach", wt, "main");
+      fs.writeFileSync(path.join(wt, file), content);
+      await run("-C", wt, "add", ".");
+      await run("-C", wt, "-c", "user.name=O", "-c", "user.email=o@e.invalid", "commit", "-m", "concurrent");
+      const sha = await run("-C", wt, "rev-parse", "HEAD");
+      await run("-C", repo, "update-ref", "refs/heads/main", sha);
+      await runProcess("git", ["-C", repo, "worktree", "remove", "--force", wt]);
+      return sha;
+    },
+  };
+}
+
+const ACCEPTING = [
+  { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+  { action: "ACCEPT", reason: "done" },
+];
+
+test("AUTO publishes the accepted result; the branch becomes the validated tree", async (t) => {
+  const w = await integrating(t, ACCEPTING, "AUTO");
+  const before = await w.head();
+  const finished = await w.sessions.tick(w.started.session_id);
+
+  assert.equal(finished.state, "completed");
+  assert.ok(finished.integration, "the session reports what landed");
+  assert.equal(finished.integration.from, before);
+  assert.equal(await w.head(), finished.integration.to);
+
+  // The ledger independently agrees that the published tree is the validated one.
+  const staged = w.dispatcher.db.prepare(
+    "SELECT * FROM staged_integrations WHERE session_id = ?",
+  ).get(w.started.session_id);
+  assert.equal(staged.publish_state, "PUBLISHED");
+  assert.equal(staged.validation_state, "PASSED");
+  assert.equal(finished.integration.validated_tree, staged.prepared_tree);
+});
+
+test("MANUAL does the same work and stops with the candidate ready", async (t) => {
+  // Same intelligence, same delegation, same review. The mode governs only whether it lands.
+  const w = await integrating(t, ACCEPTING, "MANUAL");
+  const before = await w.head();
+  const finished = await w.sessions.tick(w.started.session_id);
+
+  assert.equal(finished.state, "semantically_accepted");
+  assert.ok(finished.result.candidate_commit, "the work was done in full");
+  assert.equal(finished.integration, null);
+  assert.equal(await w.head(), before, "nothing landed");
+  assert.equal(w.dispatcher.db.prepare("SELECT COUNT(*) c FROM staged_integrations").get().c, 0,
+    "MANUAL did not even prepare a publication");
+});
+
+test("PLAN never publishes, even if the manager somehow accepts", async (t) => {
+  const w = await integrating(t, ACCEPTING, "PLAN");
+  const before = await w.head();
+  await w.sessions.tick(w.started.session_id);
+  assert.equal(await w.head(), before);
+  assert.equal(w.dispatcher.db.prepare("SELECT COUNT(*) c FROM staged_integrations").get().c, 0);
+});
+
+// Drift that happens WHILE the work is happening -- which is the only moment it matters.
+//
+// Landing the concurrent commit before the session starts would trip the authorized-base guard
+// instead, refusing to buy work against a base nobody approved. That guard is correct and is not
+// what these tests are about, so the commit lands during preparation: after a candidate exists and
+// was accepted, exactly as it would if someone pushed while a worker was building.
+function driftingIntegrator(w, file, content) {
+  return new (class extends SafeIntegrator {
+    async prepare(options) {
+      if (!this.drifted) { this.drifted = true; await w.land(file, content); }
+      return super.prepare(options);
+    }
+  })({ dispatcher: w.dispatcher });
+}
+
+test("a merge conflict goes to the manager, not to Hermes", async (t) => {
+  // A conflict is a fact about the repository, like a failing test. The machinery that reasons about
+  // repository facts is the manager -- which already holds the intent, the settled clarifications
+  // and the accepted candidate. Interrupting a person for it would be interrupting them for
+  // something they cannot usefully answer.
+  const w = await integrating(t, [
+    { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+    // Handed the conflict, the manager re-plans rather than the session asking anyone.
+    { action: "IMPLEMENT", reason: "rebuilding against the branch as it now stands", brief: BRIEF({ diagnosis: "reconcile" }) },
+    { action: "ACCEPT", reason: "applies to the new head and still does what was asked" },
+  ], "AUTO");
+  w.sessions.integrator = driftingIntegrator(w, "export.js", "SOMETHING ELSE ENTIRELY\n");
+
+  const finished = await w.sessions.tick(w.started.session_id);
+
+  // Whatever the outcome, nobody was asked about a merge conflict as such.
+  for (const question of w.sessions.messages(w.started.session_id)
+    .filter((message) => message.direction === "TO_HERMES")) {
+    assert.doesNotMatch(question.body, /merge conflict|cherry-pick|could not apply/i,
+      "a mechanical conflict is not a question for a person");
+  }
+  const handed = w.dispatcher.db.prepare(
+    "SELECT * FROM events WHERE kind = 'INTEGRATION_CONFLICT_TO_MANAGER'",
+  ).all();
+  assert.ok(handed.length >= 1, "the conflict went to the manager");
+  assert.ok(handed.length <= 2, "and handing it back is bounded rather than churning");
+  assert.ok(["completed", "semantically_accepted", "working", "failed"].includes(finished.state));
+});
+
+test("a semantic dead end reaches Hermes as a choice, not as a merge conflict", async (t) => {
+  const w = await integrating(t, [
+    { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+    // Handed the conflict, the manager concludes the two behaviours cannot both be preserved.
+    {
+      action: "ESCALATE",
+      reason: "The branch now formats exports differently; preserving both is impossible.",
+      question: "The target branch changed the same export behaviour while this task ran. Keep the "
+        + "branch's new behaviour, or the behaviour you asked for?",
+    },
+  ], "AUTO");
+  w.sessions.integrator = driftingIntegrator(w, "export.js", "INCOMPATIBLE\n");
+
+  const finished = await w.sessions.tick(w.started.session_id);
+
+  assert.equal(finished.state, "waiting_for_hermes");
+  assert.match(finished.question, /Keep the branch's new behaviour, or the behaviour you asked for/);
+  assert.doesNotMatch(finished.question, /merge conflict|cherry-pick/i);
+  assert.match(finished.why_it_matters, /decision about what the change should mean/);
+  assert.equal(w.dispatcher.db.prepare(
+    "SELECT COUNT(*) c FROM staged_integrations WHERE publish_state = 'PUBLISHED'",
+  ).get().c, 0, "the branch is untouched while the question is open");
 });
