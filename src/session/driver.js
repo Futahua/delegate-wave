@@ -42,14 +42,20 @@ export class SessionDriver {
 
   // Sessions that still have somewhere to go.
   //
-  // WORKING is obvious. SEMANTICALLY_ACCEPTED is included because for a session permitted to
-  // publish it is not a resting state: the acceptance is recorded before publication, so a crash in
-  // that window leaves work that is finished except for its cheapest step. Whether it may proceed is
-  // then the ordinary permission question, asked by tick() rather than decided here.
+  // WORKING is obvious. SEMANTICALLY_ACCEPTED is included only for a session PERMITTED TO PUBLISH:
+  // for those it is not a resting state, because acceptance is recorded before publication and a
+  // crash in that window leaves work finished except for its cheapest step.
+  //
+  // For MANUAL and PLAN it IS the resting state -- the result is meant to wait for a person. Claiming
+  // them anyway meant five finished probe sessions were re-driven every two seconds forever, doing
+  // nothing but occupying the slots that starved a live one. Terminal-for-this-mode is a fact worth
+  // asking the query, rather than discovering after the work is claimed.
   pending() {
     const rows = this.db.prepare(
       `SELECT id, state, mode FROM autonomous_sessions
-       WHERE state IN ('WORKING', 'SEMANTICALLY_ACCEPTED') ORDER BY updated_at`,
+       WHERE state = 'WORKING'
+          OR (state = 'SEMANTICALLY_ACCEPTED' AND mode IN ('AUTO', 'ACCEPT_EDITS', 'BYPASS'))
+       ORDER BY updated_at`,
     ).all();
     // Least-recently-driven first, so every session reaches a slot.
     //
