@@ -174,6 +174,12 @@ async function main() {
       // The supervised runtime is entitled to every role, so it is a safe place to complete a
       // pending legacy-store upgrade rather than fail the logon task on a stale format.
       await supervisor.migrateSecrets();
+      // A second supervised runtime would drive the same autonomous sessions as the first.
+      const running = supervisor.runtimeAlreadyRunning();
+      if (running) {
+        print({ ok: true, already_running: running, note: "a supervised Control API is already live; not starting a second" });
+        return;
+      }
       Object.assign(process.env, await supervisor.runtimeEnvironment());
       supervisor.recordRuntimePid();
       await serve();

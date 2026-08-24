@@ -548,6 +548,28 @@ export class WindowsSupervisor {
     return { stopped: true, task_name: SUPERVISOR_TASK_NAME };
   }
 
+  // Whether a supervised runtime is already alive.
+  //
+  // The scheduled task repeats every minute and its MultipleInstancesPolicy governs TASK instances,
+  // not the process each instance leaves running. When the scheduler loses track of a detached
+  // child, it launches another one a minute later, and another -- five accumulated during one
+  // dogfood. That was survivable when the runtime only served HTTP. It is not now: every supervised
+  // runtime carries a SessionDriver, so duplicates drive the SAME sessions concurrently, race each
+  // other for the single live attempt, and produce exactly the "already has live attempt" refusals
+  // that made a dogfood look like a manager fault.
+  //
+  // Checked from the durable receipt, so the guard survives a restart and does not depend on any
+  // in-memory registry.
+  runtimeAlreadyRunning() {
+    try {
+      if (!fs.existsSync(this.runtimePidPath)) return null;
+      const pid = Number(fs.readFileSync(this.runtimePidPath, "utf8").trim());
+      if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+      if (pid === process.pid) return null;
+      return this.processProbe(pid) ? pid : null;
+    } catch { return null; }
+  }
+
   recordRuntimePid(pid = process.pid) {
     fs.mkdirSync(path.dirname(this.runtimePidPath), { recursive: true });
     fs.writeFileSync(this.runtimePidPath, `${pid}\n`, { encoding: "utf8", mode: 0o600 });
