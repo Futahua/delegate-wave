@@ -1,4 +1,8 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
+
+// Kept as a named constant: writing this regex inline has broken this file twice.
+const SPLIT_LINES = new RegExp("\r?\n");
 import path from "node:path";
 import { runProcess } from "./process.js";
 
@@ -111,6 +115,17 @@ export function openCodeCapabilities(mode) {
 export class OpenCodeBackend {
   // Identity recorded on every attempt, so routing never needs archaeology.
   executorId = "opencode";
+
+  // The version actually installed. A NULL here would weaken the field's whole purpose: "which
+  // executor, at which version" is the question that took transcript archaeology to answer once.
+  get executorVersion() {
+    try {
+      const resolved = execFileSync(this.executable ?? "opencode", ["--version"], {
+        encoding: "utf8", timeout: 10_000, windowsHide: true,
+      }).trim().split(SPLIT_LINES)[0];
+      return resolved ? `opencode@${resolved}` : null;
+    } catch { return null; }
+  }
 
   constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000, launchResolver = defaultOpenCodeLaunch } = {}) {
     if (executable) {

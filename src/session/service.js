@@ -229,6 +229,15 @@ export class AutonomousSessionService {
       return this.poll(sessionId);
     }
 
+    // A worker is already building for this session.
+    //
+    // Asking the manager to decide again here would buy a scarce turn to answer a question whose
+    // answer is "wait", and its likely re-decision -- IMPLEMENT, again -- would try to commission a
+    // second attempt beside the live one. The driver ticks every couple of seconds while a worker
+    // runs for minutes, so this is the ordinary case, not an edge case.
+    const inFlight = this.dispatcher.liveAttemptFor(session.job_id);
+    if (inFlight) return this.poll(sessionId);
+
     try {
       await this.manager.advance(session.job_id, {
         // The manager reasons from evidence; these are the answers Hermes already gave it.

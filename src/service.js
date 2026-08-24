@@ -2308,6 +2308,18 @@ export class Dispatcher {
   // they cannot produce a candidate, cannot integrate, and are refused outright if they modify the
   // tree, so two of them running together cannot interfere through anything but budget -- which
   // admitAttempt() now settles atomically.
+  // The job's own in-flight worker, if it has one.
+  //
+  // Exists so normal in-flight work is discovered BEFORE a scarce manager turn is bought, rather
+  // than by assertAdmissible() refusing afterwards. That global fence stays exactly as it is -- it is
+  // the last line, and it should never be the first thing to notice ordinary concurrency.
+  liveAttemptFor(jobId) {
+    return this.db.prepare(
+      `SELECT a.id, a.ordinal, a.started_at, a.scheduler_pid FROM attempts a
+       WHERE a.job_id = ? AND ${lifecycleActive("a")} ORDER BY a.ordinal DESC LIMIT 1`,
+    ).get(jobId) ?? null;
+  }
+
   assertAdmissible(jobId) {
     const job = this.getJob(jobId);
     const root = this.budgetRootJobId(jobId);

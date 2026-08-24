@@ -142,6 +142,20 @@ export async function startControlServer({
   const router = backend ? null : new BackendRouter({ apiKey: executorApiKey, prefer: preferBackend });
   const dispatcher = new Dispatcher({ root, backend, router });
 
+  // A previous runtime may have died holding an attempt. reconcile() checks whether each owner
+  // process is actually alive, so a live attempt belonging to a running scheduler is untouched while
+  // an orphan is resolved -- which matters more than it used to: assertAdmissible() fences ALL work
+  // behind any live attempt, so one orphan left by a crash would otherwise block the installation
+  // until somebody noticed. The global fence stays strict; startup just stops lying to it.
+  const recovered = await dispatcher.reconcile({ apply: true });
+  const strandedCount = Array.isArray(recovered?.stranded) ? recovered.stranded.length : 0;
+  if (strandedCount) {
+    recordEvent(dispatcher.db, {
+      kind: "RUNTIME_RECOVERED_ORPHANED_ATTEMPTS", entityType: "job", entityId: "runtime",
+      payload: { attempts: recovered.stranded },
+    });
+  }
+
   // The autonomous runtime, assembled here because this is where the executor lanes are known.
   //
   // The driver is what makes a session autonomous: Hermes starts one, observes it and answers its
@@ -202,6 +216,13 @@ export async function startControlServer({
     // Reported, not inferred from which executor's artifacts turn up. Routing is per model, so the
     // report names each lane rather than pretending one executor serves everything.
     managerProvider: managerProvider ? managerProvider.id : null,
+    // Startup evidence: which executor was ASKED for and where that instruction came from, so a
+    // runtime routing work somewhere unexpected says so at boot rather than in a transcript.
+    workerExecutor: {
+      requested: preferBackend,
+      source: process.env.DELEGATE_WAVE_BACKEND ? "cli/--backend or environment" : "default",
+    },
+    recoveredAttempts: strandedCount,
     executor: router ? {
       default: router.select(DEFAULT_WORKER_MODEL).selected,
       review: router.select(REVIEW_MODEL).selected,

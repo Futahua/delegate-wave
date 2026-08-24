@@ -174,6 +174,14 @@ async function main() {
       // The supervised runtime is entitled to every role, so it is a safe place to complete a
       // pending legacy-store upgrade rather than fail the logon task on a stale format.
       await supervisor.migrateSecrets();
+      // Named by the task definition, not inherited from an environment snapshot.
+      //
+      // Task Scheduler captures its environment block when the service starts, so a User variable
+      // set afterwards never reaches a task-launched process -- proven the hard way: a runtime kept
+      // routing work to the wrong executor while the variable said otherwise. An explicit flag on
+      // the action is a fact about the task rather than a fact about whoever's shell created it.
+      if (options.backend) process.env.DELEGATE_WAVE_BACKEND = options.backend;
+
       // A second supervised runtime would drive the same autonomous sessions as the first.
       const running = supervisor.runtimeAlreadyRunning();
       if (running) {

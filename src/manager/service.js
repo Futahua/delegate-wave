@@ -787,6 +787,21 @@ export class ManagerService {
       );
     }
 
+    // Re-checked here, immediately before commissioning, because the pre-inference guard upstream
+    // and this moment are not the same instant. Two ticks that both passed the earlier check must
+    // still produce exactly one attempt.
+    //
+    // Returning is not a failure: a worker is already building the very thing this decision asked
+    // for. Treating it as one turned ordinary concurrency into a dead session.
+    const alreadyRunning = this.dispatcher.liveAttemptFor(run.job_id);
+    if (alreadyRunning) {
+      recordEvent(this.db, {
+        kind: "MANAGER_IMPLEMENT_ALREADY_IN_FLIGHT", entityType: "job", entityId: run.job_id,
+        payload: { runId: run.id, attemptId: alreadyRunning.id },
+      });
+      return { alreadyInFlight: alreadyRunning.id };
+    }
+
     // The root sits at RUNNING between attempts; runJob claims from PENDING or NEEDS_ATTENTION.
     this.db.prepare("UPDATE jobs SET status = 'PENDING', updated_at = ? WHERE id = ?").run(now(), run.job_id);
     await this.dispatcher.runJob(run.job_id, {

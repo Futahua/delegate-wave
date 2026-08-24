@@ -153,6 +153,9 @@ export function buildTaskXml({
   workingDirectory = supervisorPaths().workingDirectory,
   principal = currentWindowsPrincipal(),
   startBoundary = localStartBoundary(),
+  // Which executor this installation runs workers under. Written into the action so the task itself
+  // states it, rather than depending on whatever environment the scheduler happens to have cached.
+  workerBackend = null,
 } = {}) {
   return `<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -206,7 +209,7 @@ export function buildTaskXml({
   <Actions Context="Author">
     <Exec>
       <Command>${xml(nodePath)}</Command>
-      <Arguments>&quot;${xml(cliPath)}&quot; supervisor run</Arguments>
+      <Arguments>&quot;${xml(cliPath)}&quot; supervisor run${workerBackend ? ` --backend ${xml(workerBackend)}` : ""}</Arguments>
       <WorkingDirectory>${xml(workingDirectory)}</WorkingDirectory>
     </Exec>
   </Actions>
