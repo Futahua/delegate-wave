@@ -206,7 +206,10 @@ async function main() {
         "Unknown supervisor command; use install, status, start, stop, uninstall, migrate-secrets, or add-role",
       );
     }
-    print(await supervisor[action]());
+    // install carries the executor into the task definition; the others take no options.
+    print(await supervisor[action](
+      action === "install" && options.backend ? { workerBackend: options.backend } : undefined,
+    ));
     return;
   }
   if (positional[0] === "mcp") {

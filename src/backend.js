@@ -120,7 +120,11 @@ export class OpenCodeBackend {
   // executor, at which version" is the question that took transcript archaeology to answer once.
   get executorVersion() {
     try {
-      const resolved = execFileSync(this.executable ?? "opencode", ["--version"], {
+      // Deliberately NOT this.executable: that is the node binary this backend spawns, so asking it
+      // for --version yields node's version wearing an opencode label. A manufactured provenance is
+      // worse than a missing one, because only the missing one is detectable later -- this getter
+      // returns null unless it can ask opencode itself.
+      const resolved = execFileSync("opencode", ["--version"], {
         encoding: "utf8", timeout: 10_000, windowsHide: true,
       }).trim().split(SPLIT_LINES)[0];
       return resolved ? `opencode@${resolved}` : null;
