@@ -235,7 +235,11 @@ export class AutonomousSessionService {
     // answer is "wait", and its likely re-decision -- IMPLEMENT, again -- would try to commission a
     // second attempt beside the live one. The driver ticks every couple of seconds while a worker
     // runs for minutes, so this is the ordinary case, not an edge case.
-    const inFlight = this.dispatcher.liveAttemptFor(session.job_id);
+    // Work is already on its way: either an executor has claimed an attempt, or the manager has
+    // decided to buy one and the reservation is still open. The second case is the one that matters
+    // -- between decision and attempt there is nothing else to see.
+    const inFlight = this.dispatcher.liveAttemptFor(session.job_id)
+      ?? this.dispatcher.openCommission(session.job_id);
     if (inFlight) return this.poll(sessionId);
 
     try {
@@ -255,6 +259,13 @@ export class AutonomousSessionService {
         });
         return this.poll(sessionId);
       }
+      // A session must not momentarily advertise a terminal FAILED while work that could still
+      // finish it is in flight. Terminal states are read by people and by Hermes, and a state that
+      // can be walked back is worse than a state that waits: the first is a lie that corrects
+      // itself, the second is merely slow.
+      const stillWorking = this.dispatcher.liveAttemptFor(session.job_id)
+        ?? this.dispatcher.openCommission(session.job_id);
+      if (stillWorking) return this.poll(sessionId);
       this.setState(sessionId, {
         state: "FAILED",
         outcome: error instanceof ManagerStop ? `${error.code}: ${error.message}` : error.message,

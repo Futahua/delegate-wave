@@ -2308,6 +2308,46 @@ export class Dispatcher {
   // they cannot produce a candidate, cannot integrate, and are refused outright if they modify the
   // tree, so two of them running together cannot interfere through anything but budget -- which
   // admitAttempt() now settles atomically.
+  // Work already on its way for this job: a decision that has been made, whether or not an executor
+  // has claimed it yet.
+  openCommission(jobId) {
+    return this.db.prepare(
+      "SELECT * FROM work_commissions WHERE job_id = ? AND state IN ('PENDING','CLAIMED') LIMIT 1",
+    ).get(jobId) ?? null;
+  }
+
+  // Reserves the right to commission work, atomically. Returns null when somebody else already has
+  // it -- losing this race is ordinary, not an error.
+  //
+  // The unique index does the deciding, so two callers that both looked and both saw nothing still
+  // produce exactly one commission.
+  commissionWork({ jobId, managerRunId = null, action, decisionTurnId = null }) {
+    const commissionId = `wcom_${crypto.randomUUID()}`;
+    try {
+      this.db.prepare(`INSERT INTO work_commissions(
+        id, job_id, manager_run_id, action, decision_turn_id, state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)`).run(
+        commissionId, jobId, managerRunId, action, decisionTurnId, now(), now(),
+      );
+      return this.db.prepare("SELECT * FROM work_commissions WHERE id = ?").get(commissionId);
+    } catch (error) {
+      if (/UNIQUE|constraint/i.test(String(error?.message))) return null;
+      throw error;
+    }
+  }
+
+  // Binds a commission to the attempt it became, or closes it when the work will never arrive.
+  //
+  // The failure path matters as much as the success one: a commission left PENDING by a dispatch
+  // that died would fence the job forever, which is the opposite of what single-flight is for.
+  settleCommission(commissionId, { state, attemptId = null, outcome = null }) {
+    if (!commissionId) return null;
+    this.db.prepare(
+      "UPDATE work_commissions SET state = ?, attempt_id = ?, outcome = ?, updated_at = ? WHERE id = ?",
+    ).run(state, attemptId, outcome, now(), commissionId);
+    return this.db.prepare("SELECT * FROM work_commissions WHERE id = ?").get(commissionId);
+  }
+
   // The job's own in-flight worker, if it has one.
   //
   // Exists so normal in-flight work is discovered BEFORE a scarce manager turn is bought, rather

@@ -793,23 +793,42 @@ export class ManagerService {
     //
     // Returning is not a failure: a worker is already building the very thing this decision asked
     // for. Treating it as one turned ordinary concurrency into a dead session.
-    const alreadyRunning = this.dispatcher.liveAttemptFor(run.job_id);
-    if (alreadyRunning) {
+    // The reservation, taken BEFORE anything is dispatched.
+    //
+    // Checking for a live attempt cannot close this window, because between deciding and dispatching
+    // there is no attempt to find. Two ticks could each look, each see nothing, and each commission
+    // work. The unique index decides instead: losing this race is ordinary, and the loser simply
+    // returns rather than buying a second worker.
+    const commission = this.dispatcher.commissionWork({
+      jobId: run.job_id, managerRunId: run.id, action: "IMPLEMENT",
+    });
+    if (!commission) {
       recordEvent(this.db, {
         kind: "MANAGER_IMPLEMENT_ALREADY_IN_FLIGHT", entityType: "job", entityId: run.job_id,
-        payload: { runId: run.id, attemptId: alreadyRunning.id },
+        payload: { runId: run.id, reason: "another commission is already open for this job" },
       });
-      return { alreadyInFlight: alreadyRunning.id };
+      return { alreadyInFlight: true };
     }
 
     // The root sits at RUNNING between attempts; runJob claims from PENDING or NEEDS_ATTENTION.
     this.db.prepare("UPDATE jobs SET status = 'PENDING', updated_at = ? WHERE id = ?").run(now(), run.job_id);
-    await this.dispatcher.runJob(run.job_id, {
-      model: this.workerModel, instruction, startSha,
-    });
-    const attempt = this.db.prepare(
-      "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
-    ).get(run.job_id);
+    let attempt = null;
+    try {
+      await this.dispatcher.runJob(run.job_id, {
+        model: this.workerModel, instruction, startSha,
+      });
+      attempt = this.db.prepare(
+        "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+      ).get(run.job_id);
+      this.dispatcher.settleCommission(commission.id, {
+        state: "CLOSED", attemptId: attempt?.id ?? null,
+      });
+    } catch (error) {
+      // A dispatch that will never arrive must release the reservation, or single-flight becomes a
+      // permanent fence on the job rather than a guard against duplicate work.
+      this.dispatcher.settleCommission(commission.id, { state: "FAILED", outcome: error.message });
+      throw error;
+    }
     this.setRun(run.id, { status: "REVIEWING", last_candidate_attempt_id: attempt?.id ?? null });
   }
 

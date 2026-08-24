@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "31";
+export const SCHEMA_VERSION = "32";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -733,6 +733,41 @@ CREATE TABLE IF NOT EXISTS manager_receipt_pricings (
 -- BYPASS suppresses QUESTIONS, never INVARIANTS. Protected paths, deterministic validation, CAS
 -- integration, budget admission, worktree and credential isolation are mechanical and refuse under
 -- every mode including this one.
+-- Work the manager has DECIDED to buy, recorded before anyone is asked to buy it.
+--
+-- The window this closes is between a decision and an attempt row. Two ticks could both find no
+-- live attempt -- because none existed yet -- and both spend a scarce turn concluding IMPLEMENT,
+-- and the collision only surfaced later when the dispatcher refused the second. Checking
+-- attempts.terminal_state cannot close that gap: the fact that needs to be durable is "work is
+-- already on its way", which is true from the moment of the decision, not from the moment an
+-- executor claims it.
+--
+-- Durable rather than an in-memory lock, because a process that dies between deciding and
+-- dispatching must still tell its replacement that work was commissioned. An in-memory mutex would
+-- forget exactly when forgetting is most expensive.
+CREATE TABLE IF NOT EXISTS work_commissions (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  manager_run_id TEXT REFERENCES manager_runs(id),
+  -- IMPLEMENT or REVISE: which semantic decision bought this.
+  action TEXT NOT NULL,
+  -- The turn that decided it, so a commission is traceable to the reasoning that caused it.
+  decision_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('PENDING', 'CLAIMED', 'CLOSED', 'FAILED')),
+  attempt_id TEXT REFERENCES attempts(id),
+  outcome TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- A claimed or closed commission names the attempt it became.
+  CHECK (state IN ('PENDING', 'FAILED') OR attempt_id IS NOT NULL)
+);
+
+-- At most one commission may be OPEN per job. This is the single-flight rule, enforced by the
+-- database rather than by whichever caller remembers to look: two crossed ticks race to insert and
+-- exactly one wins.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_commissions_single_flight
+  ON work_commissions(job_id) WHERE state IN ('PENDING', 'CLAIMED');
+
 CREATE TABLE IF NOT EXISTS autonomous_sessions (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
