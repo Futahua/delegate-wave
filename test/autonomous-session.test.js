@@ -651,3 +651,40 @@ test("a long session does not starve the others", async (t) => {
     "the quick session ran while the slow one was still working");
   assert.ok(second.session_id);
 });
+
+test("no session starves behind sessions that cannot progress", async (t) => {
+  // The failure this reproduces: with more pending sessions than concurrency, ordering by
+  // updated_at claimed the same oldest few on every pass. Sessions that return immediately free
+  // their slots instantly and are re-claimed two seconds later, forever, so anything behind them is
+  // never reached. A freshly started session sat untouched behind four such sessions for minutes
+  // and looked exactly like a driver that had never started.
+  const w = await integrating(t, ACCEPTING, "MANUAL");
+  const driven = [];
+  const sessions = {
+    db: w.dispatcher.db,
+    tick: async (id) => { driven.push(id); },
+  };
+  const driver = new SessionDriver({ sessions, intervalMs: 5, concurrency: 2 });
+  t.after(() => driver.stop());
+
+  // Five pending sessions, room for two at a time.
+  const ids = [w.started.session_id];
+  for (let index = 0; index < 4; index += 1) {
+    const extra = await w.sessions.start({
+      projectId: w.sessions.get(w.started.session_id).project_id,
+      intent: `filler ${index}`, mode: "MANUAL",
+    });
+    ids.push(extra.session_id);
+  }
+
+  // Enough passes that a fair scheduler must have reached everyone.
+  for (let pass = 0; pass < 12; pass += 1) {
+    driver.pass();
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+  }
+
+  const reached = new Set(driven);
+  for (const id of ids) {
+    assert.ok(reached.has(id), `${id} never reached a slot: it starved behind the others`);
+  }
+});

@@ -199,6 +199,9 @@ export async function startControlServer({
         payload: { message: error.message },
       });
     },
+    onEvent: (kind, payload) => {
+      recordEvent(dispatcher.db, { kind, entityType: "job", entityId: "runtime", payload });
+    },
   }).start();
 
   const service = new ControlService({ dispatcher, sessions });

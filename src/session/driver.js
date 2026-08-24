@@ -21,13 +21,20 @@ const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_CONCURRENCY = 4;
 
 export class SessionDriver {
-  constructor({ sessions, intervalMs = DEFAULT_INTERVAL_MS, concurrency = DEFAULT_CONCURRENCY, onError = null }) {
+  constructor({ sessions, intervalMs = DEFAULT_INTERVAL_MS, concurrency = DEFAULT_CONCURRENCY, onError = null, onEvent = null }) {
     if (!sessions) throw new Error("SessionDriver requires a session service");
     this.sessions = sessions;
     this.db = sessions.db;
     this.intervalMs = intervalMs;
     this.concurrency = concurrency;
     this.onError = onError;
+    // Bounded lifecycle evidence. "No error recorded" and "never ran" look identical from the
+    // outside, and distinguishing them took a session of guessing.
+    this.onEvent = onEvent;
+    this.passes = 0;
+    // When each session was last given a slot. Ordering by this rather than by updated_at is what
+    // stops a session that cannot progress from permanently starving one that can.
+    this.lastDriven = new Map();
     this.inFlight = new Set();
     this.timer = null;
     this.stopped = false;
@@ -40,18 +47,37 @@ export class SessionDriver {
   // that window leaves work that is finished except for its cheapest step. Whether it may proceed is
   // then the ordinary permission question, asked by tick() rather than decided here.
   pending() {
-    return this.db.prepare(
+    const rows = this.db.prepare(
       `SELECT id, state, mode FROM autonomous_sessions
        WHERE state IN ('WORKING', 'SEMANTICALLY_ACCEPTED') ORDER BY updated_at`,
     ).all();
+    // Least-recently-driven first, so every session reaches a slot.
+    //
+    // Ordering by updated_at alone starves: with more pending sessions than concurrency, the same
+    // oldest few are claimed on every pass, and any session behind them is never reached. Sessions
+    // that return immediately -- because their work is already in flight, or because they are stuck
+    // -- free their slots instantly and are simply re-claimed two seconds later, forever. A newly
+    // started session sat untouched behind four such sessions and looked like a dead driver.
+    return rows.sort((a, b) => (this.lastDriven.get(a.id) ?? 0) - (this.lastDriven.get(b.id) ?? 0));
   }
 
   // One pass: claim what there is room for, and return without waiting for any of it.
   pass() {
-    for (const session of this.pending()) {
+    this.passes += 1;
+    const pending = this.pending();
+    const before = this.inFlight.size;
+    // Reported only when there is something to say, so a quiet driver stays quiet.
+    if (pending.length && this.onEvent) {
+      this.onEvent("SESSION_DRIVER_PASS", { pass: this.passes, workingFound: pending.length, inFlight: before });
+    }
+    const live = new Set(pending.map((session) => session.id));
+    for (const known of [...this.lastDriven.keys()]) if (!live.has(known)) this.lastDriven.delete(known);
+
+    for (const session of pending) {
       if (this.inFlight.size >= this.concurrency) break;
       if (this.inFlight.has(session.id)) continue;
       this.inFlight.add(session.id);
+      this.lastDriven.set(session.id, this.passes);
       // Deliberately not awaited. A pass that awaited its work would serialise every session behind
       // the slowest one, which is the starvation this design exists to avoid.
       Promise.resolve()
@@ -65,7 +91,13 @@ export class SessionDriver {
   start() {
     if (this.timer) return this;
     this.stopped = false;
-    this.timer = setInterval(() => { if (!this.stopped) this.pass(); }, this.intervalMs);
+    if (this.onEvent) this.onEvent("SESSION_DRIVER_STARTED", { intervalMs: this.intervalMs, concurrency: this.concurrency });
+    this.timer = setInterval(() => {
+      if (this.stopped) return;
+      // A throw here would otherwise surface as an uncaught exception in a timer, which is both
+      // fatal and unattributable. The driver reports and keeps going.
+      try { this.pass(); } catch (error) { if (this.onError) this.onError(error, null); }
+    }, this.intervalMs);
     // Never hold the process open on the driver's account: the served runtime decides its own
     // lifetime, and a timer that kept it alive would turn a clean shutdown into a hang.
     if (typeof this.timer.unref === "function") this.timer.unref();
