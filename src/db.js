@@ -21,7 +21,7 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "30";
+export const SCHEMA_VERSION = "31";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -344,6 +344,26 @@ CREATE TABLE IF NOT EXISTS attempts (
   --
   -- NULL means the family carries no ceiling, so there was no authority to divide.
   budget_reservation_usd REAL CHECK (budget_reservation_usd IS NULL OR budget_reservation_usd > 0),
+  -- WHY it failed, in words, beside the digest that identifies the failure.
+  --
+  -- failure_signature stays exactly what it was: a stable hash used to detect an attempt repeating
+  -- itself. It is deliberately not human-readable, and for a long time it was the ONLY thing an
+  -- operator saw. A real attempt reduced to "FAILED, reason = <64 hex characters>" while its
+  -- transcript held an unknown-tool error twelve times over -- the cause was recorded and
+  -- unreadable at the same time.
+  --
+  -- These three answer "what broke, at which stage, and where can I read about it" without touching
+  -- the digest, so deduplication keeps working and history keeps its identity.
+  failure_stage TEXT,
+  failure_code TEXT,
+  failure_detail_artifact TEXT,
+  -- WHICH executor actually ran this, as opposed to which model was asked for.
+  --
+  -- manage and the served runtime resolved this differently for months and nothing recorded it, so
+  -- the same model string ran under two different executors and the discrepancy was only findable by
+  -- reading transcripts. Routing is a fact about the attempt, not a detail of whoever launched it.
+  resolved_executor TEXT,
+  executor_version TEXT,
   UNIQUE(job_id, ordinal)
 );
 
@@ -1003,6 +1023,15 @@ function migrate(db) {
     db.exec("ALTER TABLE jobs ADD COLUMN internal_kind TEXT");
   }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
+  // Readable failure evidence and executor identity. Plain ADD COLUMNs: all five are nullable with
+  // no constraint, so a migrated table matches a fresh one exactly and historical attempts simply
+  // carry NULL -- which is the truth about them, since nothing recorded these facts at the time.
+  for (const column of [
+    "failure_stage", "failure_code", "failure_detail_artifact",
+    "resolved_executor", "executor_version",
+  ]) {
+    if (!attemptColumns.includes(column)) db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
+  }
   if (!attemptColumns.includes("changed_files_json")) {
     // Null for attempts that predate the column: they genuinely have no record, and inventing an
     // empty list would claim they changed nothing.

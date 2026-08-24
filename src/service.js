@@ -19,6 +19,7 @@ import {
   updateRefCas,
 } from "./git.js";
 import { referenceCostUsd } from "./pricing.js";
+import { classifyFailure, writeFailureDetail, describeFailure } from "./failure.js";
 import { assertNotShellComposed, runCommand, runShell } from "./process.js";
 import { capabilityProfile as capabilityProfileSpec } from "./harness/backend.js";
 import { readFinalText } from "./manager/runtime.js";
@@ -781,8 +782,8 @@ export class Dispatcher {
       this.db.prepare(`INSERT INTO attempts(
         id, job_id, ordinal, scheduler_epoch, backend, capability_profile, model,
         scheduler_pid, worktree_path, started_at, start_sha, instruction_digest,
-        budget_reservation_usd
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        budget_reservation_usd, resolved_executor, executor_version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         attemptId, jobId, ordinal, epoch, backend.constructor.name,
         // Recorded before the worker starts: the authority a worker ran under is evidence, not a
         // detail to be reconstructed afterwards from which artifacts happen to exist.
@@ -792,6 +793,14 @@ export class Dispatcher {
         // told something different from attempt 1" a mechanical fact rather than the manager's word.
         startFrom, instructionDigest(instructionText),
         reservation,
+        // WHICH executor actually ran this, recorded at claim time rather than inferred later.
+        //
+        // The class name above says which adapter object was used; these say which executor the
+        // ROUTER chose and what version of it exists on disk. delegate-wave spent a dogfood run
+        // discovering, by reading transcripts, that two entry points had resolved the same model
+        // string to different executors. Routing is a fact about the attempt.
+        backend.executorId ?? null,
+        backend.executorVersion ?? null,
       );
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?").run(now(), jobId);
       recordEvent(this.db, {
@@ -2710,6 +2719,17 @@ export class Dispatcher {
   async failAttempt({ attemptId, jobId, epoch, project, worktreePath, executorIntentId = null, error }) {
     const message = error instanceof Error ? error.message : String(error);
     const signature = normalizeFailureSignature(message);
+    // Additive: the digest above is untouched, and this only adds words beside it. Written before
+    // the transaction because an artifact is a file, and a file write does not belong inside a
+    // database transaction that must stay short.
+    const { stage, code } = classifyFailure(message);
+    const detailArtifact = writeFailureDetail({
+      artifactDir: this.paths.attemptArtifacts
+        ? this.paths.attemptArtifacts(project?.id, attemptId)
+        : path.join(this.paths.artifacts, String(project?.id ?? "unknown"), String(attemptId)),
+      message, stage, code,
+      evidence: [`attempt: ${attemptId}`, `signature: ${signature}`],
+    });
     const applied = transaction(this.db, () => {
       const attempt = this.db.prepare("SELECT * FROM attempts WHERE id = ?").get(attemptId);
       const currentEpoch = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'scheduler_epoch'").get().value);
@@ -2718,14 +2738,18 @@ export class Dispatcher {
         if (attempt.executor_intent_id !== executorIntentId) return false;
         this.db.prepare(`UPDATE attempts SET terminal_state = 'FAILED', finished_at = ?,
           executor_intent_id = NULL, executor_pid = NULL, failure_signature = ?,
-          quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(now(), signature, attemptId);
+          failure_stage = ?, failure_code = ?, failure_detail_artifact = ?,
+          quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(
+          now(), signature, stage, code, detailArtifact, attemptId);
       } else if (attempt.terminal_state === 'SUCCEEDED' && attempt.validation_state === 'PENDING') {
         // A check that could not be executed produced no evidence about this candidate. The attempt
         // still fails -- an unverifiable candidate cannot be offered -- but it fails as a system
         // fault, and the candidate is left unjudged rather than recorded as having failed its tests.
         this.db.prepare(`UPDATE attempts SET validation_state = ?,
-          failure_signature = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(
-          error?.validationDidNotRun ? 'NOT_RUN' : 'FAILED', signature, attemptId,
+          failure_signature = ?, failure_stage = ?, failure_code = ?,
+          failure_detail_artifact = ?, quarantined = 1, worktree_locked = 1 WHERE id = ?`).run(
+          error?.validationDidNotRun ? 'NOT_RUN' : 'FAILED', signature, stage, code,
+          detailArtifact, attemptId,
         );
       } else return false;
       const count = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?").get(jobId).count;
@@ -2745,7 +2769,13 @@ export class Dispatcher {
   status(jobId) {
     const job = this.getJob(jobId);
     if (!job) throw new Error(`Unknown job: ${jobId}`);
-    const attempts = this.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(jobId);
+    const rows = this.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(jobId);
+    // A failed attempt says what broke, not just that something did. describeFailure returns null
+    // for an attempt that did not fail, so a successful one gains nothing and reads the same.
+    const attempts = rows.map((attempt) => {
+      const failure = describeFailure(attempt);
+      return failure ? { ...attempt, failure } : attempt;
+    });
     const validations = this.db.prepare(`SELECT v.* FROM validation_runs v
       JOIN attempts a ON a.id = v.attempt_id WHERE a.job_id = ? ORDER BY v.started_at`).all(jobId);
     return { job, attempts, validations, family: this.jobFamily(jobId) };

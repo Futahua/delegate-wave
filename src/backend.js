@@ -75,6 +75,9 @@ const INLINE_POLICY = {
 };
 
 export class FakeBackend {
+  // Identity recorded on every attempt, so routing never needs archaeology.
+  executorId = "fake";
+
   constructor(handler = async () => ({ exitCode: 0, stdout: "fake success", stderr: "" })) {
     this.handler = handler;
   }
@@ -106,6 +109,9 @@ export function openCodeCapabilities(mode) {
 }
 
 export class OpenCodeBackend {
+  // Identity recorded on every attempt, so routing never needs archaeology.
+  executorId = "opencode";
+
   constructor({ executable, prefixArgs, attach, timeoutMs = 30 * 60_000, launchResolver = defaultOpenCodeLaunch } = {}) {
     if (executable) {
       this.executable = executable;

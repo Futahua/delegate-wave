@@ -259,6 +259,15 @@ export class HarnessBackend {
   } = {}) {
     if (!harnessHome) throw new Error("HarnessBackend requires the directory where dsh is installed");
     this.harnessHome = harnessHome;
+    // Identity recorded on every attempt, so "which executor ran this" never needs archaeology.
+    this.executorId = "harness";
+    // The version actually installed, read from the package rather than remembered. A release
+    // candidate that mangles a provider's streamed tool calls is a fact about a VERSION, and an
+    // attempt that fails under it should say which one it ran.
+    try {
+      const manifest = path.join(harnessHome, "node_modules", HARNESS_PACKAGE, "package.json");
+      this.executorVersion = HARNESS_PACKAGE + "@" + JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+    } catch { this.executorVersion = null; }
     this.entry = path.join(harnessHome, "node_modules", HARNESS_PACKAGE, "lib", "bin.js");
     this.model = model;
     this.baseUrl = baseUrl;
