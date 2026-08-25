@@ -57,6 +57,13 @@ process.stdin.on("data", (chunk) => {
 
 function handle(request) {
   const { id, method, params = {} } = request;
+  // Today's Hermes has no capability surface at all, so the DEFAULT here is the unknown-method
+  // refusal a real 0.19.0 gives. A stub that helpfully reported capabilities by default would make
+  // every test pass through a gate that no real receiver currently opens.
+  if (method === "gateway.capabilities") {
+    if (!script.capabilities) return err(id, -32601, `unknown method: ${method}`);
+    return ok(id, script.capabilities);
+  }
   if (method === "session.resume") {
     if (script.resumeFails) return err(id, 4007, "session not found");
     resumedDurable = params.session_id;
@@ -76,9 +83,13 @@ function handle(request) {
   }
   if (method === "prompt.submit") {
     if (params.session_id !== RUNTIME) return err(id, 4007, "session not found");
-    // The typed refusal the upstream per-session lease will produce: no turn started, nothing
-    // durable written. The contract is that this is an ordinary outcome, not an error.
-    if (script.busy) return err(id, 4030, "session is busy", { reason: "SESSION_BUSY" });
+    // The typed refusal the upstream per-session lease must produce: no turn started, nothing
+    // durable written. The contract is that this is an ordinary outcome, not an error -- and that it
+    // is identified by an exact machine-readable reason rather than by a code that means three other
+    // things or by prose containing the word "busy".
+    if (script.busy) {
+      return err(id, 5001, "session is owned by another process", { reason: "SESSION_NOT_OWNED" });
+    }
     const state = load();
     state.submits += 1;
     // The user row becoming durable BEFORE the assistant turn is the whole reason PARTIAL exists.

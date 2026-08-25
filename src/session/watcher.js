@@ -141,23 +141,47 @@ export class SessionWatcher {
 
   // Re-arms a watch that a PARTIAL delivery stopped. A PERSON does this, never a timer.
   //
-  // The blocked state exists because what already happened in that conversation is unknown, and no
-  // amount of waiting turns an unknown into a known. Only someone who can look at the transcript can
-  // say it is safe to speak into it again, so the escape hatch is deliberately manual and
-  // deliberately here rather than on the delivery path.
-  unblock(watchId) {
+  // BOUND TO THE AMBIGUITY THEY ACTUALLY LOOKED AT.
+  //
+  // Naming the wake is not ceremony. The blocked state means a specific delivery left a specific
+  // conversation in an unknown condition, and clearing it is a claim that SOMEBODY READ THAT
+  // TRANSCRIPT and knows what happened. A bare unblock(watchId) accepts that claim from someone who
+  // may be clearing a different ambiguity than the one they inspected -- or one that appeared while
+  // they were reading. So the caller names the wake, and this refuses if that is not still the row
+  // holding the watch shut: a compare-and-swap on a human decision, for the same reason every other
+  // mutation in this system compare-and-swaps on the world it was decided against.
+  unblock(watchId, partialWakeId) {
     const watch = this.db.prepare("SELECT * FROM session_watches WHERE id = ?").get(watchId);
     if (!watch) throw new Error(`Unknown watch: ${watchId}`);
     if (watch.state !== "BLOCKED") return watch;
-    // Cleared along with the state: the point of re-arming is that the last announcement is no
-    // longer trusted to have arrived, so the next pass must be free to say it again.
-    this.db.prepare(
-      `UPDATE session_watches SET state = 'ACTIVE', notified_state = NULL, notified_message_id = NULL,
-                                  updated_at = ? WHERE id = ?`,
-    ).run(now(), watchId);
-    recordEvent(this.db, {
-      kind: "SESSION_WATCH_UNBLOCKED", entityType: "job", entityId: watch.session_id,
-      payload: { watchId, hermesSessionId: watch.hermes_session_id },
+    if (typeof partialWakeId !== "string" || !partialWakeId.trim()) {
+      throw new Error("unblocking a watch requires naming the PARTIAL wake being cleared");
+    }
+    // The row that is actually holding it shut, decided here rather than trusted from the caller.
+    const blocker = this.db.prepare(
+      `SELECT * FROM wake_outbox WHERE watch_id = ? AND state = 'PARTIAL'
+       ORDER BY updated_at DESC LIMIT 1`,
+    ).get(watchId);
+    if (!blocker) throw new Error(`Watch ${watchId} is blocked but no PARTIAL wake explains it`);
+    if (blocker.id !== partialWakeId) {
+      throw new Error(
+        `Watch ${watchId} is held by ${blocker.id}, not ${partialWakeId}. `
+        + "Inspect the conversation for that wake before clearing it.",
+      );
+    }
+    transaction(this.db, () => {
+      // Cleared along with the state: the point of re-arming is that the last announcement is no
+      // longer trusted to have arrived, so the next pass must be free to say it again.
+      this.db.prepare(
+        `UPDATE session_watches SET state = 'ACTIVE', notified_state = NULL, notified_message_id = NULL,
+                                    updated_at = ? WHERE id = ?`,
+      ).run(now(), watchId);
+      // The wake itself is left PARTIAL for good. It is evidence of what happened, not a task, and
+      // rewriting it would erase the only record that this conversation was once ambiguous.
+      recordEvent(this.db, {
+        kind: "SESSION_WATCH_UNBLOCKED", entityType: "job", entityId: watch.session_id,
+        payload: { watchId, hermesSessionId: watch.hermes_session_id, acknowledgedWake: partialWakeId },
+      });
     });
     return this.db.prepare("SELECT * FROM session_watches WHERE id = ?").get(watchId);
   }

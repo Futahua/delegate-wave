@@ -256,9 +256,10 @@ Where each measured finding landed:
 3  no receiver idempotency     opaque marker written once at enqueue, never regenerated
 4  status is not an idle gate  never consulted; no preflight ownership state is computed
 5  no cross-process discovery  not depended on
-6  crash boundaries            classifyHistory(): ABSENT / DELIVERED / PARTIAL, one branch each
+6  crash boundaries            classifyHistory(): ABSENT / DELIVERED / PARTIAL / AMBIGUOUS
 7  capacity != exclusivity     the reason allowSubmit defaults to false
-8  the upstream fix            isBusyRefusal(): BUSY is an ordinary outcome, PENDING again
+8  the upstream fix            SESSION_NOT_OWNED matched exactly; BUSY leaves the wake PENDING
+7  PID + process-start leases  reused for delegate-wave's own reclaim rule (schema 34)
 ```
 
 The withheld step is one flag. `WakeDeliverer` is constructed only when
@@ -268,14 +269,55 @@ all run either way -- a withheld wake returns to PENDING with `WAKE_SUBMISSION_W
 a queue standing still reads as a decision rather than as a broken watcher. Turn the flag on when
 section 8 lands upstream, not before.
 
-Two additions beyond the frozen text, both consequences of it rather than departures:
+Additions beyond the frozen text, all consequences of it rather than departures:
 
 - **PARTIAL blocks its watch.** A durable marker with no assistant turn means what happened in that
   conversation is unknown. More automatic wakes into it would compound an ambiguity rather than
-  resolve it, so the watch moves to BLOCKED and only a person re-arms it (`SessionWatcher.unblock`).
-- **A grace window before PARTIAL.** A turn still running is not evidence of a lost one. A SUBMITTED
-  row is left alone for ten minutes before its silence is read as evidence; without this,
-  reconciling a healthy in-flight delivery would declare it PARTIAL and stop the watch.
+  resolve it, so the watch moves to BLOCKED and only a person re-arms it -- naming the specific
+  PARTIAL wake they inspected, which is compare-and-swapped against the row actually holding the
+  watch shut. A bare acknowledgement would accept a decision about a different ambiguity than the
+  one that was read.
+- **AMBIGUOUS is a fourth verdict.** Attribution stops at the next user turn. An assistant row that
+  arrives after somebody else has spoken is not an answer to this marker, and reading it as one
+  loses the wake in total silence -- nobody told, nothing retried, evidence saying it went fine.
+  Recorded in the PARTIAL state, because the handling is identical, with its own explanation,
+  because what a person must do about it is not.
+- **Reclaim requires a proven death, never an elapsed interval.** A delivery that is slow and one
+  that was abandoned are indistinguishable by clock. An age-based rule releases the slow one, its
+  original owner then submits, and a second process submits the same marker -- the exact failure
+  this subsystem exists to prevent. Schema 34 records the owning runtime and its gateway child as
+  (pid, process start time), and a row is only reclaimed when both are positively DEAD. UNKNOWN
+  never authorises anything. This is the identity principle Hermes already uses for its own leases.
+
+### Two corrections to the first implementation
+
+Both were found in review, and both would only have caused damage once submission was enabled.
+
+- **The turn timeout was a turn kill.** `waitForTurn` had a five-minute deadline, after which
+  `deliver()` returned and its `finally` closed the gateway -- and closing the gateway kills the turn
+  it hosts, which is how the PARTIAL boundary was produced during these measurements in the first
+  place. So a wake that took too long to answer was destroyed by the thing waiting for it, and the
+  wreckage was then recorded as evidence. The wait is now unbounded by default and ends when the turn
+  completes or the child dies; a deadline is available but documented as what it is, a cancellation
+  policy.
+- **BUSY was inferred rather than matched.** The predicate accepted code 4030 and any message
+  containing "busy". In Hermes 0.19.0, 4030 is "llm.oneshot requires a template" and "path outside
+  spawn-trees root". The upstream lease must emit an exact machine-readable reason --
+  `SESSION_NOT_OWNED` -- and that is what is matched, alongside Hermes' existing 4009. An unrecognised
+  code is an error, which stops and asks, rather than a retry.
+
+### Enabling submission takes more than a flag
+
+```text
+DELEGATE_WAVE_HERMES_AGENT_DIR   a gateway exists to spawn
+DELEGATE_WAVE_WAKE_SUBMIT=1      an operator asked for submission
+gateway.capabilities reports     per_session_exclusive_submit = true
+```
+
+The third is checked per delivery and cannot be configured. A receiver that does not answer counts
+as one that answers no, so today -- where no Hermes has a capability surface at all -- submission
+stays withheld even with the flag set. That is the point: the flag must not survive a downgrade, an
+unexpected PATH, or a copied config and do its damage in somebody's real conversation.
 
 `SEMANTICALLY_ACCEPTED` also wakes, but only for the modes where it is terminal (MANUAL, PLAN) --
 the same rule `SessionDriver.pending()` already applies. Without it the one mode whose entire purpose

@@ -234,11 +234,15 @@ export async function startControlServer({
   // Delivery is constructed only when a Hermes agent directory is configured, and it does not submit
   // even then.
   //
-  // Two separate gates, because they refuse two different things. Without a configured gateway there
-  // is nothing to spawn at all. With one, everything up to the mutation runs -- resume, canonical
-  // history, marker reconciliation, PARTIAL handling -- and the final `prompt.submit` is withheld
-  // until Hermes can refuse a second writer per session (research section 8). Turning it on is one
-  // environment variable, and it should be turned on when that fix lands, not before.
+  // THREE separate gates, because they refuse three different things. Without a configured gateway
+  // there is nothing to spawn at all. Without the environment flag, an operator has not asked for
+  // submission. And without Hermes itself reporting that it enforces per-session exclusivity, the
+  // flag authorises nothing -- that last one is checked per delivery, inside the deliverer, because
+  // it is a fact about the receiver rather than about this configuration, and no environment
+  // variable may be allowed to assert it.
+  //
+  // Everything before the mutation runs regardless: resume, canonical history, marker
+  // reconciliation, PARTIAL handling.
   const deliverer = HermesGateway.configured()
     ? new WakeDeliverer({
       db: dispatcher.db,

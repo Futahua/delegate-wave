@@ -26,24 +26,35 @@
 // than as a debugging aid: canonical history is what the caller reasons from, and this class is
 // careful never to imply otherwise by returning something that looks like a receipt.
 import { spawn } from "node:child_process";
+import { processStartedAt } from "./liveness.js";
 
 const DEFAULT_READY_MS = 60_000;
 const DEFAULT_REQUEST_MS = 120_000;
 
 // A refusal that means "not now", as distinct from "not ever".
 //
-// Hermes does not raise this yet: per-session exclusivity is the upstream change section 8 of the
-// research names, and until it lands nothing produces these codes. The predicate exists anyway
-// because the wake path must already treat BUSY as an ordinary outcome rather than an error --
-// building it afterwards would mean shipping a deliverer whose most important branch had never run.
-const BUSY_CODES = new Set([4009, 4030]);
+// MATCHED EXACTLY, NEVER GUESSED.
+//
+// An earlier version of this also accepted 4030 and anything whose message contained the word
+// "busy". Both were wrong. In Hermes 0.19.0, 4030 is "llm.oneshot requires a template" and "path
+// outside spawn-trees root" -- nothing to do with ownership -- and inferring protocol semantics from
+// human-readable prose is how a refusal silently changes meaning in a version bump. A code this
+// system does not recognise is an error, which is the outcome that stops and asks rather than the
+// one that retries.
+//
+// 4009 is Hermes's existing "session busy": no turn started, nothing durable written, ask again
+// later. That is genuinely this shape and is matched.
+//
+// SESSION_NOT_OWNED is the contract the upstream per-session lease must emit (research section 8).
+// Nothing produces it today, which is exactly why it is written down now: the branch that handles a
+// refusal must not be authored for the first time on the day refusals start happening.
+const BUSY_CODES = new Set([4009]);
+export const OWNERSHIP_REFUSAL_REASON = "SESSION_NOT_OWNED";
 
 export function isBusyRefusal(error) {
   if (!error) return false;
   if (BUSY_CODES.has(error.code)) return true;
-  const reason = error.data?.reason;
-  if (typeof reason === "string" && /BUSY|IN_USE|ANOTHER_OWNER/i.test(reason)) return true;
-  return typeof error.message === "string" && /\bbusy\b|still running|another (owner|process)/i.test(error.message);
+  return error.data?.reason === OWNERSHIP_REFUSAL_REASON;
 }
 
 export class GatewayError extends Error {
@@ -172,6 +183,11 @@ export class HermesGateway {
     entry.resolve(message.result ?? {});
   }
 
+  // A null timeout waits indefinitely -- for the event, or for the child to die.
+  //
+  // Not an oversight. The exit handler rejects every waiter, so "wait forever" is still bounded by
+  // the process actually being there; what it is not bounded by is a clock, which for a hosted turn
+  // is the difference between waiting and killing.
   waitForEvent(type, { timeoutMs = this.requestTimeoutMs, match = null } = {}) {
     return new Promise((resolve, reject) => {
       const waiter = {
@@ -179,12 +195,12 @@ export class HermesGateway {
         resolve: (params) => { clearTimeout(timer); resolve(params); },
         reject: (error) => { clearTimeout(timer); reject(error); },
       };
-      const timer = setTimeout(() => {
+      const timer = timeoutMs === null ? null : setTimeout(() => {
         const at = this.waiters.indexOf(waiter);
         if (at >= 0) this.waiters.splice(at, 1);
         reject(new GatewayError(`Timed out after ${timeoutMs}ms waiting for ${type}`));
       }, timeoutMs);
-      if (typeof timer.unref === "function") timer.unref();
+      if (timer && typeof timer.unref === "function") timer.unref();
       this.waiters.push(waiter);
     });
   }
@@ -236,11 +252,35 @@ export class HermesGateway {
     return this.request("prompt.submit", { session_id: runtimeSessionId, text });
   }
 
-  // Bounded wait for the turn to finish, so reconciliation reads a settled transcript rather than
-  // one mid-write. A timeout here is not a failure: it means history has not settled yet, which is a
-  // fact the caller is equipped to record and revisit.
-  async waitForTurn({ timeoutMs = this.requestTimeoutMs } = {}) {
+  // Waits for the hosted turn to finish. By default it waits as long as the turn takes.
+  //
+  // Closing this gateway kills the turn running inside it -- that is how the research produced the
+  // PARTIAL boundary in the first place. So a deadline here is a CANCELLATION POLICY, not a timeout,
+  // and callers pass null unless they specifically mean "interrupt a wake that is still being
+  // answered". The wait ends when the turn completes or when the child dies.
+  async waitForTurn({ timeoutMs = null } = {}) {
     return this.waitForEvent("message.complete", { timeoutMs });
+  }
+
+  // What the receiver says it guarantees.
+  //
+  // An unknown method is a definitive answer rather than a failure: a Hermes with no capability
+  // surface is a Hermes that does not enforce per-session exclusivity, and it must read as an empty
+  // set -- the caller then withholds, which is the safe direction.
+  async capabilities() {
+    try {
+      const result = await this.request("gateway.capabilities", {}, { timeoutMs: 30_000 });
+      return result && typeof result === "object" ? result : {};
+    } catch (error) {
+      if (error.code === -32601) return {};
+      throw error;
+    }
+  }
+
+  // The child's own (pid, start time), so a later process can tell "still speaking" from "gone".
+  async identity() {
+    if (!this.child?.pid) return null;
+    return { pid: this.child.pid, startedAt: await processStartedAt(this.child.pid) };
   }
 
   async close() {

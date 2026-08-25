@@ -24,7 +24,9 @@ import { managedPaths } from "./paths.js";
 // 33: session_watches and wake_outbox. A finished or blocked session becomes something someone is
 //     waiting to be told, and every delivery attempt carries the evidence that decides whether it
 //     may be retried.
-export const SCHEMA_VERSION = "33";
+// 34: a wake in flight names the process driving it, so it can only be taken away from an owner
+//     proven dead rather than from one that has merely been slow.
+export const SCHEMA_VERSION = "34";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -948,6 +950,20 @@ CREATE TABLE IF NOT EXISTS wake_outbox (
   reconciled_at TEXT,
   runtime_session_id TEXT,
   submitted_at TEXT,
+  -- WHO IS DRIVING THIS DELIVERY, in terms another process can check.
+  --
+  -- A claimed row may only be taken away from a process that is provably gone. Time cannot answer
+  -- that: a delivery running for an hour and a delivery abandoned an hour ago are indistinguishable
+  -- from a clock, and reclaiming the first is how one wake gets said twice.
+  --
+  -- The pair (pid, start time) rather than a pid, because pids are reused -- the same defect already
+  -- recorded against the supervisor is not worth reproducing here. Both the owning runtime and the
+  -- gateway child it spawned are recorded: the owner can die leaving the child mid-turn, and that
+  -- child is still writing to a real conversation.
+  owner_pid INTEGER,
+  owner_started_at TEXT,
+  gateway_pid INTEGER,
+  gateway_started_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   -- Neither outcome may be claimed without having read the history that proves it.
@@ -1262,6 +1278,18 @@ function migrate(db) {
   for (const column of ["action_digest", "base_sha", "candidate_commit", "integration_branch", "validation_plan_digest"]) {
     if (!operationColumns.includes(column)) {
       db.exec(`ALTER TABLE integration_operations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+    }
+  }
+  // A wake_outbox from schema 33 records no owner. Left NULL rather than invented, which is the
+  // truth about those rows -- and the conservative outcome, because an unknown owner can never be
+  // proven dead and so its row is never reclaimed automatically.
+  const wakeColumns = db.prepare("PRAGMA table_info(wake_outbox)").all().map((column) => column.name);
+  if (wakeColumns.length) {
+    for (const [column, type] of [
+      ["owner_pid", "INTEGER"], ["owner_started_at", "TEXT"],
+      ["gateway_pid", "INTEGER"], ["gateway_started_at", "TEXT"],
+    ]) {
+      if (!wakeColumns.includes(column)) db.exec(`ALTER TABLE wake_outbox ADD COLUMN ${column} ${type}`);
     }
   }
   // Only now that every column exists.

@@ -23,14 +23,24 @@
 // evidence does not support, which is the one thing this system is not allowed to do. So PARTIAL
 // stops the watch and says so, and a person decides.
 //
-// THE SUBMIT IS GATED, DELIBERATELY.
+// THE SUBMIT IS GATED, DELIBERATELY, AND BY TWO SEPARATE THINGS.
 //
 // Hermes has no cross-process per-session exclusivity today (research section 7): two gateways can
 // resume the same durable session from independent snapshots and both append turns. Until the
 // narrow upstream fix lands -- a per-session lease enforced AT `prompt.submit`, independent of
-// `max_concurrent_sessions` -- the last step is withheld rather than attempted. Everything before
-// it runs, is exercised, and is durable; `allowSubmit` is the single line that changes when the
-// receiver can refuse safely.
+// `max_concurrent_sessions` -- the last step is withheld rather than attempted.
+//
+// An operator setting `allowSubmit` is NOT sufficient. The receiver must also positively report
+// that it enforces per-session exclusivity, and a receiver that says nothing is treated as one that
+// does not. Otherwise the flag is a foot-gun that survives a Hermes downgrade, an unexpected PATH,
+// or a copied config, and does its damage in a real conversation.
+//
+// TIME IS NOT EVIDENCE OF DEATH.
+//
+// A claimed wake may only be taken from its owner when that owner is PROVEN dead -- pid and process
+// start time, the same identity principle Hermes already uses for its own leases. An age-based rule
+// looks reasonable and creates the exact race this subsystem exists to prevent: a slow-but-healthy
+// delivery gets its wake reclaimed, and then two processes submit the same marker.
 //
 // AND NOT ON A PREFLIGHT.
 //
@@ -41,23 +51,51 @@
 // PENDING, not an error.
 import { recordEvent, transaction } from "../db.js";
 import { HermesGateway } from "./hermes-gateway.js";
+import { ALIVE, DEAD, probeProcess, selfIdentity } from "./liveness.js";
 
 const now = () => new Date().toISOString();
 
-// How long a submitted wake is left alone before its silence is treated as evidence.
+// How long a claimed wake is left alone before anyone even ASKS whether its owner is alive.
 //
-// A turn still running is not evidence of a lost one. Reconciling a SUBMITTED row the moment it
-// appears would read a transcript mid-write, find the marker with nothing after it yet, and declare
-// PARTIAL on a delivery that was going perfectly.
-const DEFAULT_PARTIAL_GRACE_MS = 10 * 60_000;
+// A debounce, not an authority. It exists so a pass does not spawn a liveness probe against a row
+// another process wrote a second ago; it never permits reclaiming anything. Waiting longer changes
+// only when the question is asked, never what the answer is allowed to be.
+const DEFAULT_INVESTIGATE_AFTER_MS = 60_000;
 
-// How long one delivery waits for the woken turn to finish before leaving it to reconciliation.
-const DEFAULT_TURN_TIMEOUT_MS = 5 * 60_000;
+// The capability Hermes must positively report before a single wake may be submitted.
+//
+// Named here rather than passed in, because the whole point is that delegate-wave cannot be
+// configured into believing a receiver is safe. Today no Hermes reports it, so submission stays off
+// even with the environment flag set -- which is the correct behaviour, not a gap.
+export const REQUIRED_CAPABILITY = "per_session_exclusive_submit";
 
 // What the durable transcript says about one marker.
 //
 // Text-matched rather than id-matched because Hermes stores a conversation, not an event log: the
 // marker IS the identity, and it is opaque precisely so that this comparison can be exact.
+//
+// THE NEXT USER TURN CLOSES THE ATTRIBUTION WINDOW.
+//
+// Scanning forward for any later assistant row was wrong, and wrong in the direction that loses a
+// wake silently. A transcript like
+//
+//   user:      [wake marker]        <- the wake process died here
+//   user:      something the person typed an hour later
+//   assistant: an answer to THAT
+//
+// has an assistant row after the marker, and none of it has anything to do with the wake. Reading
+// that as DELIVERED means nobody is ever told, and nothing ever retries, and the evidence says it
+// went fine. So attribution stops at the next user turn: only an assistant row reached before
+// another user speaks can be claimed as an answer to this marker.
+//
+// AMBIGUOUS IS ITS OWN ANSWER.
+//
+// A user turn arriving before any assistant row does not prove the wake was ignored. Hermes queues a
+// prompt submitted mid-turn and may answer several user rows in one assistant turn -- that is
+// visible in the real research transcript, where two markers were answered by a single reply. So
+// "another user spoke first" is neither delivered nor undelivered; it is unknowable from here, and
+// it is handled exactly like PARTIAL because the rule is the same: no automatic retry on evidence
+// that does not authorise one.
 export function classifyHistory(messages, marker) {
   const rows = Array.isArray(messages) ? messages : [];
   let at = -1;
@@ -68,15 +106,24 @@ export function classifyHistory(messages, marker) {
   if (at < 0) return "ABSENT";
   for (let index = at + 1; index < rows.length; index += 1) {
     const row = rows[index];
+    // Tool and system rows sit between a prompt and its answer in the ordinary case. They are part
+    // of the turn, not a boundary on it.
+    if (row?.role === "user") return "AMBIGUOUS";
     if (row?.role !== "assistant") continue;
     // An assistant turn that carries only reasoning still answered the wake: it was received and
-    // acted on. Emptiness, not visibility, is what distinguishes PARTIAL.
+    // acted on. Emptiness, not visibility, is what distinguishes an answer from a lost one.
     const spoke = (typeof row.text === "string" && row.text.trim())
       || row.reasoning || row.reasoning_content || row.reasoning_details || row.codex_reasoning_items;
     if (spoke) return "DELIVERED";
   }
   return "PARTIAL";
 }
+
+// The verdicts that mean "stop, and let a person look".
+//
+// Kept as a set rather than a comparison so that adding a fourth unknowable outcome cannot silently
+// acquire retry permission by being spelled differently.
+const HALTING = new Set(["PARTIAL", "AMBIGUOUS"]);
 
 export class WakeDeliverer {
   constructor({
@@ -87,8 +134,17 @@ export class WakeDeliverer {
     // The one line that changes when Hermes can refuse a second writer. Off by default, on purpose:
     // see the header.
     allowSubmit = false,
-    partialGraceMs = DEFAULT_PARTIAL_GRACE_MS,
-    turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+    investigateAfterMs = DEFAULT_INVESTIGATE_AFTER_MS,
+    // A HARD CANCELLATION POLICY, off by default, and not a timeout in any softer sense.
+    //
+    // Closing the gateway kills the turn it hosts -- the research measured exactly that, and it is
+    // how the PARTIAL boundary was produced in the first place. So a deadline here does not mean
+    // "stop waiting", it means "interrupt a wake that is still being answered". Wake turns are rare
+    // and short; keeping one child alive while it works is not the resident daemon this design
+    // avoids, and is much cheaper than a wake destroyed at five minutes for being thorough.
+    turnDeadlineMs = null,
+    probe = probeProcess,
+    identity = selfIdentity,
     onEvent = null,
     onError = null,
   } = {}) {
@@ -96,10 +152,17 @@ export class WakeDeliverer {
     this.db = db;
     this.gatewayFactory = gateway;
     this.allowSubmit = allowSubmit;
-    this.partialGraceMs = partialGraceMs;
-    this.turnTimeoutMs = turnTimeoutMs;
+    this.investigateAfterMs = investigateAfterMs;
+    this.turnDeadlineMs = turnDeadlineMs;
+    this.probe = probe;
+    this.identity = identity;
     this.onEvent = onEvent;
     this.onError = onError;
+    // When each row was last asked about. Purely a cost control: probing a process means spawning
+    // one, and a row whose owner is alive would otherwise be re-probed on every pass forever. In
+    // memory rather than durable because losing it costs one extra probe, and a durable "last
+    // checked" would be a timestamp that looks like it means something about ownership.
+    this.lastProbed = new Map();
   }
 
   get(wakeId) {
@@ -120,7 +183,10 @@ export class WakeDeliverer {
   // over (hermes_session_id) WHERE state IN ('PREPARING','SUBMITTED') is what actually enforces one
   // delivery per conversation, so two racing processes do not both take the same conversation --
   // one of them simply fails to claim and moves on.
-  claim() {
+  async claim() {
+    // Asked BEFORE the transaction: establishing our own identity means asking the operating system,
+    // and holding a write lock across a subprocess spawn would stall every other writer.
+    const self = await this.identity();
     try {
       return transaction(this.db, () => {
         const row = this.db.prepare(
@@ -132,8 +198,11 @@ export class WakeDeliverer {
         ).get();
         if (!row) return null;
         this.db.prepare(
-          "UPDATE wake_outbox SET state = 'PREPARING', attempts = attempts + 1, updated_at = ? WHERE id = ?",
-        ).run(now(), row.id);
+          `UPDATE wake_outbox SET state = 'PREPARING', attempts = attempts + 1,
+                                  owner_pid = ?, owner_started_at = ?,
+                                  gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        ).run(self.pid, self.startedAt, now(), row.id);
         return this.get(row.id);
       });
     } catch (error) {
@@ -151,19 +220,29 @@ export class WakeDeliverer {
   // nothing was delivered, and the same wake is still the right thing to say.
   release(wake, reason) {
     this.db.prepare(
-      `UPDATE wake_outbox SET state = 'PENDING', last_error = ?, submitted_at = NULL, updated_at = ?
+      `UPDATE wake_outbox SET state = 'PENDING', last_error = ?, submitted_at = NULL,
+                              owner_pid = NULL, owner_started_at = NULL,
+                              gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
        WHERE id = ?`,
     ).run(reason, now(), wake.id);
   }
 
+  // Writes the verdict down. AMBIGUOUS is recorded as the PARTIAL STATE with its own explanation:
+  // the handling is identical -- stop, and let a person look -- while the reason a person needs in
+  // order to act is completely different. One means nothing answered; the other means somebody else
+  // spoke first and attribution is no longer possible from this side.
   #settle(wake, verdict, { runtimeSessionId = null } = {}) {
+    const state = verdict === "AMBIGUOUS" ? "PARTIAL" : verdict;
+    const detail = verdict === "AMBIGUOUS"
+      ? "ambiguous: another user turn arrived before any answer, so no reply can be attributed to this wake"
+      : null;
     transaction(this.db, () => {
       this.db.prepare(
-        `UPDATE wake_outbox SET state = ?, reconciled_at = ?,
+        `UPDATE wake_outbox SET state = ?, reconciled_at = ?, last_error = COALESCE(?, last_error),
                                 runtime_session_id = COALESCE(?, runtime_session_id), updated_at = ?
          WHERE id = ?`,
-      ).run(verdict, now(), runtimeSessionId, now(), wake.id);
-      if (verdict === "PARTIAL") {
+      ).run(state, now(), detail, runtimeSessionId, now(), wake.id);
+      if (HALTING.has(verdict)) {
         // The conversation's state is now unknown to us, so this watch stops -- whatever it said
         // before. BLOCKED rather than CLOSED even for a watch already closed by a terminal session,
         // because the two mean different things to whoever looks next: CLOSED is "there is nothing
@@ -172,7 +251,11 @@ export class WakeDeliverer {
           .run(now(), wake.watch_id);
       }
     });
-    this.#event(verdict === "DELIVERED" ? "WAKE_DELIVERED" : "WAKE_PARTIAL", wake, { runtimeSessionId });
+    this.#event(verdict === "DELIVERED" ? "WAKE_DELIVERED" : "WAKE_PARTIAL", wake, {
+      // The event carries the true verdict even where the column collapses two of them, so triage
+      // reads what was actually observed rather than what the state machine needed to call it.
+      verdict, runtimeSessionId,
+    });
   }
 
   // Reads canonical history for one wake and records what it proves.
@@ -184,6 +267,24 @@ export class WakeDeliverer {
     const messages = await gateway.history(runtime.runtimeSessionId);
     const verdict = classifyHistory(messages, wake.marker);
     return { verdict, runtimeSessionId: runtime.runtimeSessionId, messages };
+  }
+
+  // Why submission may not proceed, or null when it may.
+  //
+  // Two independent refusals, reported separately so the operator sees which one is speaking.
+  async #withholdReason(gateway) {
+    if (!this.allowSubmit) return "submission is not enabled for this runtime";
+    const capabilities = await gateway.capabilities();
+    if (capabilities?.[REQUIRED_CAPABILITY] === true) return null;
+    return `Hermes does not report ${REQUIRED_CAPABILITY}; two processes could still write to one session`;
+  }
+
+  async #recordGateway(wake, gateway) {
+    const child = await gateway.identity();
+    if (!child?.pid) return;
+    this.db.prepare(
+      "UPDATE wake_outbox SET gateway_pid = ?, gateway_started_at = ?, updated_at = ? WHERE id = ?",
+    ).run(child.pid, child.startedAt ?? null, now(), wake.id);
   }
 
   // One wake, start to finish.
@@ -199,13 +300,26 @@ export class WakeDeliverer {
         return verdict;
       }
 
-      if (!this.allowSubmit) {
+      // BOTH gates, and the receiver's answer is the one that cannot be configured away.
+      //
+      // An operator who sets the flag against a Hermes that does not enforce per-session exclusivity
+      // has not authorised anything; they have made a mistake that would show up as a duplicated or
+      // interleaved turn in somebody's real conversation. A receiver that does not answer the
+      // question counts as one that answers no.
+      const withheld = await this.#withholdReason(gateway);
+      if (withheld) {
         // Withheld, not failed. Recorded loudly enough that a queue standing still is legible as a
         // decision rather than as a broken watcher.
-        this.release(wake, "submission withheld: Hermes has no per-session exclusivity yet");
-        this.#event("WAKE_SUBMISSION_WITHHELD", wake, { reason: wake.reason });
+        this.release(wake, `submission withheld: ${withheld}`);
+        this.#event("WAKE_SUBMISSION_WITHHELD", wake, { reason: wake.reason, withheld });
         return "WITHHELD";
       }
+
+      // The child's identity, recorded before anything is written through it. An owner can die and
+      // leave this process mid-turn; without its pid and start time here, the next runtime has no
+      // way to tell "still speaking" from "gone", and would have to choose between stalling forever
+      // and reclaiming a live conversation.
+      await this.#recordGateway(wake, gateway);
 
       // Recorded as SUBMITTED BEFORE the write reaches the pipe, so the row never understates what
       // this process may have done. Overstating is recoverable -- reconciliation reads history and
@@ -233,11 +347,19 @@ export class WakeDeliverer {
         throw error;
       }
 
-      // Bounded. A timeout is not a failure: it means history has not settled, and the row stays
-      // SUBMITTED for a later pass to judge on evidence rather than on impatience.
+      // Waits for the turn to END, not for a clock to run out.
+      //
+      // The close() in the finally below kills the gateway, and killing the gateway kills the turn
+      // it is hosting -- that is how the PARTIAL boundary was produced during the research. So a
+      // timer here would not be a timeout, it would be delegate-wave destroying its own wake for
+      // taking too long and then recording the wreckage as evidence. The wait ends when the turn
+      // completes or when the child dies; either way the row is judged on what the transcript says.
       try {
-        await gateway.waitForTurn({ timeoutMs: this.turnTimeoutMs });
+        await gateway.waitForTurn({ timeoutMs: this.turnDeadlineMs });
       } catch {
+        // The child died, or an explicit hard-cancellation deadline elapsed. Nothing may be
+        // concluded from that here: the row stays SUBMITTED, and reconciliation reads the transcript
+        // once the process is provably gone.
         return "SUBMITTED";
       }
       const after = classifyHistory(await gateway.history(runtimeSessionId), wake.marker);
@@ -254,18 +376,48 @@ export class WakeDeliverer {
     }
   }
 
-  // Wakes whose fate this process cannot know from its own memory.
+  // Rows whose owner is PROVEN gone.
   //
-  // Both PREPARING and SUBMITTED qualify: a process that died between claiming and writing left a
-  // PREPARING row that may or may not have reached the pipe, and "which state was I in" is exactly
-  // the thing that did not survive. Only the grace window keeps a live turn from being mistaken for
-  // a lost one.
-  stale({ atMs = Date.now() } = {}) {
-    const cutoff = new Date(atMs - this.partialGraceMs).toISOString();
-    return this.db.prepare(
+  // This is the method that decides whether work may be taken away from another process, and the
+  // only acceptable answer is a positive DEAD. Not "old". Not "unresponsive". Not "we could not
+  // establish anything". A slow delivery and an abandoned one are indistinguishable by age, and
+  // guessing wrong here means two processes submit the same marker into one conversation -- the
+  // precise failure this whole subsystem exists to make impossible.
+  //
+  // The gateway child is checked as well as the owning runtime, because they can die separately.
+  // An owner that crashed leaving its child mid-turn has left something still writing to a real
+  // conversation, and that row is not free.
+  async reclaimable({ atMs = Date.now() } = {}) {
+    const cutoff = new Date(atMs - this.investigateAfterMs).toISOString();
+    const candidates = this.db.prepare(
       `SELECT * FROM wake_outbox WHERE state IN ('PREPARING', 'SUBMITTED') AND updated_at < ?
        ORDER BY updated_at`,
     ).all(cutoff);
+    const dead = [];
+    for (const wake of candidates) {
+      const asked = this.lastProbed.get(wake.id);
+      if (asked !== undefined && atMs - asked < this.investigateAfterMs) continue;
+      this.lastProbed.set(wake.id, atMs);
+      // A row with no recorded owner predates schema 34. Never reclaimed automatically: nothing can
+      // be proven about a process that was never named, and the conservative outcome is the correct
+      // one even though it means a person has to look.
+      if (!wake.owner_pid) continue;
+      const owner = await this.probe(wake.owner_pid, wake.owner_started_at);
+      if (owner !== DEAD) continue;
+      if (wake.gateway_pid) {
+        const gateway = await this.probe(wake.gateway_pid, wake.gateway_started_at);
+        // Owner dead, child alive: something is still speaking into that conversation. Leaving it
+        // costs a stalled queue; taking it costs a duplicated wake.
+        if (gateway !== DEAD) continue;
+      }
+      dead.push(wake);
+      this.lastProbed.delete(wake.id);
+    }
+    // Rows that have left these states cannot be asked about again, so their entries are dropped
+    // rather than accumulating for the life of the process.
+    const live = new Set(candidates.map((wake) => wake.id));
+    for (const known of [...this.lastProbed.keys()]) if (!live.has(known)) this.lastProbed.delete(known);
+    return dead;
   }
 
   async reconcile(wake) {
@@ -274,7 +426,7 @@ export class WakeDeliverer {
       await gateway.start();
       const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
       if (verdict === "ABSENT") {
-        this.release(wake, "reconciled: no durable marker, retry permitted");
+        this.release(wake, "reconciled: owner is gone and no durable marker exists, retry permitted");
         return "PENDING";
       }
       this.#settle(wake, verdict, { runtimeSessionId });
@@ -286,18 +438,18 @@ export class WakeDeliverer {
 
   // One pass: settle what is unknown, then deliver one thing.
   //
-  // Reconciliation first, always. A stale row holds the single-flight slot for its conversation, so
-  // resolving it is what unblocks delivery rather than competing with it.
+  // Reconciliation first, always. An abandoned row holds the single-flight slot for its
+  // conversation, so resolving it is what unblocks delivery rather than competing with it.
   async pass({ atMs = Date.now() } = {}) {
     const outcomes = [];
-    for (const wake of this.stale({ atMs })) {
+    for (const wake of await this.reclaimable({ atMs })) {
       try {
         outcomes.push({ wakeId: wake.id, outcome: await this.reconcile(wake) });
       } catch (error) {
         if (this.onError) this.onError(error, wake.id);
       }
     }
-    const claimed = this.claim();
+    const claimed = await this.claim();
     if (!claimed) return outcomes;
     try {
       outcomes.push({ wakeId: claimed.id, outcome: await this.deliver(claimed) });
