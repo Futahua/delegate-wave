@@ -21,7 +21,10 @@ import { managedPaths } from "./paths.js";
 //     applied, and what the runtime independently observed.
 // 21: attempts hold a durable budget reservation, so admission is atomic under concurrency, and
 //     scheduler_epoch means the scheduler GENERATION rather than a per-attempt sequence.
-export const SCHEMA_VERSION = "32";
+// 33: session_watches and wake_outbox. A finished or blocked session becomes something someone is
+//     waiting to be told, and every delivery attempt carries the evidence that decides whether it
+//     may be retried.
+export const SCHEMA_VERSION = "33";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -875,6 +878,99 @@ CREATE TABLE IF NOT EXISTS staged_integrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_staged_integrations_job ON staged_integrations(job_id, created_at);
+
+-- WHO IS WAITING TO BE TOLD, AND ABOUT WHAT.
+--
+-- delegate-wave never sees the conversation a request came from. hermes_session_id is the only
+-- thread back to it: the durable Hermes session that asked for this work, which a wake continues
+-- rather than replaces. Without this row a finished session is a fact nobody is looking at, and the
+-- only way to learn it finished is to keep asking.
+--
+-- Durable rather than an in-memory subscription, because the whole point is to survive the wait. A
+-- session that finishes at 3am must still reach the conversation that asked for it after a restart,
+-- and a subscription registered in a process that has since died would be exactly the evidence that
+-- went missing.
+CREATE TABLE IF NOT EXISTS session_watches (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES autonomous_sessions(id),
+  hermes_session_id TEXT NOT NULL,
+  -- BLOCKED is not a synonym for CLOSED. It records that a delivery reached PARTIAL -- the marker is
+  -- durable in Hermes but no assistant turn answered it -- so what already happened in that
+  -- conversation is unknown, and this watch must not enqueue more automatic wakes into it.
+  state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'BLOCKED', 'CLOSED')),
+  -- What has already been enqueued, so a state that persists for an hour is announced once.
+  --
+  -- The state alone is not enough. A session may ask, be answered, work, and ask again: three
+  -- WAITING_FOR_HERMES observations of which two are different questions. Recording WHICH question
+  -- was announced is what distinguishes "still waiting on the same one" from "asking a new one".
+  notified_state TEXT,
+  notified_message_id TEXT REFERENCES autonomous_session_messages(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- One watch per conversation per session. Two Hermes sessions may each watch the same work; the
+  -- same one may not watch it twice.
+  UNIQUE (session_id, hermes_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_watches_session ON session_watches(session_id);
+
+-- ONE THING TO SAY, AND WHAT IS KNOWN ABOUT WHETHER IT WAS SAID.
+--
+-- The receiver has no idempotency: submitting the same event twice produces two independent agent
+-- turns, and prompt.submit returns {"status":"streaming"} before anything is durable. So the
+-- acknowledgement is not evidence of delivery -- canonical Hermes history is. marker is the
+-- identity that history is searched for, written once at enqueue and never regenerated: a
+-- regenerated marker would make an already-durable delivery invisible and the retry would duplicate
+-- it.
+--
+-- PARTIAL is a state, not an error code. Marker durable, no assistant turn: tools may already have
+-- run, a session_answer may already have come back, and the only honest thing to do is stop and
+-- say so. Automatic retry from that evidence would violate the rule the rest of this system runs
+-- on -- evidence authorises the mutation.
+CREATE TABLE IF NOT EXISTS wake_outbox (
+  id TEXT PRIMARY KEY,
+  watch_id TEXT NOT NULL REFERENCES session_watches(id),
+  session_id TEXT NOT NULL REFERENCES autonomous_sessions(id),
+  hermes_session_id TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('QUESTION', 'READY', 'COMPLETED', 'FAILED')),
+  -- The question this wake carries, when it carries one.
+  message_id TEXT REFERENCES autonomous_session_messages(id),
+  marker TEXT NOT NULL UNIQUE,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'PENDING', 'PREPARING', 'SUBMITTED', 'DELIVERED', 'PARTIAL', 'ABANDONED'
+  )),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- Why the last attempt did not deliver. Ordinary, not exceptional: a BUSY session and an
+  -- unreachable gateway are both expected conditions on this path.
+  last_error TEXT,
+  -- When canonical history was last consulted, and the runtime handle it was consulted through.
+  reconciled_at TEXT,
+  runtime_session_id TEXT,
+  submitted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- Neither outcome may be claimed without having read the history that proves it.
+  CHECK (state NOT IN ('DELIVERED', 'PARTIAL') OR reconciled_at IS NOT NULL),
+  -- A wake that reached the wire says when. Nothing else may.
+  CHECK (state IN ('SUBMITTED', 'DELIVERED', 'PARTIAL') OR submitted_at IS NULL),
+  CHECK (reason != 'QUESTION' OR message_id IS NOT NULL)
+);
+
+-- At most one wake in flight per Hermes conversation.
+--
+-- Two gateways resuming the same durable session is the hazard section 2 of the wake-path research
+-- measured, and delegate-wave is not permitted to be the thing that causes it. This index is the
+-- half of that problem this side owns: whatever else is running, THIS system will not have two
+-- deliveries open into one conversation at once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wake_outbox_single_flight
+  ON wake_outbox(hermes_session_id) WHERE state IN ('PREPARING', 'SUBMITTED');
+
+CREATE INDEX IF NOT EXISTS idx_wake_outbox_pending ON wake_outbox(state, created_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_wake_outbox_immutable_delete
+BEFORE DELETE ON wake_outbox
+BEGIN SELECT RAISE(ABORT, 'wake_outbox is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_staged_integrations_immutable_delete
 BEFORE DELETE ON staged_integrations
