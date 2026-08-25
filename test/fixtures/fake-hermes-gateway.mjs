@@ -12,8 +12,17 @@
 // time on the day it starts happening.
 import fs from "node:fs";
 
-const script = JSON.parse(process.env.FAKE_HERMES_SCRIPT || "{}");
+// Exits immediately unless a transcript was named.
+//
+// `node --test` globs every .?(c|m)js file under test/, including this one, and would otherwise run
+// it as a test file -- where the stdin reader below keeps the event loop alive forever and hangs the
+// whole suite rather than failing it. The sibling fixture carries the same guard for the same
+// reason; the trap is worth documenting twice, because it presents as an infinitely slow test run
+// rather than as an error.
 const statePath = process.env.FAKE_HERMES_STATE;
+if (!statePath) process.exit(0);
+
+const script = JSON.parse(process.env.FAKE_HERMES_SCRIPT || "{}");
 
 const load = () => {
   try { return JSON.parse(fs.readFileSync(statePath, "utf8")); } catch { return { messages: [], submits: 0 }; }
