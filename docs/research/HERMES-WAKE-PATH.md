@@ -325,6 +325,15 @@ Both were found in review, and both would only have caused damage once submissio
   reply that quoted the marker back -- a reasonable way to acknowledge one -- find nothing after it,
   and call a successful delivery PARTIAL.
 
+- **An open wake for the same event is adopted, not duplicated.** `unblock()` clears the watch's
+  notification marks on purpose, so a person who inspected an ambiguity can authorise another
+  attempt at it. But the watch is one row and the outbox is many: a session that asked a question
+  and then finished has the question PARTIAL and the completion still PENDING behind it, and
+  clearing the marks made that queued completion look unannounced. The next watcher pass wrote a
+  second copy, and the person would have been told twice about one thing. PENDING, PREPARING and
+  SUBMITTED count as open; DELIVERED and PARTIAL deliberately do not, so clearing a PARTIAL with no
+  queued successor still re-announces, which is the whole point of clearing it.
+
 An earlier test masked the second of these: its fake liveness answered DEAD for every pid including
 the deliverer's own, so "gateway dies mid-delivery" modelled owner-dead rather than the live-owner
 case that actually happens. A process asking whether it is itself alive can only get one answer, and

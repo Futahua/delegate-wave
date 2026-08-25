@@ -212,6 +212,18 @@ export class SessionWatcher {
     ).get(sessionId) ?? null;
   }
 
+  // Records that this exact event has been announced.
+  //
+  // A terminal session will not change again, so the watch has nothing left to notice. The outbox
+  // row is independent and durable: closing the watch does not abandon the delivery.
+  #markNotified(row, messageId) {
+    const watchState = ["COMPLETED", "FAILED"].includes(row.state) ? "CLOSED" : "ACTIVE";
+    this.db.prepare(
+      `UPDATE session_watches SET notified_state = ?, notified_message_id = ?, state = ?,
+                                  updated_at = ? WHERE id = ?`,
+    ).run(row.state, messageId, watchState, now(), row.watch_id);
+  }
+
   // One pass. Returns the wakes enqueued by it, which is empty on almost every pass and is meant to
   // be.
   pass() {
@@ -228,6 +240,32 @@ export class SessionWatcher {
       if (reason === "QUESTION" && !question) continue;
       const messageId = question?.id ?? null;
       if (row.notified_state === row.state && (row.notified_message_id ?? null) === messageId) continue;
+
+      // A WAKE FOR THIS EVENT MAY ALREADY BE QUEUED, EVEN THOUGH THE WATCH SAYS OTHERWISE.
+      //
+      // unblock() deliberately clears notified_state so a person who inspected an ambiguity can
+      // authorise another attempt at it. But the watch is one row and the outbox is many, and a
+      // session that asked a question and then finished has TWO wakes: the question, which went
+      // PARTIAL, and the completion, still sitting PENDING behind it. Clearing the notification marks
+      // makes the still-queued completion look unannounced, and the next pass writes a second copy of
+      // it -- so the person gets told twice about one thing.
+      //
+      // An open wake for the same logical event is therefore adopted rather than duplicated. Open
+      // means PENDING, PREPARING or SUBMITTED: still on its way. DELIVERED and PARTIAL are
+      // deliberately NOT open -- once a person has cleared a PARTIAL and no queued copy survives,
+      // re-announcing that event is exactly what they asked for.
+      const alreadyQueued = this.db.prepare(
+        `SELECT id FROM wake_outbox
+         WHERE watch_id = ? AND reason = ? AND message_id IS ?
+           AND state IN ('PENDING', 'PREPARING', 'SUBMITTED')
+         ORDER BY created_at LIMIT 1`,
+      ).get(row.watch_id, reason, messageId);
+      if (alreadyQueued) {
+        // Recorded as announced, because it is: the row exists and will be delivered. Without this
+        // the same duplicate would be reconsidered on every pass forever.
+        this.#markNotified(row, messageId);
+        continue;
+      }
 
       const wakeId = id("wake");
       const marker = wakeMarker(wakeId);
@@ -248,13 +286,7 @@ export class SessionWatcher {
           wakeId, row.watch_id, row.session_id, row.hermes_session_id, reason, messageId,
           marker, body, now(), now(),
         );
-        // A terminal session will not change again, so the watch has nothing left to notice. The
-        // outbox row is independent and durable: closing the watch does not abandon the delivery.
-        const watchState = ["COMPLETED", "FAILED"].includes(row.state) ? "CLOSED" : "ACTIVE";
-        this.db.prepare(
-          `UPDATE session_watches SET notified_state = ?, notified_message_id = ?, state = ?,
-                                      updated_at = ? WHERE id = ?`,
-        ).run(row.state, messageId, watchState, now(), row.watch_id);
+        this.#markNotified(row, messageId);
         recordEvent(this.db, {
           kind: "WAKE_ENQUEUED", entityType: "job", entityId: row.session_id,
           payload: { wakeId, reason, hermesSessionId: row.hermes_session_id },

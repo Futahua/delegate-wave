@@ -513,8 +513,48 @@ test("a blocked watch also stops the wakes already sitting in the queue", async 
   // Only a person who names the ambiguity releases it.
   const watch = w.db.prepare("SELECT * FROM session_watches").get();
   w.watcher.unblock(watch.id, first.id);
+
+  // AND THE WATCHER GETS A TURN BEFORE DELIVERY, AS IT WOULD IN THE RUNTIME.
+  //
+  // unblock() clears the notification marks on purpose, so a person who inspected an ambiguity can
+  // authorise another attempt at it. But the completion wake is still sitting PENDING, and a watcher
+  // that only consulted the watch would read "never announced" and write a second copy -- telling
+  // the person twice about one thing. An open wake for the same event is adopted, not duplicated.
+  assert.deepEqual(w.watcher.pass(), [], "a wake already on its way is not announced again");
+  assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 2);
+
   assert.deepEqual((await sender.pass()).map((o) => o.outcome), ["DELIVERED"]);
   assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "DELIVERED");
+  assert.equal(fake.transcript().submits, 1, "the completion is delivered exactly once");
+});
+
+test("clearing a PARTIAL with no queued successor does allow the event to be announced again", async (t) => {
+  // The other half of the same rule, and the reason unblock() clears the marks at all. When the
+  // ambiguous wake is the ONLY copy of that event, a person who has read the transcript and decided
+  // it never landed is entitled to have it said again. Adopting open wakes must not quietly take
+  // that away.
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_rearm");
+  w.setState(sessionId, "COMPLETED");
+  assert.equal(w.watcher.pass().length, 1);
+  const first = w.db.prepare("SELECT * FROM wake_outbox").get();
+
+  const fake = fakeGateway(w, { capabilities: EXCLUSIVE });
+  fake.append({ role: "user", text: first.marker });
+  w.db.prepare(`UPDATE wake_outbox SET state = 'SUBMITTED', submitted_at = ?, updated_at = ?,
+                                       owner_pid = 8200, owner_started_at = 'gone' WHERE id = ?`)
+    .run("2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z", first.id);
+  assert.deepEqual((await deliverer(w, fake, { allowSubmit: true, liveness: fakeLiveness(DEAD) }).pass())
+    .map((o) => o.outcome), ["PARTIAL"]);
+
+  const watch = w.db.prepare("SELECT * FROM session_watches").get();
+  w.watcher.unblock(watch.id, first.id);
+  // Nothing is queued for this event any more -- the only copy is the PARTIAL, which is not open.
+  const again = w.watcher.pass();
+  assert.equal(again.length, 1, "a person who cleared the ambiguity asked for another attempt");
+  assert.notEqual(again[0], first.id);
+  assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 2);
 });
 
 test("a completion wake is deliverable even though its watch closed on enqueue", async (t) => {
