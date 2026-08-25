@@ -236,3 +236,73 @@ accepted     SUBMITTED; canonical history then owns the truth
 Everything else in C5b -- `session_watches`, `wake_outbox`, marker reconciliation, PARTIAL
 handling, the gateway subprocess adapter -- can be built and tested before Hermes gains
 per-session exclusivity. Only the final delivery step depends on it.
+
+## 9. What C5b built against this contract — 2026-08-25
+
+Everything above except the mutation. Schema 33 adds two tables; three new modules sit beside the
+session driver.
+
+```text
+session_watches       who is waiting to be told, and about what        src/session/watcher.js
+wake_outbox           one thing to say, and what is known about it     src/session/wake.js
+HermesGateway         spawned per delivery, never resident             src/session/hermes-gateway.js
+```
+
+Where each measured finding landed:
+
+```text
+1  canonical continuation      resume() -> runtime handle; submit(handle) appends to durable S
+2  concurrent resume unsafe    partial unique index: one delivery open per hermes_session_id
+3  no receiver idempotency     opaque marker written once at enqueue, never regenerated
+4  status is not an idle gate  never consulted; no preflight ownership state is computed
+5  no cross-process discovery  not depended on
+6  crash boundaries            classifyHistory(): ABSENT / DELIVERED / PARTIAL, one branch each
+7  capacity != exclusivity     the reason allowSubmit defaults to false
+8  the upstream fix            isBusyRefusal(): BUSY is an ordinary outcome, PENDING again
+```
+
+The withheld step is one flag. `WakeDeliverer` is constructed only when
+`DELEGATE_WAVE_HERMES_AGENT_DIR` names a Hermes agent directory, and it withholds `prompt.submit`
+unless `DELEGATE_WAVE_WAKE_SUBMIT=1`. Reconciliation, resume, marker discovery and PARTIAL handling
+all run either way -- a withheld wake returns to PENDING with `WAKE_SUBMISSION_WITHHELD` recorded, so
+a queue standing still reads as a decision rather than as a broken watcher. Turn the flag on when
+section 8 lands upstream, not before.
+
+Two additions beyond the frozen text, both consequences of it rather than departures:
+
+- **PARTIAL blocks its watch.** A durable marker with no assistant turn means what happened in that
+  conversation is unknown. More automatic wakes into it would compound an ambiguity rather than
+  resolve it, so the watch moves to BLOCKED and only a person re-arms it (`SessionWatcher.unblock`).
+- **A grace window before PARTIAL.** A turn still running is not evidence of a lost one. A SUBMITTED
+  row is left alone for ten minutes before its silence is read as evidence; without this,
+  reconciling a healthy in-flight delivery would declare it PARTIAL and stop the watch.
+
+`SEMANTICALLY_ACCEPTED` also wakes, but only for the modes where it is terminal (MANUAL, PLAN) --
+the same rule `SessionDriver.pending()` already applies. Without it the one mode whose entire purpose
+is to stop with a finished result for a person would be the one that never told anyone it was ready.
+
+### Verified against the live runtime, read-only
+
+The adapter and the classifier were run against the real Hermes 0.19.0 gateway and the durable
+session the sections above were measured in (`20260824_233004_5d8271`, now 20 messages). Nothing was
+submitted.
+
+```text
+gateway.ready                 1956ms after spawn
+session.resume                runtime handle 44724b94, durable 20260824_233004_5d8271
+                              the handle is NOT the durable id, as section 1 requires
+session.history               20 rows, roles user/tool/assistant
+```
+
+`classifyHistory` over that real transcript, with no fixtures involved:
+
+```text
+WAKE-CONCURRENT-901  DELIVERED   marker + assistant reply
+DUP-A / DUP-B        DELIVERED   both duplicates land, which is section 3 restated
+CRASH-D-731          DELIVERED   two user rows answered by one assistant turn
+"900-word essay"     PARTIAL     a real abandoned turn: user row durable, no assistant reply
+absent marker        ABSENT      retry permitted
+```
+
+The PARTIAL is not synthetic. It is the essay probe that was killed mid-turn during the original
+measurements, still sitting in the transcript exactly as the crash-boundary table predicts.
