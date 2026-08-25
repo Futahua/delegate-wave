@@ -26,7 +26,7 @@ import { managedPaths } from "./paths.js";
 //     may be retried.
 // 34: a wake in flight names the process driving it, so it can only be taken away from an owner
 //     proven dead rather than from one that has merely been slow.
-export const SCHEMA_VERSION = "34";
+export const SCHEMA_VERSION = "35";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -96,6 +96,77 @@ const ATTEMPT_USAGE_RECEIPTS_COLUMNS = `
 //
 // A verifier that did not execute produces no evidence about the candidate at all, and must never
 // be readable as evidence against it.
+const WAKE_OUTBOX_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  watch_id TEXT NOT NULL REFERENCES session_watches(id),
+  session_id TEXT NOT NULL REFERENCES autonomous_sessions(id),
+  hermes_session_id TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('QUESTION', 'READY', 'COMPLETED', 'FAILED')),
+  -- The question this wake carries, when it carries one.
+  message_id TEXT REFERENCES autonomous_session_messages(id),
+  marker TEXT NOT NULL UNIQUE,
+  body TEXT NOT NULL,
+  -- TWO DELIVERY PROTOCOLS SHARE THIS COLUMN, AND ONLY ONE OF THEM RUNS.
+  --
+  --   SUBMITTED  legacy direct-submit. delegate-wave handed prompt.submit to a gateway it
+  --              spawned itself, so THAT gateway's pid and liveness are what recovery reasons
+  --              about. Retained for A/B forensics; unreachable from the current route.
+  --   ENQUEUED   external-turn v1, the current route. wake.id exists as a row in Hermes'
+  --              session_external_turns inbox, and the session's own live owner runs the turn.
+  --              No gateway of ours hosts it, so gateway liveness says nothing here.
+  --
+  -- The names are deliberately not shared. A single in-flight state would have made the two
+  -- recovery models look interchangeable, and applying the direct-submit one to an enqueued row
+  -- reads a healthy remote turn as an abandoned local one.
+  state TEXT NOT NULL CHECK (state IN (
+    'PENDING', 'PREPARING', 'SUBMITTED', 'ENQUEUED', 'DELIVERED', 'PARTIAL', 'ABANDONED'
+  )),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- Why the last attempt did not deliver. Ordinary, not exceptional: a BUSY session and an
+  -- unreachable gateway are both expected conditions on this path.
+  last_error TEXT,
+  -- When canonical history was last consulted, and the runtime handle it was consulted through.
+  reconciled_at TEXT,
+  runtime_session_id TEXT,
+  submitted_at TEXT,
+  -- When the event was handed to the Hermes inbox. The external-turn counterpart of
+  -- submitted_at, kept separate so a settled row still says which protocol carried it.
+  enqueued_at TEXT,
+  -- THE RECEIVER'S LAST WORD, FOR DIAGNOSTICS ONLY.
+  --
+  -- Named so it cannot be mistaken for delegate-wave's own lifecycle. Hermes' CLAIMED / STARTED /
+  -- FINISHED are observations of a remote process, true when they were read and possibly false
+  -- now; copying them into a state column would create a second authority that drifts from both
+  -- the inbox and canonical history. Every decision re-reads the receiver rather than trusting
+  -- these.
+  last_receiver_state TEXT,
+  last_receiver_observed_at TEXT,
+  -- WHO IS DRIVING THIS DELIVERY, in terms another process can check.
+  --
+  -- A claimed row may only be taken away from a process that is provably gone. Time cannot answer
+  -- that: a delivery running for an hour and a delivery abandoned an hour ago are indistinguishable
+  -- from a clock, and reclaiming the first is how one wake gets said twice.
+  --
+  -- The pair (pid, start time) rather than a pid, because pids are reused -- the same defect already
+  -- recorded against the supervisor is not worth reproducing here. Both the owning runtime and the
+  -- gateway child it spawned are recorded: the owner can die leaving the child mid-turn, and that
+  -- child is still writing to a real conversation.
+  owner_pid INTEGER,
+  owner_started_at TEXT,
+  gateway_pid INTEGER,
+  gateway_started_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  -- Neither outcome may be claimed without having read the history that proves it.
+  CHECK (state NOT IN ('DELIVERED', 'PARTIAL') OR reconciled_at IS NOT NULL),
+  -- A wake that reached the wire says when, by whichever protocol carried it. Nothing else may.
+  CHECK (state IN ('SUBMITTED', 'DELIVERED', 'PARTIAL') OR submitted_at IS NULL),
+  CHECK (state IN ('ENQUEUED', 'DELIVERED', 'PARTIAL') OR enqueued_at IS NULL),
+  -- And never both. A row carried by one protocol must not look like evidence from the other.
+  CHECK (submitted_at IS NULL OR enqueued_at IS NULL),
+  CHECK (reason != 'QUESTION' OR message_id IS NOT NULL)
+`;
+
 const VALIDATION_RUNS_COLUMNS = `
   id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL REFERENCES attempts(id),
@@ -929,49 +1000,7 @@ CREATE INDEX IF NOT EXISTS idx_session_watches_session ON session_watches(sessio
 -- run, a session_answer may already have come back, and the only honest thing to do is stop and
 -- say so. Automatic retry from that evidence would violate the rule the rest of this system runs
 -- on -- evidence authorises the mutation.
-CREATE TABLE IF NOT EXISTS wake_outbox (
-  id TEXT PRIMARY KEY,
-  watch_id TEXT NOT NULL REFERENCES session_watches(id),
-  session_id TEXT NOT NULL REFERENCES autonomous_sessions(id),
-  hermes_session_id TEXT NOT NULL,
-  reason TEXT NOT NULL CHECK (reason IN ('QUESTION', 'READY', 'COMPLETED', 'FAILED')),
-  -- The question this wake carries, when it carries one.
-  message_id TEXT REFERENCES autonomous_session_messages(id),
-  marker TEXT NOT NULL UNIQUE,
-  body TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN (
-    'PENDING', 'PREPARING', 'SUBMITTED', 'DELIVERED', 'PARTIAL', 'ABANDONED'
-  )),
-  attempts INTEGER NOT NULL DEFAULT 0,
-  -- Why the last attempt did not deliver. Ordinary, not exceptional: a BUSY session and an
-  -- unreachable gateway are both expected conditions on this path.
-  last_error TEXT,
-  -- When canonical history was last consulted, and the runtime handle it was consulted through.
-  reconciled_at TEXT,
-  runtime_session_id TEXT,
-  submitted_at TEXT,
-  -- WHO IS DRIVING THIS DELIVERY, in terms another process can check.
-  --
-  -- A claimed row may only be taken away from a process that is provably gone. Time cannot answer
-  -- that: a delivery running for an hour and a delivery abandoned an hour ago are indistinguishable
-  -- from a clock, and reclaiming the first is how one wake gets said twice.
-  --
-  -- The pair (pid, start time) rather than a pid, because pids are reused -- the same defect already
-  -- recorded against the supervisor is not worth reproducing here. Both the owning runtime and the
-  -- gateway child it spawned are recorded: the owner can die leaving the child mid-turn, and that
-  -- child is still writing to a real conversation.
-  owner_pid INTEGER,
-  owner_started_at TEXT,
-  gateway_pid INTEGER,
-  gateway_started_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  -- Neither outcome may be claimed without having read the history that proves it.
-  CHECK (state NOT IN ('DELIVERED', 'PARTIAL') OR reconciled_at IS NOT NULL),
-  -- A wake that reached the wire says when. Nothing else may.
-  CHECK (state IN ('SUBMITTED', 'DELIVERED', 'PARTIAL') OR submitted_at IS NULL),
-  CHECK (reason != 'QUESTION' OR message_id IS NOT NULL)
-);
+CREATE TABLE IF NOT EXISTS wake_outbox (${WAKE_OUTBOX_COLUMNS});
 
 -- At most one wake in flight per Hermes conversation.
 --
@@ -979,8 +1008,11 @@ CREATE TABLE IF NOT EXISTS wake_outbox (
 -- measured, and delegate-wave is not permitted to be the thing that causes it. This index is the
 -- half of that problem this side owns: whatever else is running, THIS system will not have two
 -- deliveries open into one conversation at once.
+-- One delivery in flight per conversation, whichever protocol is carrying it. ENQUEUED belongs
+-- here for the same reason SUBMITTED does: the event is with the receiver, and starting a second
+-- one for the same conversation is how a person gets told twice.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wake_outbox_single_flight
-  ON wake_outbox(hermes_session_id) WHERE state IN ('PREPARING', 'SUBMITTED');
+  ON wake_outbox(hermes_session_id) WHERE state IN ('PREPARING', 'SUBMITTED', 'ENQUEUED');
 
 CREATE INDEX IF NOT EXISTS idx_wake_outbox_pending ON wake_outbox(state, created_at);
 
@@ -1288,6 +1320,10 @@ function migrate(db) {
     for (const [column, type] of [
       ["owner_pid", "INTEGER"], ["owner_started_at", "TEXT"],
       ["gateway_pid", "INTEGER"], ["gateway_started_at", "TEXT"],
+      // 35: the external-turn protocol. Existing rows were carried by direct submit, so these stay
+      // NULL -- which is the truth about them, and keeps their recovery on the SUBMITTED model.
+      ["enqueued_at", "TEXT"],
+      ["last_receiver_state", "TEXT"], ["last_receiver_observed_at", "TEXT"],
     ]) {
       if (!wakeColumns.includes(column)) db.exec(`ALTER TABLE wake_outbox ADD COLUMN ${column} ${type}`);
     }
@@ -1377,6 +1413,29 @@ function rebuildConstrainedTables(db) {
         `CREATE TRIGGER IF NOT EXISTS trg_usage_receipts_immutable_delete
          BEFORE DELETE ON attempt_usage_receipts
          BEGIN SELECT RAISE(ABORT, 'attempt_usage_receipts is immutable'); END`,
+      ],
+    });
+  }
+  // A wake_outbox migrated from 34 has the ENQUEUED column values but not the CHECKs that make
+  // the two protocols exclusive: it would accept a row claiming both submitted_at and enqueued_at,
+  // which is the one shape that makes recovery ambiguous about which protocol to apply.
+  if (definition("wake_outbox") && !definition("wake_outbox").includes("'ENQUEUED'")) {
+    pending.push({
+      name: "wake_outbox",
+      columns: WAKE_OUTBOX_COLUMNS,
+      // Named, never positional: ALTER TABLE ADD COLUMN leaves the physical order different from
+      // the canonical definition, and a positional copy would transpose a pid into a timestamp.
+      copy: `id, watch_id, session_id, hermes_session_id, reason, message_id, marker, body,
+             state, attempts, last_error, reconciled_at, runtime_session_id, submitted_at,
+             enqueued_at, last_receiver_state, last_receiver_observed_at,
+             owner_pid, owner_started_at, gateway_pid, gateway_started_at, created_at, updated_at`,
+      after: [
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_wake_outbox_single_flight
+           ON wake_outbox(hermes_session_id) WHERE state IN ('PREPARING', 'SUBMITTED', 'ENQUEUED')`,
+        "CREATE INDEX IF NOT EXISTS idx_wake_outbox_pending ON wake_outbox(state, created_at)",
+        `CREATE TRIGGER IF NOT EXISTS trg_wake_outbox_immutable_delete
+         BEFORE DELETE ON wake_outbox
+         BEGIN SELECT RAISE(ABORT, 'wake_outbox is immutable'); END`,
       ],
     });
   }
