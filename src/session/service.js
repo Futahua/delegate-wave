@@ -23,6 +23,7 @@ import crypto from "node:crypto";
 import { recordEvent, transaction } from "../db.js";
 import { ManagerStop } from "../manager/service.js";
 import { ConflictRequiresJudgment } from "../integration/safe.js";
+import { registerWatch } from "./watcher.js";
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -72,7 +73,14 @@ export class AutonomousSessionService {
   }
 
   // Accepts the task and returns. Nothing is waited for.
-  async start({ projectId, intent, mode = "AUTO", maximumCost = null, maxAttempts = 3 }) {
+  //
+  // `hermesSessionId` is the conversation this request came from, and the only thread back to it.
+  //
+  // Optional because delegate-wave must remain usable from a CLI, a test and a control client that
+  // have no conversation to return to. Registered in the SAME transaction as the session, not a
+  // moment later: a session that finishes quickly between the two writes would finish unwatched, and
+  // the sessions most worth waking for are not always the slow ones.
+  async start({ projectId, intent, mode = "AUTO", maximumCost = null, maxAttempts = 3, hermesSessionId = null }) {
     if (!SESSION_MODES.includes(mode)) throw new Error(`Unknown autonomy mode: ${mode}`);
     if (typeof intent !== "string" || !intent.trim()) throw new Error("intent must be a non-empty string");
     const project = this.dispatcher.getProject(projectId);
@@ -98,12 +106,13 @@ export class AutonomousSessionService {
       ) VALUES (?, ?, ?, ?, ?, 'WORKING', ?, ?, ?)`).run(
         sessionId, projectId, job.id, intent, mode, maximumCost, now(), now(),
       );
+      if (hermesSessionId) registerWatch(this.db, sessionId, hermesSessionId);
       recordEvent(this.db, {
         kind: "AUTONOMOUS_SESSION_STARTED", entityType: "job", entityId: job.id,
-        payload: { sessionId, mode, intent: intent.slice(0, 400) },
+        payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(hermesSessionId) },
       });
     });
-    return { session_id: sessionId, state: "WORKING", job_id: job.id, mode };
+    return { session_id: sessionId, state: "WORKING", job_id: job.id, mode, watched: Boolean(hermesSessionId) };
   }
 
   get(sessionId) {

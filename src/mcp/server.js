@@ -100,6 +100,12 @@ const TOOLS = Object.freeze([
             + "MANUAL stops with a finished candidate; PLAN never writes.",
         },
         maximum_cost: { type: "number" },
+        hermes_session_id: {
+          type: "string",
+          description: "Your own durable session id. Supply it and delegate-wave will come back to "
+            + "THIS conversation when the work finishes or gets stuck, instead of waiting to be "
+            + "polled. Omit it and the session still runs; nobody is told when it ends.",
+        },
       },
       required: ["project_id", "intent"],
     },
@@ -182,6 +188,7 @@ export class HermesMcpAdapter {
         intent: requiredString(args, "intent"),
         mode: args.mode || "AUTO",
         maximumCost: args.maximum_cost ?? null,
+        hermesSessionId: args.hermes_session_id ?? null,
       }, `req_${randomUUID()}`);
     }
     if (name === "session_poll") {

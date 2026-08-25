@@ -21,6 +21,7 @@ import { ManagerService } from "../src/manager/service.js";
 import { AutonomousSessionService, modePolicy, SESSION_MODES } from "../src/session/service.js";
 import { SafeIntegrator } from "../src/integration/safe.js";
 import { SessionDriver } from "../src/session/driver.js";
+import { SessionWatcher } from "../src/session/watcher.js";
 import { runProcess } from "../src/process.js";
 
 const BRIEF = (extra = {}) => ({
@@ -226,6 +227,60 @@ test("an unanswered question cannot be answered twice, and a working session can
   sessions.answer(started.session_id, "Route Z");
   // And once answered, the question is closed: a second answer has nothing to attach to.
   assert.throws(() => sessions.answer(started.session_id, "Route Z again"), /not waiting for an answer/);
+});
+
+test("a session started from a conversation is watched from birth, and its question reaches it", async (t) => {
+  // The wake layer's one dependency on this one: delegate-wave never sees the conversation a request
+  // came from, so the id has to arrive with the request or the result has nowhere to go. Registered
+  // inside the same transaction as the session, because a session that finished between the two
+  // writes would be a finished session nobody was watching.
+  const { boot, projectId } = await world(t);
+  const { sessions } = boot([
+    { action: "ESCALATE", reason: "needs judgment", question: "Which export format did they mean?" },
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  const watcher = new SessionWatcher({ sessions, intervalMs: 5 });
+  t.after(() => watcher.stop());
+
+  const started = await sessions.start({
+    projectId, intent: "Add a --json flag", mode: "AUTO", hermesSessionId: "20260824_233004_5d8271",
+  });
+  assert.equal(started.watched, true);
+  const watch = sessions.db.prepare("SELECT * FROM session_watches WHERE session_id = ?").get(started.session_id);
+  assert.equal(watch.hermes_session_id, "20260824_233004_5d8271");
+  // Nothing to say yet: the session is working, which is the ordinary case and costs nothing.
+  assert.deepEqual(watcher.pass(), []);
+
+  await sessions.tick(started.session_id);
+  assert.equal(sessions.get(started.session_id).state, "WAITING_FOR_HERMES");
+  const enqueued = watcher.pass();
+  assert.equal(enqueued.length, 1);
+  const wake = sessions.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(enqueued[0]);
+  assert.equal(wake.reason, "QUESTION");
+  assert.equal(wake.hermes_session_id, "20260824_233004_5d8271");
+  // The words that arrive carry the question and the way back to it, not a session dump.
+  assert.ok(wake.body.includes("Which export format did they mean?"));
+  assert.ok(wake.body.includes(started.session_id));
+
+  // Answered, the session goes back to work and nothing further is announced about the same thing.
+  sessions.answer(started.session_id, "JSON lines");
+  assert.deepEqual(watcher.pass(), []);
+});
+
+test("a session started without a conversation still runs, and nobody is waiting on it", async (t) => {
+  // The honest degraded case, stated as a test so it cannot quietly become an exception thrown at a
+  // CLI user who has no Hermes session to give.
+  const { boot, projectId } = await world(t);
+  const { sessions } = boot([{ action: "ESCALATE", reason: "judgment", question: "Which route?" }]);
+  const started = await sessions.start({ projectId, intent: "Fix it", mode: "AUTO" });
+  assert.equal(started.watched, false);
+  await sessions.tick(started.session_id);
+  assert.equal(sessions.get(started.session_id).state, "WAITING_FOR_HERMES");
+  const watcher = new SessionWatcher({ sessions, intervalMs: 5 });
+  t.after(() => watcher.stop());
+  assert.deepEqual(watcher.pass(), []);
+  assert.equal(sessions.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 0);
 });
 
 test("the session survives the process dying mid-run", async (t) => {

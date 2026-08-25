@@ -14,10 +14,17 @@ import { ManagerService } from "../manager/service.js";
 import { CodexManagerBackend } from "../manager/backend.js";
 import { AutonomousSessionService } from "../session/service.js";
 import { SessionDriver } from "../session/driver.js";
+import { SessionWatcher } from "../session/watcher.js";
+import { WakeDeliverer } from "../session/wake.js";
+import { HermesGateway } from "../session/hermes-gateway.js";
 import { SafeIntegrator } from "../integration/safe.js";
 import { providerForModel } from "../manager/provider.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+// Wakes are rare and never urgent to the second. Polling this slowly is not a compromise: the cost
+// of a pass is a process spawn, and the cost of missing one for ten seconds is ten seconds.
+const WAKE_DELIVERY_INTERVAL_MS = 10_000;
 
 function tokenMatches(header, token) {
   if (!token || typeof header !== "string" || !header.startsWith("Bearer ")) return false;
@@ -204,6 +211,75 @@ export async function startControlServer({
     },
   }).start();
 
+  // Noticing costs nothing, so it always runs.
+  //
+  // The watcher only reads columns and, when something genuinely changed, writes one row. It is
+  // started unconditionally because the expensive and risky part of waking somebody is DELIVERY, and
+  // that is a separate object with its own gate. Enqueuing is free, durable, and the thing that must
+  // not be missed: a wake that was never enqueued cannot be delivered later, while a wake that sits
+  // in the outbox until the receiver is safe to write to loses nothing but time.
+  const watcher = new SessionWatcher({
+    sessions,
+    onError: (error) => {
+      recordEvent(dispatcher.db, {
+        kind: "SESSION_WATCHER_ERROR", entityType: "job", entityId: "runtime",
+        payload: { message: error.message },
+      });
+    },
+    onEvent: (kind, payload) => {
+      recordEvent(dispatcher.db, { kind, entityType: "job", entityId: "runtime", payload });
+    },
+  }).start();
+
+  // Delivery is constructed only when a Hermes agent directory is configured, and it does not submit
+  // even then.
+  //
+  // Two separate gates, because they refuse two different things. Without a configured gateway there
+  // is nothing to spawn at all. With one, everything up to the mutation runs -- resume, canonical
+  // history, marker reconciliation, PARTIAL handling -- and the final `prompt.submit` is withheld
+  // until Hermes can refuse a second writer per session (research section 8). Turning it on is one
+  // environment variable, and it should be turned on when that fix lands, not before.
+  const deliverer = HermesGateway.configured()
+    ? new WakeDeliverer({
+      db: dispatcher.db,
+      gateway: () => new HermesGateway(),
+      allowSubmit: process.env.DELEGATE_WAVE_WAKE_SUBMIT === "1",
+      onEvent: (kind, payload) => {
+        recordEvent(dispatcher.db, { kind, entityType: "job", entityId: "runtime", payload });
+      },
+      onError: (error, wakeId) => {
+        recordEvent(dispatcher.db, {
+          kind: "WAKE_DELIVERY_ERROR", entityType: "job", entityId: wakeId ?? "runtime",
+          payload: { message: error.message },
+        });
+      },
+    })
+    : null;
+
+  // Serialised on purpose: one pass at a time, never overlapping.
+  //
+  // A delivery spawns a Hermes gateway and talks to a durable conversation. Two overlapping passes
+  // would be this system doing to itself exactly what section 2 of the research measured being done
+  // to it -- two independent processes on the same session -- so the interval schedules the NEXT
+  // pass only once the previous one has finished, rather than every N milliseconds regardless.
+  let deliveryTimer = null;
+  if (deliverer) {
+    let running = false;
+    deliveryTimer = setInterval(() => {
+      if (running) return;
+      running = true;
+      deliverer.pass()
+        .catch((error) => {
+          recordEvent(dispatcher.db, {
+            kind: "WAKE_DELIVERY_ERROR", entityType: "job", entityId: "runtime",
+            payload: { message: error.message },
+          });
+        })
+        .finally(() => { running = false; });
+    }, WAKE_DELIVERY_INTERVAL_MS);
+    if (typeof deliveryTimer.unref === "function") deliveryTimer.unref();
+  }
+
   const service = new ControlService({ dispatcher, sessions });
   const server = createControlServer({
     service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
@@ -234,8 +310,12 @@ export async function startControlServer({
     url: `http://${host}:${address.port}`,
     sessions,
     driver,
+    watcher,
+    deliverer,
     async close() {
       driver.stop();
+      watcher.stop();
+      if (deliveryTimer) clearInterval(deliveryTimer);
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       server.closeAllConnections();
       await closed;
