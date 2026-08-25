@@ -100,8 +100,13 @@ export function classifyHistory(messages, marker) {
   const rows = Array.isArray(messages) ? messages : [];
   let at = -1;
   for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const text = rows[index]?.text;
-    if (typeof text === "string" && text.includes(marker)) { at = index; break; }
+    const row = rows[index];
+    // Anchored on a USER row specifically. A wake is submitted as a user turn, so that is the only
+    // row that can BE the delivery; an assistant that quotes the marker back -- an entirely
+    // reasonable thing to do when acknowledging one -- would otherwise be selected as the anchor,
+    // leaving nothing after it and turning a successful wake into a PARTIAL.
+    if (row?.role !== "user") continue;
+    if (typeof row.text === "string" && row.text.includes(marker)) { at = index; break; }
   }
   if (at < 0) return "ABSENT";
   for (let index = at + 1; index < rows.length; index += 1) {
@@ -163,6 +168,16 @@ export class WakeDeliverer {
     // memory rather than durable because losing it costs one extra probe, and a durable "last
     // checked" would be a timestamp that looks like it means something about ownership.
     this.lastProbed = new Map();
+    // The rows this process is driving RIGHT NOW.
+    //
+    // In memory on purpose, and sound precisely because it is: it answers a question only this
+    // process can answer about itself, and after a crash it is not needed at all -- the owner pid is
+    // then dead and the cross-process rule takes over. It exists because a row owned by a LIVE
+    // process that is no longer driving it would otherwise be unreachable by both rules: the
+    // cross-process rule refuses to touch a live owner's work, and the owner had already moved on.
+    this.driving = new Set();
+    // Established once. It is the same answer every time within a process, and it costs a spawn.
+    this.self = null;
   }
 
   get(wakeId) {
@@ -183,16 +198,39 @@ export class WakeDeliverer {
   // over (hermes_session_id) WHERE state IN ('PREPARING','SUBMITTED') is what actually enforces one
   // delivery per conversation, so two racing processes do not both take the same conversation --
   // one of them simply fails to claim and moves on.
+  async #whoAmI() {
+    if (!this.self) this.self = await this.identity();
+    return this.self;
+  }
+
+  #isMine(wake) {
+    return Boolean(this.self)
+      && wake.owner_pid === this.self.pid
+      && (wake.owner_started_at ?? null) === (this.self.startedAt ?? null);
+  }
+
   async claim() {
     // Asked BEFORE the transaction: establishing our own identity means asking the operating system,
     // and holding a write lock across a subprocess spawn would stall every other writer.
-    const self = await this.identity();
+    const self = await this.#whoAmI();
     try {
       return transaction(this.db, () => {
         const row = this.db.prepare(
           `SELECT * FROM wake_outbox WHERE state = 'PENDING'
              AND hermes_session_id NOT IN (
                SELECT hermes_session_id FROM wake_outbox WHERE state IN ('PREPARING', 'SUBMITTED')
+             )
+             -- A BLOCKED watch blocks what is ALREADY QUEUED, not merely what would be enqueued next.
+             --
+             -- The watcher stops CREATING wakes for a blocked watch, but a wake enqueued before the
+             -- ambiguity is still sitting in the outbox, and delivering it walks straight into the
+             -- conversation nobody can account for. A session that asked a question and then finished
+             -- produces exactly that pair: the question goes PARTIAL and the completion is right
+             -- behind it. CLOSED stays deliverable on purpose -- a terminal watch closes the instant
+             -- it enqueues, so excluding it would strand every completion wake ever written.
+             AND EXISTS (
+               SELECT 1 FROM session_watches w
+               WHERE w.id = wake_outbox.watch_id AND w.state != 'BLOCKED'
              )
            ORDER BY created_at LIMIT 1`,
         ).get();
@@ -290,6 +328,7 @@ export class WakeDeliverer {
   // One wake, start to finish.
   async deliver(wake) {
     const gateway = this.gatewayFactory();
+    this.driving.add(wake.id);
     try {
       await gateway.start();
       const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
@@ -372,17 +411,23 @@ export class WakeDeliverer {
       this.#settle(wake, after, { runtimeSessionId });
       return after;
     } finally {
+      // Dropped BEFORE the close, so a row this process has stopped driving is immediately visible
+      // to its own next pass as work nothing is driving.
+      this.driving.delete(wake.id);
       await gateway.close();
     }
   }
 
-  // Rows whose owner is PROVEN gone.
+  // Rows nothing is driving any more, by either of the two ways that can be known.
   //
-  // This is the method that decides whether work may be taken away from another process, and the
-  // only acceptable answer is a positive DEAD. Not "old". Not "unresponsive". Not "we could not
-  // establish anything". A slow delivery and an abandoned one are indistinguishable by age, and
-  // guessing wrong here means two processes submit the same marker into one conversation -- the
-  // precise failure this whole subsystem exists to make impossible.
+  // For ANOTHER process's row the only acceptable answer is a positive DEAD. Not "old". Not
+  // "unresponsive". Not "we could not establish anything". A slow delivery and an abandoned one are
+  // indistinguishable by age, and guessing wrong means two processes submit the same marker into one
+  // conversation -- the precise failure this subsystem exists to make impossible.
+  //
+  // For OUR OWN row the question is not about liveness at all, and asking the operating system about
+  // ourselves would answer the wrong question: this process is obviously alive, and that says
+  // nothing about whether it is still driving that delivery.
   //
   // The gateway child is checked as well as the owning runtime, because they can die separately.
   // An owner that crashed leaving its child mid-turn has left something still writing to a real
@@ -393,8 +438,23 @@ export class WakeDeliverer {
       `SELECT * FROM wake_outbox WHERE state IN ('PREPARING', 'SUBMITTED') AND updated_at < ?
        ORDER BY updated_at`,
     ).all(cutoff);
+    await this.#whoAmI();
     const dead = [];
     for (const wake of candidates) {
+      // OUR OWN ABANDONED WORK NEEDS NO PROBE.
+      //
+      // A gateway can die while this runtime keeps running -- the ordinary failure, not an exotic
+      // one. deliver() then leaves the row SUBMITTED and returns, and from that moment nothing is
+      // driving it: the cross-process rule below refuses to touch a live owner's work, and the owner
+      // has already moved on. The row would sit SUBMITTED until this process happened to die.
+      //
+      // So a row this process owns and is not currently driving is reconcilable immediately. That is
+      // knowledge, not inference: no other process could tell us this, and no probe is needed to
+      // establish it.
+      if (this.#isMine(wake)) {
+        if (!this.driving.has(wake.id)) dead.push(wake);
+        continue;
+      }
       const asked = this.lastProbed.get(wake.id);
       if (asked !== undefined && atMs - asked < this.investigateAfterMs) continue;
       this.lastProbed.set(wake.id, atMs);
@@ -452,14 +512,32 @@ export class WakeDeliverer {
     const claimed = await this.claim();
     if (!claimed) return outcomes;
     try {
-      outcomes.push({ wakeId: claimed.id, outcome: await this.deliver(claimed) });
+      const outcome = await this.deliver(claimed);
+      outcomes.push({ wakeId: claimed.id, outcome });
+      // The child died mid-turn, or a deadline cut it off. The gateway that was hosting it is closed
+      // by now, so a FRESH one reads canonical history and settles the row here rather than leaving
+      // it SUBMITTED for a recovery path that -- correctly -- will not touch a live owner's work.
+      if (outcome === "SUBMITTED") {
+        outcomes.push({ wakeId: claimed.id, outcome: await this.reconcile(this.get(claimed.id)) });
+      }
     } catch (error) {
       if (this.onError) this.onError(error, claimed.id);
       // Only a row this process left PREPARING is safe to hand back on an exception. A SUBMITTED row
       // may have reached the wire, and returning it to the queue would authorise a retry that no
-      // evidence supports.
+      // evidence supports -- so it is RECONCILED instead, on this process's own knowledge that it is
+      // no longer driving it.
       const current = this.get(claimed.id);
-      if (current?.state === "PREPARING") this.release(claimed, String(error.message).slice(0, 500));
+      if (current?.state === "PREPARING") {
+        this.release(claimed, String(error.message).slice(0, 500));
+      } else if (current?.state === "SUBMITTED") {
+        try {
+          outcomes.push({ wakeId: current.id, outcome: await this.reconcile(current) });
+        } catch (failure) {
+          // Still unresolved, and that is survivable: the row stays SUBMITTED and this process's own
+          // next pass sees it as work it is not driving, without waiting for anything to die.
+          if (this.onError) this.onError(failure, current.id);
+        }
+      }
     }
     return outcomes;
   }

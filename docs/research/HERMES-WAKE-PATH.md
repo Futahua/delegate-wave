@@ -306,6 +306,30 @@ Both were found in review, and both would only have caused damage once submissio
   `SESSION_NOT_OWNED` -- and that is what is matched, alongside Hermes' existing 4009. An unrecognised
   code is an error, which stops and asks, rather than a retry.
 
+### Three further corrections
+
+- **BLOCKED must stop what is already queued.** The watcher stopped creating wakes for a blocked
+  watch, but `claim()` selected PENDING rows from the outbox alone. A session that asks a question
+  and then finishes enqueues two wakes; if the first goes PARTIAL, the second was still delivered
+  into the conversation nobody can account for. The claim now requires the owning watch not to be
+  BLOCKED -- and deliberately still permits CLOSED, because a terminal watch closes the instant it
+  enqueues and excluding it would strand every completion wake ever written.
+- **A dead gateway under a live owner wedged the row forever.** The ordinary failure, not an exotic
+  one. `deliver()` left the row SUBMITTED and returned; the cross-process rule then refused -- rightly
+  -- to touch a live owner's work, and the owner had already moved on. Nothing resolved it until the
+  runtime happened to die. Now the owner reconciles its own abandoned row: immediately, with a fresh
+  gateway, and on later passes too, because a row this process owns and is not driving is knowledge
+  no probe could supply. The PID rule stays exclusively for another process recovering work whose
+  owner actually disappeared.
+- **The marker anchors on a user row.** A reverse search over every row could select an assistant
+  reply that quoted the marker back -- a reasonable way to acknowledge one -- find nothing after it,
+  and call a successful delivery PARTIAL.
+
+An earlier test masked the second of these: its fake liveness answered DEAD for every pid including
+the deliverer's own, so "gateway dies mid-delivery" modelled owner-dead rather than the live-owner
+case that actually happens. A process asking whether it is itself alive can only get one answer, and
+the fake now says so.
+
 ### Enabling submission takes more than a flag
 
 ```text

@@ -122,10 +122,19 @@ function fakeGateway(w, script = {}) {
 // that asks a hundred times. More importantly, a test needs to say "this owner is alive" as a
 // PREMISE -- the whole point of these cases is what the deliverer does with an answer it cannot
 // influence.
+//
+// THE DELIVERER'S OWN PID IS ALIVE, ALWAYS.
+//
+// An earlier version of this let the blanket verdict answer for SELF_PID too, so every test quietly
+// modelled a deliverer that was dead while it ran. That is not a state that exists, and it hid a
+// real bug: the ordinary failure is a dead gateway under a LIVE owner, and no test was expressing
+// it. A process asking whether it is itself alive can only get one answer.
+const SELF_PID = 4242;
+
 function fakeLiveness(verdict = DEAD) {
-  const answers = new Map();
+  const answers = new Map([[SELF_PID, ALIVE]]);
   return {
-    identity: async () => ({ pid: 4242, startedAt: "self-start" }),
+    identity: async () => ({ pid: SELF_PID, startedAt: "self-start" }),
     probe: async (pid) => answers.get(pid) ?? verdict,
     say: (pid, value) => answers.set(pid, value),
   };
@@ -245,6 +254,18 @@ test("history classification follows the measured crash boundaries", () => {
       { role: "assistant", text: "unrelated answer" },
     ], marker),
     "AMBIGUOUS",
+  );
+  // AN ASSISTANT THAT QUOTES THE MARKER BACK IS NOT THE MARKER.
+  //
+  // Acknowledging a wake by repeating its identifier is an entirely reasonable thing for a model to
+  // do. A reverse search over every row would anchor on that reply, find nothing after it, and call
+  // a perfectly successful delivery PARTIAL. Only a user row can BE the delivery.
+  assert.equal(
+    classifyHistory([
+      { role: "user", text: marker },
+      { role: "assistant", text: `Got it -- that was ${marker}, I will tell them.` },
+    ], marker),
+    "DELIVERED",
   );
   // Tool and system rows sit INSIDE a turn and are not a boundary on it.
   assert.equal(
@@ -454,6 +475,62 @@ test("another user turn before any answer is ambiguous, not delivered", async (t
   assert.equal(JSON.parse(event.payload_json).verdict, "AMBIGUOUS");
 });
 
+test("a blocked watch also stops the wakes already sitting in the queue", async (t) => {
+  // A session asks a question and then finishes: two wakes into one conversation, the second
+  // enqueued before anyone knew the first would go wrong. If the question's delivery ends ambiguous,
+  // the completion is still PENDING and would walk straight into the conversation nobody can account
+  // for -- which is the entire thing BLOCKED exists to prevent. The watcher not creating NEW wakes
+  // was never the whole job.
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_queued");
+  const question = w.ask(sessionId, "which export format did they mean?");
+  assert.equal(w.watcher.pass().length, 1);
+  w.answer(sessionId, question);
+  w.setState(sessionId, "COMPLETED");
+  assert.equal(w.watcher.pass().length, 1);
+  const [first, second] = w.db.prepare("SELECT * FROM wake_outbox ORDER BY created_at").all();
+  assert.equal(first.reason, "QUESTION");
+  assert.equal(second.reason, "COMPLETED");
+
+  // The question's delivery leaves the conversation ambiguous.
+  const fake = fakeGateway(w, { capabilities: EXCLUSIVE });
+  fake.append({ role: "user", text: first.marker });
+  const liveness = fakeLiveness(DEAD);
+  w.db.prepare(`UPDATE wake_outbox SET state = 'SUBMITTED', submitted_at = ?, updated_at = ?,
+                                       owner_pid = 8100, owner_started_at = 'gone' WHERE id = ?`)
+    .run("2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z", first.id);
+  const sender = deliverer(w, fake, { allowSubmit: true, liveness });
+  assert.deepEqual((await sender.pass()).map((o) => o.outcome), ["PARTIAL"]);
+  assert.equal(w.db.prepare("SELECT state FROM session_watches").get().state, "BLOCKED");
+
+  // The completion wake must not be delivered into it.
+  assert.equal(await sender.claim(), null, "a queued wake is not exempt from the block");
+  assert.deepEqual(await sender.pass(), []);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "PENDING");
+  assert.equal(fake.transcript().submits, 0);
+
+  // Only a person who names the ambiguity releases it.
+  const watch = w.db.prepare("SELECT * FROM session_watches").get();
+  w.watcher.unblock(watch.id, first.id);
+  assert.deepEqual((await sender.pass()).map((o) => o.outcome), ["DELIVERED"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "DELIVERED");
+});
+
+test("a completion wake is deliverable even though its watch closed on enqueue", async (t) => {
+  // The other half of the same query. A terminal watch is CLOSED the instant it enqueues, so an
+  // exclusion that caught CLOSED as well as BLOCKED would strand every completion wake ever written
+  // -- the most common wake there is.
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_closed");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  assert.equal(w.db.prepare("SELECT state FROM session_watches").get().state, "CLOSED");
+  const fake = fakeGateway(w, { capabilities: EXCLUSIVE });
+  assert.deepEqual((await deliverer(w, fake, { allowSubmit: true }).pass()).map((o) => o.outcome), ["DELIVERED"]);
+});
+
 test("a live owner keeps its wake no matter how old the row is", async (t) => {
   // THE RACE THE AGE RULE CREATED.
   //
@@ -593,7 +670,13 @@ test("only one delivery is ever open into one conversation", async (t) => {
   );
 });
 
-test("a gateway that dies mid-delivery does not authorise a retry it cannot justify", async (t) => {
+test("a gateway that dies mid-delivery is reconciled by its still-living owner", async (t) => {
+  // THE ORDINARY FAILURE, and the one no earlier test expressed.
+  //
+  // The Hermes child dies; the delegate-wave runtime that spawned it keeps running. The
+  // cross-process rule refuses -- correctly -- to touch a live owner's work, and the owner itself had
+  // already returned from deliver(). Nothing was left to resolve the row, so it sat SUBMITTED until
+  // this process happened to die. A wedged wake is a wake nobody is ever told about.
   const w = world(t);
   const sessionId = w.session();
   registerWatch(w.db, sessionId, "hermes_die");
@@ -604,16 +687,44 @@ test("a gateway that dies mid-delivery does not authorise a retry it cannot just
   const liveness = fakeLiveness(DEAD);
   const dying = deliverer(w, fake, { allowSubmit: true, liveness, onError: (error) => errors.push(error) });
 
-  await dying.pass();
-  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
-  // The user row IS durable. Handing this back to the queue would duplicate it.
-  assert.equal(wake.state, "SUBMITTED");
-  assert.ok(fake.transcript().messages[0].text.includes(wake.marker));
-  // The child that died is recorded, so the next pass can prove it is gone rather than assume it.
-  assert.ok(wake.gateway_pid);
-  // And once both are provably dead, the transcript is read and called what it is.
   const outcomes = await dying.pass();
-  assert.deepEqual(outcomes.map((o) => o.outcome), ["PARTIAL"]);
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  // The user row IS durable, so returning this to the queue would duplicate it. It is settled from
+  // the transcript instead -- in the SAME pass, by a fresh gateway, because the one hosting the turn
+  // is gone.
+  assert.deepEqual(outcomes.map((o) => o.outcome), ["SUBMITTED", "PARTIAL"]);
+  assert.equal(wake.state, "PARTIAL");
+  assert.ok(wake.reconciled_at, "the verdict must come from history, not from the child dying");
+  assert.ok(fake.transcript().messages[0].text.includes(wake.marker));
+  assert.equal(fake.transcript().submits, 1, "reconciliation reads; it must not resubmit");
+  // The owner never had to die for this to resolve.
+  assert.equal(await liveness.probe(SELF_PID), ALIVE);
+});
+
+test("a row this process stopped driving is resolvable without waiting for anything to die", async (t) => {
+  // The same wedge reached the other way: a SUBMITTED row owned by THIS live process, which is not
+  // driving it. No probe can establish that -- asking the operating system whether we are alive
+  // answers the wrong question -- so it is knowledge this process has about itself.
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_wedged");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wakeId = w.db.prepare("SELECT id FROM wake_outbox").get().id;
+  const fake = fakeGateway(w, { capabilities: EXCLUSIVE });
+  fake.append({ role: "user", text: wakeMarker(wakeId) });
+  fake.append({ role: "assistant", text: "already handled, actually" });
+  const liveness = fakeLiveness(ALIVE);
+  const owner = deliverer(w, fake, { allowSubmit: true, liveness });
+  // Left behind by an earlier pass of THIS process: owner alive, gateway gone.
+  w.db.prepare(`UPDATE wake_outbox SET state = 'SUBMITTED', submitted_at = ?, updated_at = ?,
+                                       owner_pid = ?, owner_started_at = 'self-start',
+                                       gateway_pid = 9911, gateway_started_at = 'gone'
+                WHERE id = ?`).run(new Date().toISOString(), new Date().toISOString(), SELF_PID, wakeId);
+
+  const outcomes = await owner.pass();
+  assert.deepEqual(outcomes.map((o) => o.outcome), ["DELIVERED"]);
+  assert.equal(fake.transcript().submits, 0, "the transcript already proved it; nothing is resent");
 });
 
 test("an unreachable gateway leaves the wake exactly where it was", async (t) => {
