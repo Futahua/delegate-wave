@@ -105,7 +105,7 @@ class World {
     g.resume = async (...args) => { g.isListener = true; return resume(...args); };
     const close = g.close.bind(g);
     g.close = async () => {
-      if (g.isListener && this.trackedEvent && !this.teardownStarted) {
+      if (g.isListener && this.trackedEvent && !this.teardownStarted && !g.deliberateKill) {
         try {
           const row = await this.receiver.status(this.trackedEvent);
           if (row && row.owner_alive && ["CLAIMED", "STARTED"].includes(row.state)) {
@@ -473,6 +473,181 @@ define(4, "an owner that dies holding the claim is recovered, and told once", as
   check("exactly one hidden marker -- the dead claim did not become a second turn", c.hidden === 1,
     `${c.hidden}`);
   check("delivered", c.verdict === "DELIVERED", c.verdict);
+});
+
+define(5, "an owner that dies mid-turn without writing the marker is reopened once", async (w, check) => {
+  // THE ONLY CASE THAT AUTHORISES SAYING A WAKE AGAIN.
+  //
+  // Hermes writes STARTED as soon as the turn thread launches; that thread persists the user row
+  // afterwards. A process killed in between leaves a row claiming a turn began and a transcript
+  // holding no evidence of one. Absence of the marker is the only thing that authorises a replay,
+  // so this must fire exactly once and produce exactly one turn.
+  //
+  // The window is small and must be hit deliberately. A first attempt polled at the harness's
+  // ordinary two-second cadence, observed STARTED long after the marker had landed, and so built
+  // the wrong scenario entirely -- the producer correctly declined to reopen a wake that was
+  // plainly delivered, and the case failed for being unconstructible rather than for being wrong.
+  const { gateway, key } = await w.establish();
+  await gateway.close();
+  await sleep(1_500);
+  const wake = w.wake(key);
+
+  const deliverer = w.deliverer({ kick: null });   // no listener: the timing of the kill is ours
+  check("ingress enqueues", (await deliverer.pass())[0]?.outcome === "ENQUEUED");
+
+  // CONSTRUCTED, NOT RACED.
+  //
+  // A first attempt tried to kill a listener in the instant between STARTED and the marker becoming
+  // durable. It never landed: every status read here spawns a Python subprocess, so a "50ms" poll
+  // is really about a second, and the marker always won. Three attempts, three delivered wakes, no
+  // experiment.
+  //
+  // Racing was the wrong instrument. That the window is REACHABLE is already established by
+  // scripts/probe_external_turn_crash.py on the Hermes side, which observed STARTED with no marker
+  // at kill delays up to 0.4s. What is under test here is the PRODUCER'S RESPONSE to that state, so
+  // the state is built exactly and directly: a process claims the event, marks it started, and
+  // exits without running a turn. Owner dead, transcript empty, deterministically.
+  const { execFileSync } = await import("node:child_process");
+  execFileSync(PYTHON, ["-c", [
+    "import sys",
+    "from tools.session_external_turns import claim_external_turn, mark_external_turn_started",
+    "cid = claim_external_turn(sys.argv[1])",
+    "assert cid, 'could not claim'",
+    "assert mark_external_turn_started(sys.argv[1], cid), 'could not mark started'",
+  ].join(String.fromCharCode(10)), wake.id],
+  { cwd: FORK, env: { ...process.env, HERMES_HOME: w.home }, encoding: "utf8", timeout: 120_000 });
+
+  const row = await w.status(wake.id);
+  const markers = (await w.canonical(key)).messages
+    .filter((m) => m.display_kind === "hidden" && m.text === wake.body).length;
+  check("the window exists: STARTED, owner gone, no marker",
+    row?.state === "STARTED" && row.owner_alive === false && markers === 0,
+    `${row?.state}/${row?.owner_alive} markers=${markers}`);
+
+  // Only now does the producer look.
+  const reopened = [];
+  const observer = w.deliverer({
+    onEvent: (kind, payload) => { if (kind === "WAKE_REOPENED") reopened.push(payload.wakeId); },
+  });
+  await observer.pass();
+  check("the producer reopens it, exactly once", reopened.length === 1, `${reopened.length} reopens`);
+
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
+  await observer.settleKicks();
+  await observer.pass();
+
+  const c = await w.counts(wake);
+  check("exactly one receiver row", c.receiverRows === 1);
+  check("exactly one hidden marker -- the reopen did not double it", c.hidden === 1, `${c.hidden}`);
+  check("delivered", c.verdict === "DELIVERED", c.verdict);
+});
+
+define(9, "an event that appears between the look and the write is still verified", async (w, check) => {
+  // status() says absent, somebody else creates the event, and this producer's enqueue returns its
+  // idempotent false. That false is indistinguishable from "already ours" without looking, so the
+  // readback looks -- and adoption still demands every field match.
+  const { gateway, key } = await w.establish();
+  await gateway.close();
+  await sleep(1_500);
+  const wake = w.wake(key);
+
+  const real = w.receiver;
+  let looks = 0;
+  const racy = {
+    reopen: (a, b) => real.reopen(a, b),
+    present: () => real.present(),
+    status: async (id) => {
+      looks += 1;
+      // Absent on the first look only; by the write, somebody else has created it.
+      if (looks === 1) return null;
+      return real.status(id);
+    },
+    enqueue: async (args) => {
+      // The competing producer wins the race, so ours is the idempotent no-op.
+      await real.enqueue({ ...args });
+      return real.enqueue(args);
+    },
+  };
+
+  const deliverer = w.deliverer({ externalTurns: () => racy });
+  const [outcome] = (await deliverer.pass()).map((o) => o.outcome);
+  check("it still records the handover", outcome === "ENQUEUED", String(outcome));
+
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
+  await deliverer.settleKicks();
+  await deliverer.pass();
+
+  const c = await w.counts(wake);
+  check("exactly one receiver row despite the race", c.receiverRows === 1);
+  check("exactly one hidden marker", c.hidden === 1, `${c.hidden}`);
+  check("delivered", c.verdict === "DELIVERED", c.verdict);
+});
+
+define(10, "a wake that rotated into an ancestor is still found", async (w, check) => {
+  // Canonical history spans the compression lineage precisely so this works. A marker written
+  // before an auto-compression rotation lives on the parent, and a tip-only read would report it
+  // absent -- which is the one answer that authorises saying the wake a second time.
+  const { gateway, key } = await w.establish();
+  const wake = w.wake(key);
+  const deliverer = w.deliverer();
+  await deliverer.pass();
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
+  await deliverer.settleKicks();
+  await gateway.close();
+  await sleep(1_500);
+
+  const beforeRotation = await w.counts(wake);
+  check("delivered before the rotation", beforeRotation.verdict === "DELIVERED",
+    beforeRotation.verdict);
+
+  // Rotate: a compression child, with the parent's transcript left where it is.
+  const { execFileSync } = await import("node:child_process");
+  const child = `${key}_c`;
+  execFileSync(PYTHON, ["-c", [
+    "import sqlite3, sys",
+    "db, parent, child = sys.argv[1], sys.argv[2], sys.argv[3]",
+    "c = sqlite3.connect(db, timeout=30)",
+    "c.execute(\"INSERT INTO sessions (id, source, parent_session_id, started_at, message_count) \"",
+    "          \"VALUES (?, 'tui', ?, '2026-08-26T23:00:00Z', 1)\", (child, parent))",
+    "c.execute(\"INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)\",",
+    "          (child, 'user', 'a turn written after the rotation', '2026-08-26T23:00:01Z'))",
+    "c.commit(); c.close()",
+  ].join(String.fromCharCode(10)), `${w.home}/state.db`, key, child],
+  { cwd: FORK, encoding: "utf8", timeout: 60_000 });
+
+  const after = await w.canonical(key);
+  check("the read follows the chain to the child", after.resolvedSessionId === child,
+    `${after.resolvedSessionId}`);
+  const verdict = classifyRoutedWake(after.messages, wake);
+  check("and the pre-rotation marker is STILL evidence", verdict === "DELIVERED",
+    `${verdict} -- a tip-only read would say ABSENT and replay it`);
+  check("exactly one hidden marker across the lineage",
+    after.messages.filter((m) => m.display_kind === "hidden" && m.text === wake.body).length === 1);
+});
+
+define(12, "a case leaves nothing of its own running", async (w, check) => {
+  // Hygiene as a case in its own right, rather than only as an epilogue to others. It matters
+  // because closing a gateway kills the LAUNCHER, and the interpreter it started can outlive it --
+  // holding a lease and a database handle with nothing left that knows about it.
+  const { gateway, key } = await w.establish();
+  const wake = w.wake(key);
+  const deliverer = w.deliverer();
+  await deliverer.pass();
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
+  await deliverer.settleKicks();
+
+  const beforeClose = await w.liveInterpreters();
+  check("this case really is running Hermes processes", beforeClose.length >= 1,
+    `${beforeClose.length} live`);
+  await gateway.close();
+  for (const g of w.gateways) { try { await g.close(); } catch { /* */ } }
+  await sleep(3_000);
+
+  const afterClose = await w.liveInterpreters();
+  check("and closing them ends the INTERPRETERS, not just the handles",
+    afterClose.length === 0, afterClose.join(","));
+  check("with no lease left behind",
+    w.registry().filter((r) => { try { process.kill(Number(r.pid), 0); return true; } catch { return false; } }).length === 0);
 });
 
 define(6, "reading canonical history consumes nothing", async (w, check) => {
