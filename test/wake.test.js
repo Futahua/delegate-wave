@@ -1774,3 +1774,49 @@ test("an adopted event still needs somebody to run it", async (t) => {
   assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ADOPTED"]);
   assert.deepEqual(kicked, [wake.id], "an adopted event is kicked, exactly as a freshly enqueued one is");
 });
+
+test("a listener keeps listening through a DEAD claim, because it is the recovery", async (t) => {
+  // THE SELF-DEFEATING EXIT.
+  //
+  // Hermes offers a dead CLAIMED row back to any newly-live session, whose poller performs the
+  // recovery. That recovery requires a live session to exist -- which is exactly what this listener
+  // was started to provide. Treating "the claimer died" as a conclusive answer closes the only
+  // process capable of doing the recovery it was started to enable, and the event strands.
+  //
+  // The sequence below is the real one: a claim whose owner is gone, observed more than once
+  // because recovery is not instant, then the recovered turn running, then done.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const sequence = [
+    { state: "CLAIMED", owner_alive: false, owner_pid: 4001 },
+    { state: "CLAIMED", owner_alive: false, owner_pid: 4001 },
+    { state: "STARTED", owner_alive: true, owner_pid: 4002 },
+    { state: "FINISHED", owner_alive: false, outcome: "completed" },
+  ];
+  let step = 0;
+  const inner = ext.factory();
+  const scripted = {
+    ...inner,
+    status: async () => sequence[Math.min(step++, sequence.length - 1)],
+  };
+
+  const deliverer = new WakeDeliverer({
+    db: w.db,
+    gateway: fake.factory(),
+    externalTurns: () => scripted,
+    canonicalHistory: fakeCanonicalHistory(fake),
+    allowEnqueue: true,
+    probe: fakeLiveness().probe,
+    identity: fakeLiveness().identity,
+    investigateAfterMs: 0,
+    kick: null,
+  });
+
+  assert.equal(await deliverer.resumeKick(wake), "HOSTED",
+    "it stays through the dead claim and hosts the recovered turn to the end");
+  assert.ok(step >= sequence.length,
+    `it must have seen the whole sequence, not left at the first dead claim (saw ${step})`);
+});

@@ -568,11 +568,18 @@ export class WakeDeliverer {
         if (!status) return "GONE";
         const state = String(status.state ?? "");
         if (state === "FINISHED") return hosted ? "HOSTED" : "FINISHED";
-        // Still queued: nobody has taken it, so this listener is still the reason one might.
-        if (state === "PENDING" || state === "CLAIMED") {
-          if (state === "CLAIMED" && !status.owner_alive) return "OWNER_DIED";
-          continue;
-        }
+        // Still queued, or claimed by somebody who died before dispatching.
+        //
+        // A DEAD CLAIM IS NOT A REASON TO LEAVE -- IT IS THE REASON TO STAY.
+        //
+        // Hermes offers a dead CLAIMED row back to any newly-live session, and that session's
+        // poller performs the recovery. This listener IS that live session. Leaving here closes
+        // the only process capable of doing the recovery it was started to enable, and the event
+        // strands with nobody able to take it.
+        //
+        // An earlier version returned OWNER_DIED on exactly this observation, which read as
+        // prudence and was self-defeating.
+        if (state === "PENDING" || state === "CLAIMED") continue;
         // Being run right now. Whether by this listener's session or another owner's is not
         // knowable from here and does not matter: leaving could kill it.
         if (!status.owner_alive) return "OWNER_DIED";

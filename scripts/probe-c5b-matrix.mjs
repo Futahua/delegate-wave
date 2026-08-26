@@ -76,6 +76,10 @@ class World {
     this.receiver = new HermesExternalTurns({
       command: PYTHON, cwd: FORK, env: { ...process.env, HERMES_HOME: this.home },
     });
+    // Interpreters that existed before this case started are somebody else's business. Captured
+    // in begin(), because the constructor cannot await.
+    this.baselineInterpreters = new Set();
+    this.teardownStarted = false;
   }
 
   // Every gateway this case starts, remembered -- so the case can prove it left nothing running.
@@ -85,20 +89,28 @@ class World {
       env: { ...process.env, HERMES_HOME: this.home },
       readyTimeoutMs: 180_000, requestTimeoutMs: 240_000,
     });
-    // THE INVARIANT THAT CAPTURES MOST OF THE BUGS FOUND DURING THIS WORK.
+    // THE INVARIANT THAT CAPTURES MOST OF THE BUGS FOUND DURING THIS WORK -- AND IT NO LONGER
+    // ASKS WHICH PROCESS ANYTHING IS.
     //
-    // A gateway must never be closed while the receiver says that same process owns the event in
-    // CLAIMED or STARTED -- that is delegate-wave destroying a turn it asked for. Checked here
-    // rather than reasoned about, because every version of this bug looked correct in review.
+    // The first version compared the event's owner_pid to g.child.pid. That is the exact mistake
+    // production just had removed from resumeKick: a virtualenv python.exe is a launcher shim, so
+    // those two identifiers are never the same process in this deployment. The check could not
+    // possibly have fired -- an assertion that cannot fail is worse than none, because it is
+    // counted as coverage.
+    //
+    // The rule matches the production rule instead. A listener stays alive while ANY live owner is
+    // handling the event, so closing one that has resumed a session while the event is being run
+    // by somebody alive is the violation, regardless of who that somebody is.
+    const resume = g.resume.bind(g);
+    g.resume = async (...args) => { g.isListener = true; return resume(...args); };
     const close = g.close.bind(g);
     g.close = async () => {
-      const pid = g.child?.pid ?? null;
-      if (pid && this.trackedEvent) {
+      if (g.isListener && this.trackedEvent && !this.teardownStarted) {
         try {
           const row = await this.receiver.status(this.trackedEvent);
-          if (row && row.owner_pid === pid && ["CLAIMED", "STARTED"].includes(row.state)) {
+          if (row && row.owner_alive && ["CLAIMED", "STARTED"].includes(row.state)) {
             this.violations.push(
-              `closed gateway pid ${pid} while it owned ${this.trackedEvent} in ${row.state}`,
+              `closed a listener while ${this.trackedEvent} was ${row.state} under a live owner`,
             );
           }
         } catch { /* the check must never be the thing that fails a case */ }
@@ -263,18 +275,49 @@ ${row.marker}`;
     };
   }
 
+  // Every REAL Hermes interpreter running right now, by pid.
+  //
+  // Not the launcher handles this process holds: those are shims, and a dead shim says nothing
+  // about the interpreter it started. Killed probes have already been observed leaving stray
+  // tui_gateway processes behind, so hygiene is measured against the processes that actually exist.
+  async begin() {
+    this.baselineInterpreters = new Set(await this.liveInterpreters());
+    return this;
+  }
+
+  async liveInterpreters() {
+    const { execFileSync } = await import("node:child_process");
+    try {
+      const out = execFileSync(PYTHON, ["-c",
+        "import psutil,json;print(json.dumps([p.pid for p in psutil.process_iter(['cmdline']) "
+        + "if 'tui_gateway.entry' in ' '.join(p.info.get('cmdline') or [])]))",
+      ], { cwd: FORK, encoding: "utf8", timeout: 60_000 });
+      return JSON.parse(out.trim());
+    } catch { return []; }
+  }
+
   async teardown() {
+    this.teardownStarted = true;   // closing here is cleanup, not a violation
     for (const g of this.gateways) { try { await g.close(); } catch { /* already gone */ } }
-    await sleep(1_000);
-    const alive = [];
+    await sleep(2_000);
+
+    // Two independent witnesses, because each can be wrong on its own.
+    //
+    //   the active-session registry -- Hermes's own record of who holds a session, written by the
+    //     interpreter itself, so it carries the identity that actually matters
+    //   the live interpreter list -- catches a process that leaked without holding a lease
+    const leases = this.registry().filter((r) => {
+      try { process.kill(Number(r.pid), 0); return true; } catch { return false; }
+    });
+    const strays = (await this.liveInterpreters()).filter((pid) => !this.baselineInterpreters.has(pid));
+
+    for (const pid of strays) { try { process.kill(pid, "SIGKILL"); } catch { /* */ } }
     for (const g of this.gateways) {
       const pid = g.child?.pid;
-      if (!pid) continue;
-      try { process.kill(pid, 0); alive.push(pid); try { process.kill(pid, "SIGKILL"); } catch { /* */ } }
-      catch { /* dead, which is what we want */ }
+      if (pid) { try { process.kill(pid, "SIGKILL"); } catch { /* */ } }
     }
     try { this.db.close(); } catch { /* */ }
-    return alive;
+    return { leases: leases.map((r) => r.pid), strays };
   }
 }
 
@@ -362,6 +405,49 @@ define(3, "a busy owner finishes its turn first; the wake never interrupts", asy
   check("and the wake landed AFTER it, never inside it", wakeAt > countingAt,
     `counting@${countingAt} wake@${wakeAt}`);
   check("exactly one hidden marker", c.hidden === 1, `${c.hidden}`);
+  check("delivered", c.verdict === "DELIVERED", c.verdict);
+});
+
+define(4, "an owner that dies holding the claim is recovered, and told once", async (w, check) => {
+  // Hermes offers a dead CLAIMED row back to any newly-live session, whose poller recovers it. That
+  // recovery REQUIRES a live session to exist -- which is precisely what a kick is for.
+  //
+  // So the listener must keep listening through a dead claim. If it treats "the claimer died" as a
+  // conclusive answer and leaves, it closes the only process capable of performing the recovery it
+  // was started to enable, and the event strands.
+  const { gateway, key } = await w.establish();
+  await gateway.close();
+  await sleep(1_500);
+  const wake = w.wake(key);
+
+  // A claim taken by a process that then exits, exactly as a crash leaves one.
+  const { execFileSync } = await import("node:child_process");
+  execFileSync(PYTHON, ["-c",
+    "import sys;from tools.session_external_turns import enqueue_external_turn, claim_external_turn;"
+    + "enqueue_external_turn(event_id=sys.argv[1], target_session_key=sys.argv[2], body=sys.argv[3],"
+    + " source='delegate-wave');print(claim_external_turn(sys.argv[1]))",
+    wake.id, wake.hermes_session_id, wake.body,
+  ], { cwd: FORK, env: { ...process.env, HERMES_HOME: w.home }, encoding: "utf8", timeout: 120_000 });
+
+  const orphaned = await w.status(wake.id);
+  check("the claim is dead before anything recovers it",
+    orphaned?.state === "CLAIMED" && orphaned.owner_alive === false,
+    `${orphaned?.state}/${orphaned?.owner_alive}`);
+
+  const deliverer = w.deliverer();
+  const [outcome] = (await deliverer.pass()).map((o) => o.outcome);
+  check("delegate-wave adopts the event it already handed over", outcome === "ADOPTED",
+    String(outcome));
+
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000,
+    "the recovered event to finish");
+  await deliverer.settleKicks();
+  await deliverer.pass();
+
+  const c = await w.counts(wake);
+  check("exactly one receiver row", c.receiverRows === 1);
+  check("exactly one hidden marker -- the dead claim did not become a second turn", c.hidden === 1,
+    `${c.hidden}`);
   check("delivered", c.verdict === "DELIVERED", c.verdict);
 });
 
@@ -485,7 +571,7 @@ async function main() {
   for (const c of CASES) {
     if (only.length && !only.includes(c.n)) continue;
     console.log(`\n=== case ${c.n}: ${c.title} ===`);
-    const w = new World(`case${c.n}`);
+    const w = await new World(`case${c.n}`).begin();
     const failures = [];
     const check = (label, ok, detail = "") => {
       console.log(`  ${ok ? "PASS" : "FAIL"}  ${label}${detail ? ` -- ${detail}` : ""}`);
@@ -496,8 +582,9 @@ async function main() {
     } catch (error) {
       check(`case threw: ${error.message}`, false);
     } finally {
-      const alive = await w.teardown();
-      check("no gateway it started survives", alive.length === 0, alive.join(","));
+      const { leases, strays } = await w.teardown();
+      check("no live Hermes process it started survives", strays.length === 0, strays.join(","));
+      check("and no session it created is still leased", leases.length === 0, leases.join(","));
       for (const v of w.violations) check(`kill invariant: ${v}`, false);
     }
     results.push({ n: c.n, failures });
