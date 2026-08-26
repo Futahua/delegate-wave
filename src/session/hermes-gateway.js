@@ -21,10 +21,10 @@
 //
 // THE ACKNOWLEDGEMENT IS NOT THE DELIVERY.
 //
-// `prompt.submit` returns `{"status": "streaming"}` before anything is durable, and Hermes does not
-// deduplicate submissions. So this adapter exposes `history()` as a first-class operation rather
-// than as a debugging aid: canonical history is what the caller reasons from, and this class is
-// careful never to imply otherwise by returning something that looks like a receipt.
+// `prompt.submit` returns `{"status": "streaming"}` before anything is durable, and this call does
+// not deduplicate. So nothing this adapter returns is a receipt, and it is careful never to look
+// like one. What a caller reasons from is the durable record -- and for the routed transport that
+// means `session.canonical_history`, not the `history()` below, which is the display projection.
 import { spawn } from "node:child_process";
 import { processStartedAt } from "./liveness.js";
 
@@ -241,6 +241,15 @@ export class HermesGateway {
   }
 
   // Canonical durable history: the delivery authority, not a convenience.
+  // THE DISPLAY PROJECTION. What a person should see, not what durably happened.
+  //
+  // Hermes drops `display_kind="hidden"` rows from this -- machine scaffolding, compaction
+  // references, and the routed transport's own wake rows. A producer reconciling its own delivery
+  // against this will never find its marker and will conclude, forever, that nothing was written.
+  // That bug shipped; see HermesCanonicalHistory, which is what routed reconciliation uses.
+  //
+  // This remains correct for anything asking what the conversation LOOKS like, and for the legacy
+  // direct-submit path, whose wakes were ordinary visible user rows.
   async history(runtimeSessionId) {
     const result = await this.request("session.history", { session_id: runtimeSessionId });
     return result.messages ?? [];

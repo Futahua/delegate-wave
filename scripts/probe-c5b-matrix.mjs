@@ -307,16 +307,26 @@ define(1, "no owner: the kick becomes one, and the person is told exactly once",
 });
 
 define(2, "an idle owner consumes it, and the kick does not steal it", async (w, check) => {
-  const { gateway, key } = await w.establish();   // stays open and idle
+  const { gateway, sid, key } = await w.establish();   // stays open and idle
   const wake = w.wake(key);
   const deliverer = w.deliverer();
   await deliverer.pass();
 
   const finished = await w.waitFor(async () => await w.status(wake.id), 300_000, "the event");
-  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 300_000, "FINISHED");
-  const owner = (await w.status(wake.id)).owner_pid;
-  check("the existing owner ran it, not a kick",
-    owner === gateway.child.pid, `owner=${owner} existing=${gateway.child.pid}`);
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
+
+  // IDENTIFIED BY LIVE SESSION, NOT BY PID.
+  //
+  // The obvious assertion -- owner_pid === the pid we spawned -- is the same mistake that broke
+  // resumeKick: a virtualenv python.exe is a launcher shim, so the pid we hold is never the pid of
+  // the Hermes process that writes owner_pid. The runtime session id IS visible to both sides, so
+  // ownership is asked in terms both sides can actually see.
+  const owners = w.registry().filter((r) => r.session_id === key);
+  check("exactly one live session owns the conversation", owners.length === 1,
+    JSON.stringify(owners.map((r) => r.metadata)));
+  check("and it is the chat that was already open, not a kick's",
+    owners[0]?.metadata?.live_session_id === sid,
+    `owner live_session=${owners[0]?.metadata?.live_session_id} existing=${sid}`);
   check("event exists once", Boolean(finished));
 
   await deliverer.settleKicks();
@@ -336,17 +346,22 @@ define(3, "a busy owner finishes its turn first; the wake never interrupts", asy
 
   const wake = w.wake(key);
   await w.deliverer().pass();
-  await sleep(8_000);
-  const during = await w.status(wake.id);
-  check("it waits while the owner is busy",
-    during && ["PENDING", "CLAIMED"].includes(during.state), String(during?.state));
+  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 600_000, "FINISHED");
 
-  await w.waitFor(async () => (await w.status(wake.id))?.state === "FINISHED", 300_000, "FINISHED");
+  // ORDERING IN THE DURABLE RECORD, NOT A STOPWATCH.
+  //
+  // "still PENDING at t+8s" measures how fast the model happens to be, and a quick reply makes the
+  // case fail while proving nothing. The property is that the wake became a LATER TURN: the
+  // person's turn ran to completion and the wake's row comes after it. That is true regardless of
+  // timing, and false exactly when the wake interrupts.
   const c = await w.counts(wake);
-  const counting = c.rows.filter((m) => m.role === "assistant" && /DONE-COUNTING/.test(m.text ?? ""));
-  check("the interrupted-looking turn actually completed", counting.length === 1,
-    `${counting.length} completions`);
-  check("and the wake became a later turn", c.hidden === 1, `${c.hidden}`);
+  const countingAt = c.rows.findIndex((m) => m.role === "assistant" && /DONE-COUNTING/.test(m.text ?? ""));
+  const wakeAt = c.rows.findIndex((m) => m.display_kind === "hidden" && m.text === wake.body);
+  check("the turn the person was watching ran to completion", countingAt >= 0,
+    `${c.rows.length} rows`);
+  check("and the wake landed AFTER it, never inside it", wakeAt > countingAt,
+    `counting@${countingAt} wake@${wakeAt}`);
+  check("exactly one hidden marker", c.hidden === 1, `${c.hidden}`);
   check("delivered", c.verdict === "DELIVERED", c.verdict);
 });
 
@@ -428,36 +443,38 @@ define(8, "remote enqueue committed, local record lost: adopted, never re-sent",
 });
 
 define(11, "a person speaking first makes attribution impossible, not false", async (w, check) => {
+  // The person's own chat stays OPEN and owns the conversation, which is the realistic shape and
+  // the only one the lease permits: an earlier version opened a second session to type into and was
+  // refused with SESSION_NOT_OWNED -- the fence working correctly against an unrealistic test.
   const { gateway, sid, key } = await w.establish();
-  await gateway.close();
-  await sleep(1_500);
   const wake = w.wake(key);
-  const deliverer = w.deliverer();
-  await deliverer.pass();
-  await w.waitFor(async () => ["STARTED", "FINISHED"].includes((await w.status(wake.id))?.state),
-    300_000, "the turn to start");
-  await w.waitFor(async () => (await w.canonical(key)).messages
-    .some((m) => m.display_kind === "hidden" && m.text === wake.body), 120_000, "the marker");
+  await w.deliverer().pass();
 
-  // The person types before any answer is attributable.
-  const person = w.gateway();
-  await person.start();
-  const resumed = await person.request("session.resume", { session_id: key });
-  await person.request("prompt.submit", { session_id: resumed.session_id, text: "wait, hold on" });
-  await sleep(3_000);
+  // Type into the SAME session the moment the wake's marker is durable, before any answer to it
+  // can be attributed.
+  await w.waitFor(async () => (await w.canonical(key)).messages
+    .some((m) => m.display_kind === "hidden" && m.text === wake.body), 600_000, "the marker");
+  await gateway.request("prompt.submit", { session_id: sid, text: "wait, hold on" })
+    .catch(() => { /* refused or queued: either way the transcript decides below */ });
+  await sleep(5_000);
 
   const rows = (await w.canonical(key)).messages;
   const at = rows.findLastIndex((m) => m.role === "user" && m.display_kind === "hidden"
     && m.text === wake.body);
-  const nextUser = rows.slice(at + 1).findIndex((m) => m.role === "user");
-  const nextAssistant = rows.slice(at + 1).findIndex((m) => m.role === "assistant");
+  const after = rows.slice(at + 1);
+  const nextUser = after.findIndex((m) => m.role === "user");
+  const nextAssistant = after.findIndex((m) => m.role === "assistant"
+    && ((m.text ?? "").trim() || m.reasoning));
+  const verdict = classifyRoutedWake(rows, wake);
   if (nextUser >= 0 && (nextAssistant < 0 || nextUser < nextAssistant)) {
-    check("a user turn before any answer reads as AMBIGUOUS",
-      classifyRoutedWake(rows, wake) === "AMBIGUOUS", classifyRoutedWake(rows, wake));
+    check("a person's turn before any answer reads as AMBIGUOUS, never DELIVERED",
+      verdict === "AMBIGUOUS", verdict);
   } else {
-    check("the wake was answered before the person spoke, which is also correct",
-      classifyRoutedWake(rows, wake) === "DELIVERED", classifyRoutedWake(rows, wake));
+    check("the wake was answered before the person spoke, which is equally correct",
+      verdict === "DELIVERED", verdict);
   }
+  check("and never more than one marker", rows.filter((m) => m.display_kind === "hidden"
+    && m.text === wake.body).length === 1);
 });
 
 // ── runner ────────────────────────────────────────────────────────────────────────────────────

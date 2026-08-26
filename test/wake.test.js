@@ -1746,3 +1746,31 @@ test("the watcher treats an enqueued wake as already open", async (t) => {
   assert.deepEqual(w.watcher.pass(), [], "the enqueued wake is adopted, not duplicated");
   assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 1);
 });
+
+test("an adopted event still needs somebody to run it", async (t) => {
+  // Adoption only reconciles this database with the receiver. It creates no owner, so an event
+  // recovered from a dual-write crash is in exactly the position a freshly enqueued one is: queued,
+  // with nobody necessarily listening. Without a kick it waits forever.
+  //
+  // The real-process matrix caught this as case 8 timing out on an event nothing was ever going to
+  // consume. Every unit test passed, because adoption itself was correct -- what was missing was
+  // the step after it.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_adopt_kick");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  // The handover this database never learned about.
+  await ext.factory().enqueue({
+    eventId: wake.id, sessionKey: wake.hermes_session_id, body: wake.body, source: "delegate-wave",
+  });
+
+  const kicked = [];
+  const deliverer = routedDeliverer(w, fake, ext, { kick: async (row) => { kicked.push(row.id); } });
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ADOPTED"]);
+  assert.deepEqual(kicked, [wake.id], "an adopted event is kicked, exactly as a freshly enqueued one is");
+});

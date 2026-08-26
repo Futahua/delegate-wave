@@ -1,9 +1,23 @@
 // Delivering a wake, and knowing honestly whether it was delivered.
 //
-// Everything hard about this file comes from one measured fact: the receiver has no idempotency and
-// no receipt. `prompt.submit` returns `{"status": "streaming"}` before a single row is durable, and
-// submitting the same wake twice produces two independent agent turns. So the acknowledgement is
-// worth nothing as evidence, and this deliverer never treats it as evidence.
+// TWO PROTOCOLS LIVE HERE, AND MOST OF THIS FILE'S HISTORY BELONGS TO THE OLDER ONE.
+//
+// LEGACY DIRECT-SUBMIT (state SUBMITTED). delegate-wave handed prompt.submit to a gateway it
+// spawned itself. That receiver had no idempotency and no receipt: prompt.submit returns
+// `{"status": "streaming"}` before a single row is durable, submitting the same wake twice produced
+// two independent agent turns, and nothing fenced a second writer. Every "the acknowledgement is
+// worth nothing" argument below is about THAT path. It is retained for A/B forensics and is not
+// reachable from the routed transport.
+//
+// EXTERNAL-TURN (state ENQUEUED), the current path. The receiver now has all three of the things
+// the legacy path lacked, and each is verified rather than assumed:
+//
+//   per_session_exclusive_submit   one live owner per stored session, enforced atomically
+//   session_external_turns_v1      a durable inbox, idempotent on the producer's own event id
+//   session_canonical_history_v1   the evidence projection, so a producer can SEE its own delivery
+//
+// So on the routed path an enqueue IS idempotent and there IS a receipt -- read back and verified
+// field by field, because "something occupies this id" is not "your event is there".
 //
 // CANONICAL HISTORY IS THE DELIVERY AUTHORITY.
 //
@@ -23,17 +37,13 @@
 // evidence does not support, which is the one thing this system is not allowed to do. So PARTIAL
 // stops the watch and says so, and a person decides.
 //
-// THE SUBMIT IS GATED, DELIBERATELY, AND BY TWO SEPARATE THINGS.
+// DELIVERY IS GATED BY WHAT THE RECEIVER REPORTS, NOT BY CONFIGURATION.
 //
-// Hermes has no cross-process per-session exclusivity today (research section 7): two gateways can
-// resume the same durable session from independent snapshots and both append turns. Until the
-// narrow upstream fix lands -- a per-session lease enforced AT `prompt.submit`, independent of
-// `max_concurrent_sessions` -- the last step is withheld rather than attempted.
-//
-// An operator setting `allowSubmit` is NOT sufficient. The receiver must also positively report
-// that it enforces per-session exclusivity, and a receiver that says nothing is treated as one that
-// does not. Otherwise the flag is a foot-gun that survives a Hermes downgrade, an unexpected PATH,
-// or a copied config, and does its damage in a real conversation.
+// The lease that makes any of this safe now exists upstream, but a build that lacks it accepts the
+// same calls and looks identical until it corrupts a conversation. So the receiver must positively
+// report every guarantee this path depends on, and one that says nothing is treated as one that
+// says no. An operator flag alone authorises nothing: it would otherwise survive a downgrade, an
+// unexpected PATH or a copied config, and do its damage in somebody's real conversation.
 //
 // TIME IS NOT EVIDENCE OF DEATH.
 //
@@ -769,6 +779,14 @@ export class WakeDeliverer {
         }
         if (!this.#adopt(wake)) return "LOST_CLAIM";
         this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
+        // AND SOMEBODY STILL HAS TO RUN IT.
+        //
+        // Adoption only reconciles this database with the receiver; it creates no owner. An event
+        // recovered this way is in exactly the position a freshly enqueued one is -- queued, with
+        // nobody necessarily listening -- so it needs the same kick. Without this, the dual-write
+        // crash path adopted correctly and then waited forever, which the real-process matrix
+        // caught as a timeout on an event nothing was ever going to consume.
+        this.#startKick(wake);
         return "ADOPTED";
       }
 
