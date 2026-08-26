@@ -1224,13 +1224,13 @@ test("the kick resumes and never writes", async (t) => {
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
-  // Somebody else's chat owns it, which is a conclusive answer and ends the kick.
-  ext.set(wake.id, { state: "CLAIMED", owner_alive: true, owner_pid: 31337 });
+  // Finished before the listener's first look: a conclusive answer, so it ends immediately.
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
 
   const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
   const outcome = await deliverer.resumeKick(wake);
 
-  assert.equal(outcome, "RELEASED", "another process owns it, so this listener has no reason to stay");
+  assert.equal(outcome, "FINISHED");
   assert.equal(fake.transcript().submits, 0, "a kick must never submit");
   assert.ok((fake.transcript().resumes ?? 0) >= 1, "but it must actually resume");
 });
@@ -1261,12 +1261,19 @@ test("a kick keeps listening while nobody has taken the event", async (t) => {
   assert.equal(await running, "FINISHED");
 });
 
-test("a kick whose own child took the event stays until the turn ends", async (t) => {
-  // Closing here would kill the turn this child is hosting -- the same mechanism that produced the
-  // PARTIAL boundary in the original research, arrived at from the other direction.
+test("a kick holds while ANY live owner is running the event", async (t) => {
+  // IT DOES NOT TRY TO RECOGNISE ITS OWN CLAIM, AND MUST NOT.
   //
-  // The premise is stated by reading the pid the stub recorded when the kick resumed it, so the
-  // test is about the pid the kick ACTUALLY sees rather than one asserted from outside.
+  // The earlier version compared the event's owner_pid against the pid of the process it spawned,
+  // and held only when they matched. Measured against real Hermes, that test can never pass: a
+  // virtualenv python.exe is a launcher SHIM, so the pid we spawn is the shim and the process that
+  // writes owner_pid is a different one (spawn handle 30124, process reported 55312). Every kick
+  // therefore concluded a stranger owned the event and closed -- destroying the turn it had just
+  // caused to start. A stub could never show this, because a stub's pid IS the direct child.
+  //
+  // So the pid here is deliberately one that belongs to NOBODY the test knows about. Holding is
+  // still the required behaviour: leaving could kill a live turn, and an idle process is cheaper
+  // than a lost answer.
   const w = world(t);
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
@@ -1275,22 +1282,14 @@ test("a kick whose own child took the event stays until the turn ends", async (t
 
   const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
   const running = deliverer.resumeKick(wake);
-
-  // Wait for the listener to exist, then declare it the owner.
-  const deadline = Date.now() + 20_000;
-  let listenerPid = null;
-  while (Date.now() < deadline && !listenerPid) {
-    await new Promise((resolve) => { setTimeout(resolve, 50); });
-    listenerPid = fake.transcript().lastResumePid ?? null;
-  }
-  assert.ok(listenerPid, "the kick must have resumed a session");
-  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: listenerPid });
+  await new Promise((resolve) => { setTimeout(resolve, 1_200); });
+  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: 999_001 });
 
   const held = await Promise.race([
     running.then(() => "ENDED"),
     new Promise((resolve) => { setTimeout(() => resolve("HOLDING"), 2_000); }),
   ]);
-  assert.equal(held, "HOLDING", "it hosts the turn, so it must not close while the turn runs");
+  assert.equal(held, "HOLDING", "a live turn is running; leaving could kill it");
 
   ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
   assert.equal(await running, "HOSTED");
@@ -1445,14 +1444,14 @@ test("a status read that FAILS is not evidence that the event is gone", async (t
   assert.equal(await running, "HOSTED");
 });
 
-test("a listener that cannot say who it is never resumes at all", async (t) => {
-  // If this process cannot establish its own identity, it can never recognise its OWN claim: it
-  // would read "somebody has it", conclude the event belongs to a stranger, and close -- killing
-  // the turn its own child had just begun. The same evidence collapse as the status bug, arriving
-  // from the ownership side.
+test("a listener works even when it cannot say who it is", async (t) => {
+  // The inverse of a guard that used to live here.
   //
-  // So identity is established BEFORE anything is resumed, while nothing is live and closing is
-  // still free. A listener that does not know itself must never become eligible to claim.
+  // The kick once needed its own identity, to compare against the event's owner_pid, and refused to
+  // resume without it. That comparison is gone -- it could never succeed against a real virtualenv,
+  // whose python.exe is a launcher shim spawning the actual process under a different pid -- so the
+  // identity is not needed either. This asserts the dependency is genuinely absent rather than
+  // merely unused: a gateway that cannot report a pid still listens and still hands off correctly.
   const w = world(t);
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
@@ -1469,6 +1468,7 @@ test("a listener that cannot say who it is never resumes at all", async (t) => {
     db: w.db,
     gateway: anonymous,
     externalTurns: ext.factory,
+    canonicalHistory: fakeCanonicalHistory(fake),
     allowEnqueue: true,
     probe: fakeLiveness().probe,
     identity: fakeLiveness().identity,
@@ -1477,20 +1477,11 @@ test("a listener that cannot say who it is never resumes at all", async (t) => {
   });
 
   const running = deliverer.resumeKick(wake);
-  // Driven to a terminal answer after a moment, so that a listener which WRONGLY resumed ends up
-  // reporting an outcome rather than parking -- a hung test proves the same thing far less clearly
-  // than a failed assertion naming what went wrong.
-  setTimeout(() => ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" }), 1_200);
-
-  assert.equal(await running, "FAILED", "an anonymous listener must give up before resuming");
-  assert.equal(
-    fake.transcript().resumes ?? 0, 0,
-    "and must not have resumed: a session it could not recognise itself owning is one it could kill",
-  );
+  await new Promise((resolve) => { setTimeout(resolve, 1_200); });
+  assert.ok((fake.transcript().resumes ?? 0) >= 1, "it resumed without needing to identify itself");
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+  assert.equal(await running, "FINISHED");
 });
-
-// ── EXACT IDENTITY, NOT RESEMBLANCE ────────────────────────────────────────────────────────────
-
 test("a compaction row quoting the marker is not the delivery", async (t) => {
   // THE HAZARD CANONICAL HISTORY INTRODUCED, AND WHY THE CLASSIFIER CHANGED.
   //

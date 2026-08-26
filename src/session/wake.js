@@ -520,30 +520,32 @@ export class WakeDeliverer {
     const gateway = this.gatewayFactory();
     try {
       await gateway.start();
-      // IDENTITY BEFORE RESUME, and the order matters for the same reason as everything else here.
-      //
-      // Resuming starts a live session, and a live session's poller may claim the event. If this
-      // process could not say who it is, it could never recognise its OWN claim -- it would read
-      // "somebody has it" and close, killing the turn its own child had just begun. So identity is
-      // established while nothing has been resumed and closing is still free.
-      const child = await gateway.identity().catch(() => null);
-      if (!child?.pid) return "FAILED";
       await gateway.resume(wake.hermes_session_id);
       const receiver = this.externalTurns();
+
+      // THIS LISTENER DOES NOT TRY TO RECOGNISE ITS OWN CLAIM.
+      //
+      // It used to: it compared the event's owner_pid against the pid of the process it spawned,
+      // and held the session open only when they matched. That test can never pass in a normal
+      // deployment. A virtualenv's python.exe is a LAUNCHER SHIM -- the pid we spawn is the shim,
+      // and the Hermes process that writes owner_pid is a different process entirely. Measured:
+      // spawn handle 30124, process reports 55312.
+      //
+      // So `mine` was always false, every kick concluded a stranger owned the event, and the
+      // finally below closed the gateway -- destroying the turn this listener had just caused to
+      // start. A stub could not show it, because a stub's pid IS the direct child.
+      //
+      // The question is not worth answering. A listener does not need to know whether it is the
+      // host: it only needs to not disappear while the event is being run by somebody who is
+      // alive. Holding a little longer than necessary costs an idle process; guessing wrong costs
+      // the person their answer.
       let hosted = false;
       for (;;) {
-        // The listener itself died. Nothing is concluded from that: the event is untouched and a
-        // later pass may kick again.
         if (gateway.exit) return hosted ? "HOSTED" : "GATEWAY_GONE";
         await sleep(KICK_POLL_MS);
-        // FAILING TO ASK IS NOT AN ANSWER.
-        //
-        // The adapter distinguishes these deliberately: a resolved null means Hermes was asked and
-        // has no such event, while a rejection means the question never got through -- a spawn that
-        // failed, a locked database, a timeout. Collapsing them would make a transient hiccup mean
-        // "the event is gone", and the cleanup below would then close a listener that is still
-        // eligible to claim -- killing a turn this process never observed starting. That is the
-        // clock bug again, arriving through a different door.
+        // Failing to ask is not an answer. A rejection means the question never got through -- a
+        // spawn that failed, a locked database -- and treating that as "the event is gone" would
+        // close a listener that is still eligible to claim.
         let status;
         try {
           status = await receiver.status(wake.id);
@@ -553,20 +555,17 @@ export class WakeDeliverer {
           });
           continue;
         }
-        // An answer, and it says the event no longer exists.
         if (!status) return "GONE";
         const state = String(status.state ?? "");
-        // The turn ended. Conclusive for everyone.
         if (state === "FINISHED") return hosted ? "HOSTED" : "FINISHED";
-        // Still nobody's. KEEP LISTENING -- this is the state a clock must never end, because this
-        // process is still eligible to become the owner and closing could kill a turn it had just
-        // begun.
-        if (state === "PENDING") continue;
-        if (state !== "CLAIMED" && state !== "STARTED") continue;
-        // Whose is it? A person's own open chat taking the event is the good outcome and needs
-        // nothing from us. This child hosting it is the case where leaving kills the turn.
-        const mine = Boolean(child?.pid) && status.owner_pid === child.pid;
-        if (!mine) return hosted ? "HANDED_OVER" : "RELEASED";
+        // Still queued: nobody has taken it, so this listener is still the reason one might.
+        if (state === "PENDING" || state === "CLAIMED") {
+          if (state === "CLAIMED" && !status.owner_alive) return "OWNER_DIED";
+          continue;
+        }
+        // Being run right now. Whether by this listener's session or another owner's is not
+        // knowable from here and does not matter: leaving could kill it.
+        if (!status.owner_alive) return "OWNER_DIED";
         hosted = true;
       }
     } catch (error) {
