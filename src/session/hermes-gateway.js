@@ -292,15 +292,48 @@ export class HermesGateway {
     return { pid: this.child.pid, startedAt: await processStartedAt(this.child.pid) };
   }
 
+  // KILLING THE HANDLE IS NOT KILLING HERMES.
+  //
+  // The process this class spawns is frequently not the process that runs Hermes. A virtualenv's
+  // python.exe is a launcher shim that starts the real interpreter as its child, and on Windows
+  // terminating the shim leaves that interpreter running -- holding a session lease, a database
+  // handle, and its share of memory, with nothing left that knows about it.
+  //
+  // Measured: the real-process matrix reported two surviving tui_gateway interpreters after a case
+  // whose gateways had all been closed. The earlier hygiene check probed the launcher handles, saw
+  // them gone, and called it clean -- which is how this leaked unnoticed for as long as it did.
+  //
+  // So the escalation kills the TREE, not the handle. The graceful path is unchanged: end stdin,
+  // ask the process to exit, and only reach for the tree if it does not.
+  async #killTree(pid) {
+    if (!pid) return;
+    const { execFile } = await import("node:child_process");
+    await new Promise((resolve) => {
+      if (process.platform === "win32") {
+        execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => resolve());
+      } else {
+        // The child was not started in its own group, so the tree is walked by the OS instead.
+        execFile("pkill", ["-KILL", "-P", String(pid)], () => resolve());
+      }
+    });
+  }
+
   async close() {
     if (!this.child || this.exit) return;
-    try { this.child.stdin.end(); } catch { /* already gone */ }
     const child = this.child;
+    const pid = child.pid;
+    try { child.stdin.end(); } catch { /* already gone */ }
+    let exited = false;
     await new Promise((resolve) => {
-      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } resolve(); }, 5_000);
+      const timer = setTimeout(resolve, 5_000);
       if (typeof timer.unref === "function") timer.unref();
-      child.once("exit", () => { clearTimeout(timer); resolve(); });
+      child.once("exit", () => { exited = true; clearTimeout(timer); resolve(); });
       try { child.kill(); } catch { clearTimeout(timer); resolve(); }
     });
+    // Unconditionally, even on a clean exit: the handle exiting says nothing about the interpreter
+    // it launched. A tree kill against an already-dead pid is a no-op, so this costs nothing when
+    // there was nothing to clean up.
+    await this.#killTree(pid);
+    if (!exited) { try { child.kill("SIGKILL"); } catch { /* gone */ } }
   }
 }

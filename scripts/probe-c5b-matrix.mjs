@@ -285,13 +285,37 @@ ${row.marker}`;
     return this;
   }
 
+  // MATCHED BY THIS CASE'S OWN PROFILE, NEVER BY A NAME.
+  //
+  // The first version matched any process whose command line CONTAINED "tui_gateway". That matched
+  // its own diagnostic command -- whose source code contains the string -- and, far worse, it
+  // matched the operator's real Hermes install, which teardown then SIGKILLed as a stray. A sweep
+  // that identifies victims by substring will eventually kill something that merely resembles its
+  // target.
+  //
+  // Identity is now HERMES_HOME: every gateway this case starts is given a home no other process on
+  // the machine uses, so a process belonging to this case can be named exactly rather than guessed
+  // at. Anything whose environment does not say this home is somebody else's and is never touched.
   async liveInterpreters() {
     const { execFileSync } = await import("node:child_process");
+    const script = [
+      "import psutil, json, os, sys",
+      "home = os.path.abspath(sys.argv[1]).lower()",
+      "me = os.getpid()",
+      "out = []",
+      "for p in psutil.process_iter(['pid', 'cmdline']):",
+      "    if p.info['pid'] == me: continue",
+      "    cl = ' '.join(p.info.get('cmdline') or [])",
+      "    if 'tui_gateway.entry' not in cl: continue",
+      "    try: env = p.environ()",
+      "    except Exception: continue",
+      "    h = env.get('HERMES_HOME') or ''",
+      "    if h and os.path.abspath(h).lower() == home: out.append(p.info['pid'])",
+      "print(json.dumps(out))",
+    ].join(String.fromCharCode(10));
     try {
-      const out = execFileSync(PYTHON, ["-c",
-        "import psutil,json;print(json.dumps([p.pid for p in psutil.process_iter(['cmdline']) "
-        + "if 'tui_gateway.entry' in ' '.join(p.info.get('cmdline') or [])]))",
-      ], { cwd: FORK, encoding: "utf8", timeout: 60_000 });
+      const out = execFileSync(PYTHON, ["-c", script, this.home],
+        { cwd: FORK, encoding: "utf8", timeout: 60_000 });
       return JSON.parse(out.trim());
     } catch { return []; }
   }
