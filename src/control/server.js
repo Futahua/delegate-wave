@@ -15,6 +15,7 @@ import { CodexManagerBackend } from "../manager/backend.js";
 import { AutonomousSessionService } from "../session/service.js";
 import { SessionDriver } from "../session/driver.js";
 import { SessionWatcher } from "../session/watcher.js";
+import { HermesExternalTurns } from "../session/hermes-external-turns.js";
 import { WakeDeliverer } from "../session/wake.js";
 import { HermesGateway } from "../session/hermes-gateway.js";
 import { SafeIntegrator } from "../integration/safe.js";
@@ -247,7 +248,23 @@ export async function startControlServer({
     ? new WakeDeliverer({
       db: dispatcher.db,
       gateway: () => new HermesGateway(),
-      allowSubmit: process.env.DELEGATE_WAVE_WAKE_SUBMIT === "1",
+      // TWO TRANSPORTS, TWO SWITCHES, AND THE OLD ONE CANNOT TURN ON THE NEW.
+      //
+      // DELEGATE_WAVE_WAKE_SUBMIT authorised THIS runtime to write directly into somebody's
+      // conversation. The routed transport does not do that at all -- it hands an event to Hermes
+      // and lets the session's own owner run it -- so the old flag's safety argument says nothing
+      // about the new path, and reusing it would silently carry a decision made about one mechanism
+      // over to a different one.
+      //
+      // When the routed transport is enabled it is the ONLY transport. There is no fallback to
+      // direct submit on a missing capability or an unreachable adapter: that would reinstate the
+      // concurrency hazard the per-session lease was built to remove, triggered by a downgrade or a
+      // wrong interpreter path rather than by anybody deciding anything.
+      allowEnqueue: process.env.DELEGATE_WAVE_WAKE_ENQUEUE === "1",
+      externalTurns: () => new HermesExternalTurns(),
+      allowSubmit: process.env.DELEGATE_WAVE_WAKE_ENQUEUE === "1"
+        ? false
+        : process.env.DELEGATE_WAVE_WAKE_SUBMIT === "1",
       onEvent: (kind, payload) => {
         recordEvent(dispatcher.db, { kind, entityType: "job", entityId: "runtime", payload });
       },

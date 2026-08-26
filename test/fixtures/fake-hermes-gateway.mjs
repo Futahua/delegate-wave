@@ -68,6 +68,10 @@ function handle(request) {
     if (script.resumeFails) return err(id, 4007, "session not found");
     resumedDurable = params.session_id;
     const state = load();
+    // Counted so a test can assert that a resume-only kick actually resumed. Without it, "it must
+    // resume" is unfalsifiable and passes even if the kick does nothing at all.
+    state.resumes = (state.resumes ?? 0) + 1;
+    save(state);
     return ok(id, {
       session_id: RUNTIME,
       resumed: params.session_id,

@@ -49,7 +49,33 @@
 // check-then-submit would reintroduce the exact race it appears to close. The future typed BUSY at
 // `prompt.submit` is the atomic gate; here, BUSY is an ordinary outcome that leaves the wake
 // PENDING, not an error.
+//
+// TWO DELIVERY PROTOCOLS LIVE IN THIS FILE, AND ONLY ONE OF THEM RUNS.
+//
+// SUBMITTED is legacy direct-submit evidence. It means delegate-wave itself handed prompt.submit to
+// a Hermes gateway it spawned, so the gateway-liveness recovery below applies to THAT protocol only.
+// It is retained for A/B forensics and is not reachable from the routed path.
+//
+// ENQUEUED is the current protocol. It means wake.id exists as a row in Hermes'
+// session_external_turns inbox; the session's own live owner runs the turn, in its own process, on
+// its own schedule. No gateway of ours hosts it, so nothing about our child processes says anything
+// about whether that turn is progressing. The receiver is asked instead.
+//
+// THERE IS NO FALLBACK FROM ENQUEUED TO SUBMITTED. Not on a missing capability, not on an adapter
+// failure, not on a timeout. Falling back to a transport that works reads as robustness and would
+// silently reinstate the concurrency architecture the per-session lease exists to remove -- set off
+// by nothing more than a Hermes downgrade or a wrong interpreter path. Unavailable means WAIT.
+//
+// AND THE RECEIVER'S IN-PROGRESS STATE IS NOT A PARTIAL DELIVERY.
+//
+// Under direct submit, a durable marker with no assistant reply could only mean the turn had
+// stopped: this process had submitted it and this process's own life had ended. On the routed path
+// the turn belongs to somebody else, and marker-without-reply is the ordinary shape of a turn still
+// being reasoned about. Classifying it would turn every healthy long turn into a PARTIAL and block
+// the watch over a conversation where nothing has gone wrong. So STARTED with a live owner never
+// reaches classifyHistory at all.
 import { recordEvent, transaction } from "../db.js";
+import { HermesExternalTurns } from "./hermes-external-turns.js";
 import { HermesGateway } from "./hermes-gateway.js";
 import { ALIVE, DEAD, probeProcess, selfIdentity } from "./liveness.js";
 
@@ -62,12 +88,30 @@ const now = () => new Date().toISOString();
 // only when the question is asked, never what the answer is allowed to be.
 const DEFAULT_INVESTIGATE_AFTER_MS = 60_000;
 
+// How long a kick waits to find out whether anybody took the event, and how often it asks.
+//
+// Not a delivery deadline. The kick is finished the moment the question is answered either way:
+// somebody took it, or nobody did and this pass has nothing more to offer. A longer wait would only
+// hold a resumed session open while a person's own chat was being fenced off from it.
+const DEFAULT_KICK_WAIT_MS = 15_000;
+const KICK_POLL_MS = 500;
+
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
 // The capability Hermes must positively report before a single wake may be submitted.
 //
 // Named here rather than passed in, because the whole point is that delegate-wave cannot be
 // configured into believing a receiver is safe. Today no Hermes reports it, so submission stays off
 // even with the environment flag set -- which is the correct behaviour, not a gap.
 export const REQUIRED_CAPABILITY = "per_session_exclusive_submit";
+
+// What the ROUTED path demands, and it is both of them.
+//
+// The lease proves only that concurrent writers to one session are fenced. A build can enforce that
+// and have no inbox at all -- in which case every enqueued event sits forever with nothing able to
+// consume it, and the queue stalls silently rather than failing. Two guarantees, two names, and a
+// receiver that does not report one of them is a receiver this path will not use.
+export const REQUIRED_CAPABILITIES = ["per_session_exclusive_submit", "session_external_turns_v1"];
 
 // What the durable transcript says about one marker.
 //
@@ -139,6 +183,16 @@ export class WakeDeliverer {
     // The one line that changes when Hermes can refuse a second writer. Off by default, on purpose:
     // see the header.
     allowSubmit = false,
+    // The routed path. Its own switch, deliberately not a repurposing of allowSubmit: the two
+    // protocols have different safety arguments, and a flag that used to mean "you may write
+    // directly into a session" must not silently come to mean something else.
+    allowEnqueue = false,
+    externalTurns = () => new HermesExternalTurns(),
+    // "Make sure SOME owner exists for this session" -- a separate concern from reading what the
+    // receiver says, and injected so a failure in one is never mistaken for a failure in the other.
+    // Null disables it entirely, which is what the reconciliation tests use.
+    kick = undefined,
+    kickWaitMs = DEFAULT_KICK_WAIT_MS,
     investigateAfterMs = DEFAULT_INVESTIGATE_AFTER_MS,
     // A HARD CANCELLATION POLICY, off by default, and not a timeout in any softer sense.
     //
@@ -157,6 +211,10 @@ export class WakeDeliverer {
     this.db = db;
     this.gatewayFactory = gateway;
     this.allowSubmit = allowSubmit;
+    this.allowEnqueue = allowEnqueue;
+    this.externalTurns = externalTurns;
+    this.kick = kick === undefined ? (wake) => this.resumeKick(wake) : kick;
+    this.kickWaitMs = kickWaitMs;
     this.investigateAfterMs = investigateAfterMs;
     this.turnDeadlineMs = turnDeadlineMs;
     this.probe = probe;
@@ -256,9 +314,18 @@ export class WakeDeliverer {
   // Back to the queue, with why. Not a failure state: BUSY, an unreachable gateway and a withheld
   // submission are all ordinary conditions on this path, and all of them mean the same thing --
   // nothing was delivered, and the same wake is still the right thing to say.
+  // Every trace of BOTH protocols is cleared, not just the one this runtime happened to use.
+  //
+  // The schema forbids a PENDING row carrying enqueued_at, and forbids any row claiming both
+  // transports at once. Clearing only some of the fields would be rejected outright -- or, if a
+  // CHECK were ever relaxed, would leave a row that recovery reads under the wrong protocol's rules.
+  // A release must never manufacture the other protocol's evidence either: nothing here writes
+  // submitted_at.
   release(wake, reason) {
     this.db.prepare(
-      `UPDATE wake_outbox SET state = 'PENDING', last_error = ?, submitted_at = NULL,
+      `UPDATE wake_outbox SET state = 'PENDING', last_error = ?,
+                              submitted_at = NULL, enqueued_at = NULL,
+                              last_receiver_state = NULL, last_receiver_observed_at = NULL,
                               owner_pid = NULL, owner_started_at = NULL,
                               gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
        WHERE id = ?`,
@@ -269,11 +336,15 @@ export class WakeDeliverer {
   // the handling is identical -- stop, and let a person look -- while the reason a person needs in
   // order to act is completely different. One means nothing answered; the other means somebody else
   // spoke first and attribution is no longer possible from this side.
-  #settle(wake, verdict, { runtimeSessionId = null } = {}) {
+  #settle(wake, verdict, { runtimeSessionId = null, detail: explicit = null } = {}) {
     const state = verdict === "AMBIGUOUS" ? "PARTIAL" : verdict;
-    const detail = verdict === "AMBIGUOUS"
+    // An explicit reason wins. The routed path halts for causes the direct one cannot produce -- a
+    // turn the receiver says finished normally without leaving a marker, a forced teardown whose
+    // transcript may simply be missing its tail -- and "no assistant reply" would describe none of
+    // them to the person who has to look.
+    const detail = explicit ?? (verdict === "AMBIGUOUS"
       ? "ambiguous: another user turn arrived before any answer, so no reply can be attributed to this wake"
-      : null;
+      : null);
     transaction(this.db, () => {
       this.db.prepare(
         `UPDATE wake_outbox SET state = ?, reconciled_at = ?, last_error = COALESCE(?, last_error),
@@ -311,6 +382,13 @@ export class WakeDeliverer {
   //
   // Two independent refusals, reported separately so the operator sees which one is speaking.
   async #withholdReason(gateway) {
+    if (this.allowEnqueue) {
+      const capabilities = await gateway.capabilities();
+      const missing = REQUIRED_CAPABILITIES.filter((name) => capabilities?.[name] !== true);
+      if (!missing.length) return null;
+      // Withheld, never downgraded. The wake stays queued and this runtime asks again later.
+      return `Hermes does not report ${missing.join(" and ")}; the event would be queued with nothing able to consume it`;
+    }
     if (!this.allowSubmit) return "submission is not enabled for this runtime";
     const capabilities = await gateway.capabilities();
     if (capabilities?.[REQUIRED_CAPABILITY] === true) return null;
@@ -325,8 +403,203 @@ export class WakeDeliverer {
     ).run(child.pid, child.startedAt ?? null, now(), wake.id);
   }
 
-  // One wake, start to finish.
+  // MAKES SURE SOMEBODY IS LISTENING. IT NEVER DELIVERS ANYTHING.
+  //
+  // An event addressed to a session nobody has open would sit in the inbox forever: the poller that
+  // drains it belongs to a live session, and if there is no live session there is no poller. So a
+  // resumed gateway is started, purely to bring one into existence.
+  //
+  // WHAT IT MUST NOT DO, and why each would undo the architecture:
+  //
+  //   prompt.submit  would be this process writing into the conversation again -- the exact second
+  //                  writer the lease exists to refuse, reintroduced through the back door of the
+  //                  mechanism built to avoid it.
+  //   lazy = true    defers the agent build, and the poller starts only when the agent does. The
+  //                  session would be live, own nothing, and drain nothing.
+  //
+  // It resumes, and waits to see who ends up owning the event.
+  //
+  // THE KICK'S LIFETIME IS NOT EVIDENCE. If nobody has taken the event by the time it gives up,
+  // nothing unsafe has happened and a later pass may kick again. But if OUR child is the one that
+  // took it, closing would kill the turn it is hosting -- so it stays until that turn ends.
+  async resumeKick(wake) {
+    const gateway = this.gatewayFactory();
+    try {
+      await gateway.start();
+      await gateway.resume(wake.hermes_session_id);
+      const child = await gateway.identity().catch(() => null);
+      const receiver = this.externalTurns();
+      const deadline = Date.now() + this.kickWaitMs;
+      let mine = false;
+      while (Date.now() < deadline) {
+        await sleep(KICK_POLL_MS);
+        const status = await receiver.status(wake.id).catch(() => null);
+        const state = String(status?.state ?? "");
+        // Somebody already finished it, or it went back to the queue. Either way this kick is done.
+        if (!status || state === "FINISHED" || state === "PENDING") {
+          if (state !== "PENDING") return state === "FINISHED" ? "FINISHED" : "GONE";
+          continue;
+        }
+        if (state === "CLAIMED" || state === "STARTED") {
+          // Whose is it? A person's own open chat taking the event is the good case and needs
+          // nothing from us; this child hosting it is the case where leaving would kill the turn.
+          mine = Boolean(child?.pid) && status.owner_pid === child.pid;
+          break;
+        }
+      }
+      if (!mine) return "RELEASED";
+      // Ours. Hold the session open until the turn it is running has ended, or until ownership
+      // disappears -- a turn cannot be hosted by a process that has stopped hosting it.
+      for (;;) {
+        await sleep(KICK_POLL_MS);
+        const status = await receiver.status(wake.id).catch(() => null);
+        const state = String(status?.state ?? "");
+        if (!status || state === "FINISHED" || state === "PENDING") return "HOSTED";
+        if (status.owner_pid !== child.pid) return "HANDED_OVER";
+      }
+    } catch (error) {
+      // A kick that cannot start is not a delivery failure. The event is still queued and still
+      // correct; some later pass, or a person opening the chat, will provide an owner.
+      this.#event("WAKE_KICK_FAILED", wake, { error: String(error.message).slice(0, 200) });
+      return "FAILED";
+    } finally {
+      await gateway.close();
+    }
+  }
+
+  // Records what the receiver last said. DIAGNOSTIC ONLY.
+  //
+  // Named so it cannot be mistaken for delegate-wave's own lifecycle: these are observations of a
+  // remote process, true when they were read and possibly false now. Every decision re-reads the
+  // receiver rather than trusting this.
+  #recordReceiver(wake, status) {
+    this.db.prepare(
+      `UPDATE wake_outbox SET last_receiver_state = ?, last_receiver_observed_at = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(status?.state ?? null, now(), now(), wake.id);
+  }
+
+  // What the receiver says has become of one enqueued event.
+  //
+  // Cheap by construction: the transcript is only opened for the states where it can decide
+  // something. An event still queued, still claimed, or being reasoned about right now is answered
+  // by the receiver alone.
+  async #observe(wake) {
+    const receiver = this.externalTurns();
+    const status = await receiver.status(wake.id);
+    this.#recordReceiver(wake, status);
+
+    // We recorded handing this over, and the receiver has never heard of it. That is not "nothing
+    // happened" -- it is two systems disagreeing about what was said, most often a HERMES_HOME
+    // pointing somewhere other than the one that hosts the conversation. Stopping is the only
+    // honest response; retrying would be acting on a disagreement as though it were evidence.
+    if (!status) {
+      this.#settle(wake, "PARTIAL", {
+        detail: "the receiver has no record of this event, so what became of it cannot be established here",
+      });
+      return "PARTIAL";
+    }
+
+    const state = String(status.state ?? "");
+    // Queued, or taken but not yet started. Hermes recovers a claim whose holder died on its own,
+    // so a dead CLAIMED needs nothing from us either.
+    if (state === "PENDING" || state === "CLAIMED") {
+      if (state === "PENDING" && this.kick) await this.kick(wake);
+      return "WAITING";
+    }
+    // A turn in progress, in somebody else's process. The transcript is deliberately not read.
+    if (state === "STARTED" && status.owner_alive) return "WAITING";
+
+    const gateway = this.gatewayFactory();
+    try {
+      await gateway.start();
+      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
+      if (state === "STARTED") {
+        // The owner is gone. Hermes writes STARTED as soon as the turn thread launches and that
+        // thread persists the user row afterwards, so a process killed in between leaves exactly
+        // this: a turn that began, and a transcript with no evidence of it. Absence of the marker
+        // is the only evidence that authorises saying it again, and this is the only branch acting
+        // on it.
+        if (verdict === "ABSENT") {
+          await receiver.reopen(wake.id, "owner died before the marker became durable");
+          if (this.kick) await this.kick(wake);
+          this.#event("WAKE_REOPENED", wake, {});
+          return "REOPENED";
+        }
+        this.#settle(wake, verdict, { runtimeSessionId });
+        return verdict;
+      }
+      // FINISHED. The turn ended, so canonical history is complete and may be judged -- with one
+      // exception in each direction, both of which fail closed.
+      if (verdict === "ABSENT") {
+        const outcome = String(status.outcome ?? "");
+        const detail = outcome === "session_closed"
+          ? "the hosting session was closed mid-turn; a forced close may leave state unflushed, so an absent marker does not prove nothing happened"
+          : "the receiver reports the turn started and ended normally, but its marker is not in canonical history";
+        this.#settle(wake, "PARTIAL", { detail });
+        return "PARTIAL";
+      }
+      this.#settle(wake, verdict, { runtimeSessionId });
+      return verdict;
+    } finally {
+      await gateway.close();
+    }
+  }
+
+  // Hands the event to the receiver and stops. Nothing here delivers anything.
+  async #enqueue(wake, runtimeSessionId) {
+    await this.externalTurns().enqueue({
+      eventId: wake.id,
+      sessionKey: wake.hermes_session_id,
+      body: wake.body,
+      source: "delegate-wave",
+    });
+    // The owner columns are CLEARED on this transition, on purpose. They mean "this delegate-wave
+    // process is driving the delivery", and from here on it is not: the receiver is. Leaving them
+    // set would offer the direct-submit recovery model a row it must never reason about.
+    this.db.prepare(
+      `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ?, runtime_session_id = ?,
+                              owner_pid = NULL, owner_started_at = NULL,
+                              gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
+       WHERE id = ?`,
+    ).run(now(), runtimeSessionId, now(), wake.id);
+    this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
+    if (this.kick) await this.kick(wake);
+    return "ENQUEUED";
+  }
+
+  // One wake, start to finish, by whichever protocol this runtime is configured for.
   async deliver(wake) {
+    if (this.allowEnqueue) return this.#deliverByEnqueue(wake);
+    return this.#deliverBySubmit(wake);
+  }
+
+  async #deliverByEnqueue(wake) {
+    const gateway = this.gatewayFactory();
+    this.driving.add(wake.id);
+    try {
+      await gateway.start();
+      // Reconcile first, exactly as the direct path does: whatever this process believed about its
+      // own last attempt, the transcript is the authority.
+      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
+      if (verdict !== "ABSENT") {
+        this.#settle(wake, verdict, { runtimeSessionId });
+        return verdict;
+      }
+      const withheld = await this.#withholdReason(gateway);
+      if (withheld) {
+        this.release(wake, `submission withheld: ${withheld}`);
+        this.#event("WAKE_SUBMISSION_WITHHELD", wake, { reason: wake.reason, withheld });
+        return "WITHHELD";
+      }
+      return await this.#enqueue(wake, runtimeSessionId);
+    } finally {
+      this.driving.delete(wake.id);
+      await gateway.close();
+    }
+  }
+
+  async #deliverBySubmit(wake) {
     const gateway = this.gatewayFactory();
     this.driving.add(wake.id);
     try {
@@ -502,6 +775,21 @@ export class WakeDeliverer {
   // conversation, so resolving it is what unblocks delivery rather than competing with it.
   async pass({ atMs = Date.now() } = {}) {
     const outcomes = [];
+    // Events already with the receiver, first. They hold the single-flight slot for their
+    // conversation, so resolving them is what unblocks delivery rather than competing with it --
+    // the same reason reconciliation precedes claiming below.
+    const enqueued = this.db.prepare(
+      "SELECT * FROM wake_outbox WHERE state = 'ENQUEUED' ORDER BY updated_at",
+    ).all();
+    for (const wake of enqueued) {
+      try {
+        outcomes.push({ wakeId: wake.id, outcome: await this.#observe(wake) });
+      } catch (error) {
+        // An unreachable receiver says nothing about the event. The row stays ENQUEUED and the next
+        // pass asks again; concluding anything from a failed question would be a guess.
+        if (this.onError) this.onError(error, wake.id);
+      }
+    }
     for (const wake of await this.reclaimable({ atMs })) {
       try {
         outcomes.push({ wakeId: wake.id, outcome: await this.reconcile(wake) });

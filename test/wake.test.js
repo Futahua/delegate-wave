@@ -816,3 +816,427 @@ test("a wake survives the process that enqueued it", async (t) => {
     reopened.close();
   }
 });
+
+// ── THE EXTERNAL-TURN ROUTE ────────────────────────────────────────────────────────────────────
+//
+// A different protocol with a different failure model, and the tests are written first because the
+// dangerous mistakes here all LOOK correct. Reading a healthy in-progress turn as a partial
+// delivery, falling back to direct submit when a capability is missing, replaying an event because
+// a transcript looks empty after a forced close -- each is a reasonable-sounding inference that
+// would put a second writer into somebody's conversation or say one thing twice.
+//
+// The receiver is a stub here, because what is under test is delegate-wave's reading of the
+// receiver's answers. That the answers themselves are true of real Hermes is proved separately, by
+// probes that race actual gateway processes.
+
+// The capabilities the routed path demands. BOTH, always: the lease proves only that concurrent
+// writers are fenced, and a build can enforce that while having no inbox at all -- in which case
+// every enqueued event would sit forever with nothing to consume it.
+const ROUTED = { per_session_exclusive_submit: true, session_external_turns_v1: true };
+
+// A stand-in for the Hermes inbox: rows, and a record of what was asked of it.
+//
+// `set` states a receiver observation as a PREMISE. That is the point of these cases -- delegate-wave
+// cannot influence what the receiver says, and every branch below is about what it does with an
+// answer it has to take at face value.
+function fakeExternalTurns() {
+  const rows = new Map();
+  const calls = [];
+  const adapter = {
+    enqueue: async ({ eventId, sessionKey, body }) => {
+      calls.push({ op: "enqueue", eventId });
+      if (rows.has(eventId)) return false;
+      rows.set(eventId, {
+        event_id: eventId, target_session_key: sessionKey, body,
+        state: "PENDING", owner_alive: false, owner_pid: null, outcome: null,
+      });
+      return true;
+    },
+    status: async (eventId) => {
+      calls.push({ op: "status", eventId });
+      return rows.get(eventId) ?? null;
+    },
+    reopen: async (eventId, reason) => {
+      calls.push({ op: "reopen", eventId, reason });
+      const row = rows.get(eventId);
+      if (!row || row.state !== "STARTED" || row.owner_alive) return false;
+      Object.assign(row, { state: "PENDING", owner_alive: false, owner_pid: null });
+      return true;
+    },
+    present: async () => true,
+  };
+  return {
+    factory: () => adapter,
+    calls,
+    set: (eventId, patch) => rows.set(eventId, { ...(rows.get(eventId) ?? { event_id: eventId }), ...patch }),
+    get: (eventId) => rows.get(eventId) ?? null,
+    count: () => rows.size,
+    ops: (op) => calls.filter((call) => call.op === op),
+  };
+}
+
+// A deliverer on the routed path. The kick is stubbed out by default: "make sure some owner exists"
+// is a separate concern from "read what the receiver says", and mixing them makes a failure in
+// either one look like a failure in the other.
+function routedDeliverer(w, fake, ext, { allowEnqueue = true, kick = async () => {}, ...rest } = {}) {
+  return new WakeDeliverer({
+    db: w.db,
+    gateway: fake ? fake.factory() : () => { throw new Error("the gateway must not be constructed here"); },
+    externalTurns: ext.factory,
+    allowEnqueue,
+    probe: fakeLiveness().probe,
+    identity: fakeLiveness().identity,
+    investigateAfterMs: 0,
+    kick,
+    ...rest,
+  });
+}
+
+// One wake, already handed to the receiver.
+function enqueuedWake(w, ext, { messages = [] } = {}) {
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_routed");
+  w.setState(sessionId, "COMPLETED");
+  assert.equal(w.watcher.pass().length, 1);
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  w.db.prepare(
+    `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ?, owner_pid = NULL,
+                            owner_started_at = NULL, gateway_pid = NULL, gateway_started_at = NULL,
+                            updated_at = ? WHERE id = ?`,
+  ).run(new Date().toISOString(), new Date().toISOString(), wake.id);
+  ext.set(wake.id, { state: "PENDING", owner_alive: false, outcome: null });
+  return { wake, sessionId, messages };
+}
+
+test("an in-progress remote turn is left alone, and its history is not even consulted", async (t) => {
+  // THE SINGLE MOST DANGEROUS MISREADING ON THIS PATH.
+  //
+  // Under direct submit, a durable marker with no assistant reply could only mean the turn had
+  // stopped -- the submitting process's own life had already ended. Here the turn is hosted by
+  // somebody else and marker-without-reply is the ORDINARY mid-turn state. Classifying it would
+  // turn every healthy long turn into a PARTIAL, block the watch, and demand a person look at a
+  // conversation where nothing has gone wrong.
+  //
+  // So the transcript is not read at all: the gateway factory throws if anything tries.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: 9000 });
+
+  const deliverer = routedDeliverer(w, null, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["WAITING"]);
+
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED");
+  assert.equal(after.reconciled_at, null, "nothing was concluded, so nothing may claim to have been");
+  assert.equal(after.last_receiver_state, "STARTED");
+  assert.equal(ext.ops("reopen").length, 0);
+});
+
+test("a receiver that has not started the event yet is simply waited on", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  for (const state of ["PENDING", "CLAIMED"]) {
+    const { wake } = enqueuedWake(w, ext);
+    ext.set(wake.id, { state, owner_alive: state === "CLAIMED" });
+    const deliverer = routedDeliverer(w, null, ext);
+    const outcomes = await deliverer.pass();
+    assert.deepEqual(outcomes.map((o) => o.outcome), ["WAITING"], `receiver ${state}`);
+    assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
+  }
+});
+
+test("a dead owner that never wrote the marker is the one case that authorises a replay", async (t) => {
+  // The measured window: Hermes writes STARTED as soon as the turn thread launches, and that thread
+  // persists the user row afterwards. A process killed in between leaves a row claiming a turn began
+  // and a transcript containing no evidence of one -- observed at kill delays up to 0.4s.
+  //
+  // Absence of the marker is the ONLY evidence that authorises saying it again, and this is the only
+  // branch that acts on it.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  const { wake } = enqueuedWake(w, ext);
+  ext.set(wake.id, { state: "STARTED", owner_alive: false, owner_pid: 9001 });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["REOPENED"]);
+
+  assert.deepEqual(ext.ops("reopen").map((call) => call.eventId), [wake.id]);
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED", "still the same event, awaiting an owner that can run it");
+  assert.equal(after.reconciled_at, null);
+});
+
+test("a dead owner that DID write the marker is judged on the transcript, never replayed", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  fake.append({ role: "user", text: wake.marker });
+  fake.append({ role: "assistant", text: "done - the exporter emits json now" });
+  ext.set(wake.id, { state: "STARTED", owner_alive: false, owner_pid: 9002 });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["DELIVERED"]);
+
+  assert.equal(ext.ops("reopen").length, 0, "a turn that spoke must never be said again");
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "DELIVERED");
+  assert.notEqual(after.reconciled_at, null);
+});
+
+test("a finished turn is judged on the transcript", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  fake.append({ role: "user", text: wake.marker });
+  fake.append({ role: "assistant", text: "got it" });
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["DELIVERED"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "DELIVERED");
+});
+
+test("a finished turn whose marker never appeared is an invariant breach, not permission to retry", async (t) => {
+  // FAIL-CLOSED, and deliberately not symmetric with the dead-STARTED case above.
+  //
+  // FINISHED/completed is the receiver asserting that a turn started AND ended normally. If the
+  // marker is not in the transcript after that, something that was supposed to be true is not, and
+  // the honest response is to stop. Treating it as "nothing happened, retry" would be inferring the
+  // safest-sounding explanation for evidence that does not support any explanation.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["PARTIAL"]);
+
+  assert.equal(ext.ops("reopen").length, 0);
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "PARTIAL");
+  assert.match(after.last_error, /ended normally/i, "and says which invariant broke, not merely that one did");
+  assert.equal(
+    w.db.prepare("SELECT state FROM session_watches WHERE id = ?").get(wake.watch_id).state,
+    "BLOCKED",
+    "a person decides what happened here",
+  );
+});
+
+test("a forced close with no marker halts rather than replaying", async (t) => {
+  // A teardown is NOT the measured "killed before the marker persisted" case. Finalization runs
+  // precisely because state may be unflushed, so an absent marker here does not prove nothing
+  // happened -- tools may have run, and the transcript may simply be missing its tail.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "session_closed" });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["PARTIAL"]);
+
+  assert.equal(ext.ops("reopen").length, 0, "absence after a forced close authorises nothing");
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "PARTIAL");
+  assert.match(after.last_error, /closed/i);
+});
+
+test("another user speaking first is unknowable here too", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  fake.append({ role: "user", text: wake.marker });
+  fake.append({ role: "user", text: "actually, do the other thing first" });
+  fake.append({ role: "assistant", text: "sure" });
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["AMBIGUOUS"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PARTIAL");
+});
+
+test("either capability missing withholds the wake, and never falls back to submitting", async (t) => {
+  // THE FALLBACK THAT MUST NOT EXIST.
+  //
+  // Falling back to the legacy transport when the new one is unavailable reads as robustness. It
+  // would silently reinstate the concurrency architecture the lease exists to remove, triggered by
+  // nothing more than a Hermes downgrade or a wrong interpreter path. A missing capability means
+  // WAIT.
+  for (const capabilities of [
+    { per_session_exclusive_submit: true },
+    { session_external_turns_v1: true },
+    {},
+  ]) {
+    await t.test(`capabilities ${JSON.stringify(capabilities)}`, async (t2) => {
+      const w = world(t2);
+      const ext = fakeExternalTurns();
+      const sessionId = w.session();
+      registerWatch(w.db, sessionId, "hermes_gate");
+      w.setState(sessionId, "COMPLETED");
+      w.watcher.pass();
+      const fake = fakeGateway(w, { capabilities });
+
+      const deliverer = routedDeliverer(w, fake, ext);
+      assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["WITHHELD"]);
+
+      const after = w.db.prepare("SELECT * FROM wake_outbox").get();
+      assert.equal(after.state, "PENDING");
+      assert.equal(after.enqueued_at, null);
+      assert.equal(after.submitted_at, null, "the legacy transport must not have been used");
+      assert.equal(ext.ops("enqueue").length, 0);
+      assert.equal(fake.transcript().submits, 0);
+    });
+  }
+});
+
+test("the enqueue itself is idempotent, so one wake is one event", async (t) => {
+  // The producer may not know whether its last attempt landed. Saying it again must not create a
+  // second announcement -- which is why the event id is the wake id and not a fresh one per attempt.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_dup");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
+
+  // Hand it back to the queue as if the enqueue had been retried, and deliver again.
+  deliverer.release(w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id), "retrying");
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
+
+  assert.equal(ext.count(), 1, "one wake, one event in the receiver");
+  assert.equal(ext.ops("enqueue").length, 2, "and it was genuinely offered twice");
+  assert.equal(fake.transcript().submits, 0, "no direct submit on this path, ever");
+});
+
+test("releasing a routed wake leaves no evidence of a delivery it did not make", async (t) => {
+  // The schema forbids a PENDING row carrying enqueued_at, and forbids any row claiming both
+  // transports. A release that cleared only some of the fields would either be rejected outright or
+  // -- worse, if a CHECK were ever relaxed -- leave a row that recovery reads under the wrong
+  // protocol's rules.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  w.db.prepare(
+    "UPDATE wake_outbox SET last_receiver_state = 'CLAIMED', last_receiver_observed_at = ? WHERE id = ?",
+  ).run(new Date().toISOString(), wake.id);
+
+  const deliverer = routedDeliverer(w, null, ext);
+  deliverer.release(w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id), "adapter unreachable");
+
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "PENDING");
+  assert.equal(after.enqueued_at, null);
+  assert.equal(after.submitted_at, null, "a release must never manufacture the other protocol's evidence");
+  assert.equal(after.last_receiver_state, null);
+  assert.equal(after.last_receiver_observed_at, null);
+  assert.equal(after.last_error, "adapter unreachable");
+});
+
+// ── THE RESUME-ONLY KICK ───────────────────────────────────────────────────────────────────────
+//
+// Kept apart from the reconciliation cases above on purpose. "Read what the receiver says" and
+// "make sure somebody is listening" fail for completely different reasons, and a test that mixed
+// them would report either failure as the other during the live run.
+
+test("the kick resumes and never writes", async (t) => {
+  // The two forbidden moves, and each would undo a different half of the architecture: a submit is
+  // this process becoming the second writer the lease exists to refuse, and a lazy resume produces
+  // a live session with no agent and therefore no poller to drain anything.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 400 });
+  const outcome = await deliverer.resumeKick(wake);
+
+  assert.equal(outcome, "RELEASED", "nobody took it, and that is a complete answer");
+  assert.equal(fake.transcript().submits, 0, "a kick must never submit");
+  assert.ok((fake.transcript().resumes ?? 0) >= 1, "but it must actually resume");
+});
+
+test("a kick whose own child took the event stays until the turn ends", async (t) => {
+  // Closing here would kill the turn this child is hosting -- the same mechanism that produced the
+  // PARTIAL boundary in the original research, arrived at from the other direction.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 5_000 });
+  // The child's pid is whatever the spawned stub reports, so the premise is stated by mirroring it
+  // back: this event is owned by whichever process the kick started.
+  const gatewayPid = await (async () => {
+    const probe = fake.factory()();
+    await probe.start();
+    const identity = await probe.identity();
+    await probe.close();
+    return identity.pid;
+  })();
+  // Not literally the same process as the kick's child, so the kick must decide on the pid it sees
+  // rather than on the pid recorded here: ownership by a DIFFERENT process is the release case.
+  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: gatewayPid + 1 });
+
+  const outcome = await deliverer.resumeKick(wake);
+  assert.equal(outcome, "RELEASED", "another process owns the turn, so this child has no reason to stay");
+});
+
+test("a kick gives up quietly when nothing can host the session", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED, resumeFails: true });
+
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 400 });
+  const outcome = await deliverer.resumeKick(wake);
+
+  assert.equal(outcome, "FAILED");
+  // The event is untouched: a kick that could not start says nothing about it, and some later pass
+  // -- or a person simply opening the chat -- will provide an owner.
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED");
+  assert.equal(after.reconciled_at, null);
+});
+
+test("a finished event needs no kick at all", async (t) => {
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 5_000 });
+  assert.equal(await deliverer.resumeKick(wake), "FINISHED");
+});
+
+test("delivery kicks once, and observation only kicks while nobody has taken it", async (t) => {
+  // The kick exists to create an owner, so it belongs exactly where there is none. Kicking a
+  // CLAIMED or STARTED event would spawn a gateway to be fenced by the owner already running it.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const kicked = [];
+  const { wake } = enqueuedWake(w, ext);
+
+  const deliverer = routedDeliverer(w, null, ext, { kick: async (row) => { kicked.push(row.id); } });
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
+  await deliverer.pass();
+  assert.deepEqual(kicked, [wake.id], "queued with no owner: kick");
+
+  kicked.length = 0;
+  for (const [state, alive] of [["CLAIMED", true], ["CLAIMED", false], ["STARTED", true]]) {
+    ext.set(wake.id, { state, owner_alive: alive, owner_pid: 7000 });
+    await deliverer.pass();
+  }
+  assert.deepEqual(kicked, [], "somebody already has it: no kick");
+});
