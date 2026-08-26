@@ -424,8 +424,12 @@ export class WakeDeliverer {
     this.kicks.set(wake.id, running);
   }
 
-  // Waits for every kick this deliverer started. For shutdown, and for tests that need the
-  // listener's own outcome rather than the pass's.
+  // Waits for every kick this deliverer started.
+  //
+  // NOT a shutdown barrier. A correct kick parks indefinitely while its event is still PENDING, so
+  // awaiting this on the way out would hang a process that is behaving exactly as designed. It is
+  // for tests, whose receiver eventually goes terminal. Wiring it into shutdown needs cancellation
+  // first, which this does not have.
   async settleKicks() {
     await Promise.all([...this.kicks.values()]);
   }
@@ -453,8 +457,15 @@ export class WakeDeliverer {
     const gateway = this.gatewayFactory();
     try {
       await gateway.start();
-      await gateway.resume(wake.hermes_session_id);
+      // IDENTITY BEFORE RESUME, and the order matters for the same reason as everything else here.
+      //
+      // Resuming starts a live session, and a live session's poller may claim the event. If this
+      // process could not say who it is, it could never recognise its OWN claim -- it would read
+      // "somebody has it" and close, killing the turn its own child had just begun. So identity is
+      // established while nothing has been resumed and closing is still free.
       const child = await gateway.identity().catch(() => null);
+      if (!child?.pid) return "FAILED";
+      await gateway.resume(wake.hermes_session_id);
       const receiver = this.externalTurns();
       let hosted = false;
       for (;;) {
@@ -462,7 +473,24 @@ export class WakeDeliverer {
         // later pass may kick again.
         if (gateway.exit) return hosted ? "HOSTED" : "GATEWAY_GONE";
         await sleep(KICK_POLL_MS);
-        const status = await receiver.status(wake.id).catch(() => null);
+        // FAILING TO ASK IS NOT AN ANSWER.
+        //
+        // The adapter distinguishes these deliberately: a resolved null means Hermes was asked and
+        // has no such event, while a rejection means the question never got through -- a spawn that
+        // failed, a locked database, a timeout. Collapsing them would make a transient hiccup mean
+        // "the event is gone", and the cleanup below would then close a listener that is still
+        // eligible to claim -- killing a turn this process never observed starting. That is the
+        // clock bug again, arriving through a different door.
+        let status;
+        try {
+          status = await receiver.status(wake.id);
+        } catch (error) {
+          this.#event("WAKE_KICK_STATUS_FAILED", wake, {
+            error: String(error.message).slice(0, 200),
+          });
+          continue;
+        }
+        // An answer, and it says the event no longer exists.
         if (!status) return "GONE";
         const state = String(status.state ?? "");
         // The turn ended. Conclusive for everyone.

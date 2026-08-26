@@ -1369,3 +1369,111 @@ test("no gateway opened for looking is alive when the event becomes consumable",
     `the reading gateway must be closed first, got ${timeline.join(" -> ")}`,
   );
 });
+
+test("a status read that FAILS is not evidence that the event is gone", async (t) => {
+  // THE CLOCK BUG ARRIVING THROUGH A DIFFERENT DOOR.
+  //
+  // The adapter distinguishes two things on purpose: a resolved null means Hermes was asked and has
+  // no such event, and a rejection means the question never got through -- a spawn that failed, a
+  // locked database, a timeout. An earlier version collapsed both with `.catch(() => null)`, so a
+  // transient hiccup meant "the event is gone" and the listener was closed. That listener is still
+  // ELIGIBLE to claim, and may have claimed and started the event in the same moment -- so closing
+  // it kills a turn this process never observed starting.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
+
+  let closed = false;
+  const watched = () => {
+    const gateway = fake.factory()();
+    const close = gateway.close.bind(gateway);
+    gateway.close = async () => { closed = true; return close(); };
+    return gateway;
+  };
+
+  let failing = true;
+  const inner = ext.factory();
+  const flaky = {
+    ...inner,
+    status: async (eventId) => {
+      if (failing) throw new Error("could not reach Hermes: database is locked");
+      return inner.status(eventId);
+    },
+  };
+
+  const deliverer = new WakeDeliverer({
+    db: w.db,
+    gateway: watched,
+    externalTurns: () => flaky,
+    allowEnqueue: true,
+    probe: fakeLiveness().probe,
+    identity: fakeLiveness().identity,
+    investigateAfterMs: 0,
+    kick: null,
+  });
+
+  const running = deliverer.resumeKick(wake);
+  await new Promise((resolve) => { setTimeout(resolve, 2_500); });
+  assert.equal(closed, false, "a question that failed must not close an eligible listener");
+
+  // The question starts working again, and the answer is that this listener owns the turn.
+  const listenerPid = fake.transcript().lastResumePid ?? null;
+  assert.ok(listenerPid, "the kick resumed a session");
+  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: listenerPid });
+  failing = false;
+
+  const held = await Promise.race([
+    running.then(() => "ENDED"),
+    new Promise((resolve) => { setTimeout(() => resolve("HOLDING"), 1_500); }),
+  ]);
+  assert.equal(held, "HOLDING", "and it hosts that turn to the end");
+
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+  assert.equal(await running, "HOSTED");
+});
+
+test("a listener that cannot say who it is never resumes at all", async (t) => {
+  // If this process cannot establish its own identity, it can never recognise its OWN claim: it
+  // would read "somebody has it", conclude the event belongs to a stranger, and close -- killing
+  // the turn its own child had just begun. The same evidence collapse as the status bug, arriving
+  // from the ownership side.
+  //
+  // So identity is established BEFORE anything is resumed, while nothing is live and closing is
+  // still free. A listener that does not know itself must never become eligible to claim.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
+
+  const anonymous = () => {
+    const gateway = fake.factory()();
+    gateway.identity = async () => { throw new Error("cannot read process start time"); };
+    return gateway;
+  };
+
+  const deliverer = new WakeDeliverer({
+    db: w.db,
+    gateway: anonymous,
+    externalTurns: ext.factory,
+    allowEnqueue: true,
+    probe: fakeLiveness().probe,
+    identity: fakeLiveness().identity,
+    investigateAfterMs: 0,
+    kick: null,
+  });
+
+  const running = deliverer.resumeKick(wake);
+  // Driven to a terminal answer after a moment, so that a listener which WRONGLY resumed ends up
+  // reporting an outcome rather than parking -- a hung test proves the same thing far less clearly
+  // than a failed assertion naming what went wrong.
+  setTimeout(() => ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" }), 1_200);
+
+  assert.equal(await running, "FAILED", "an anonymous listener must give up before resuming");
+  assert.equal(
+    fake.transcript().resumes ?? 0, 0,
+    "and must not have resumed: a session it could not recognise itself owning is one it could kill",
+  );
+});
