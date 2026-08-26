@@ -88,12 +88,18 @@ const now = () => new Date().toISOString();
 // only when the question is asked, never what the answer is allowed to be.
 const DEFAULT_INVESTIGATE_AFTER_MS = 60_000;
 
-// How long a kick waits to find out whether anybody took the event, and how often it asks.
+// How often a kick asks who owns its event. There is deliberately no deadline.
 //
-// Not a delivery deadline. The kick is finished the moment the question is answered either way:
-// somebody took it, or nobody did and this pass has nothing more to offer. A longer wait would only
-// hold a resumed session open while a person's own chat was being fenced off from it.
-const DEFAULT_KICK_WAIT_MS = 15_000;
+// TIME MUST NOT AUTHORISE DESTROYING A GATEWAY THAT IS STILL ELIGIBLE TO TAKE THE EVENT.
+//
+// An earlier version gave up after fifteen seconds and closed. Between its last observation of
+// PENDING and that close there is no fence, so its own poller could claim and start the event in
+// the gap -- and closing then kills a turn nobody ever observed starting, manufacturing exactly the
+// dead-STARTED-with-no-marker boundary this whole design exists to avoid.
+//
+// So a kick ends only on a conclusive answer about ownership. While the event is still PENDING it
+// keeps listening, which can leave a fenced listener parked while a person's own chat is busy.
+// Wakes are rare; a parked process is much cheaper than a deliberately created crash boundary.
 const KICK_POLL_MS = 500;
 
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -192,7 +198,6 @@ export class WakeDeliverer {
     // receiver says, and injected so a failure in one is never mistaken for a failure in the other.
     // Null disables it entirely, which is what the reconciliation tests use.
     kick = undefined,
-    kickWaitMs = DEFAULT_KICK_WAIT_MS,
     investigateAfterMs = DEFAULT_INVESTIGATE_AFTER_MS,
     // A HARD CANCELLATION POLICY, off by default, and not a timeout in any softer sense.
     //
@@ -214,7 +219,10 @@ export class WakeDeliverer {
     this.allowEnqueue = allowEnqueue;
     this.externalTurns = externalTurns;
     this.kick = kick === undefined ? (wake) => this.resumeKick(wake) : kick;
-    this.kickWaitMs = kickWaitMs;
+    // Kicks in flight, by wake. A kick parks until ownership is settled, so without this every pass
+    // over a still-PENDING event would spawn another listener for the same conversation -- an
+    // unbounded number of gateways, each one fenced, none of them wrong individually.
+    this.kicks = new Map();
     this.investigateAfterMs = investigateAfterMs;
     this.turnDeadlineMs = turnDeadlineMs;
     this.probe = probe;
@@ -403,6 +411,25 @@ export class WakeDeliverer {
     ).run(child.pid, child.startedAt ?? null, now(), wake.id);
   }
 
+  // Starts a kick without waiting for it, and never starts a second one for the same event.
+  //
+  // Not awaited, because a kick now parks until ownership is conclusive: awaiting it would stall
+  // every other delivery behind one conversation whose owner happens to be busy.
+  #startKick(wake) {
+    if (!this.kick || this.kicks.has(wake.id)) return;
+    const running = Promise.resolve()
+      .then(() => this.kick(wake))
+      .catch((error) => { if (this.onError) this.onError(error, wake.id); })
+      .finally(() => { this.kicks.delete(wake.id); });
+    this.kicks.set(wake.id, running);
+  }
+
+  // Waits for every kick this deliverer started. For shutdown, and for tests that need the
+  // listener's own outcome rather than the pass's.
+  async settleKicks() {
+    await Promise.all([...this.kicks.values()]);
+  }
+
   // MAKES SURE SOMEBODY IS LISTENING. IT NEVER DELIVERS ANYTHING.
   //
   // An event addressed to a session nobody has open would sit in the inbox forever: the poller that
@@ -429,39 +456,57 @@ export class WakeDeliverer {
       await gateway.resume(wake.hermes_session_id);
       const child = await gateway.identity().catch(() => null);
       const receiver = this.externalTurns();
-      const deadline = Date.now() + this.kickWaitMs;
-      let mine = false;
-      while (Date.now() < deadline) {
-        await sleep(KICK_POLL_MS);
-        const status = await receiver.status(wake.id).catch(() => null);
-        const state = String(status?.state ?? "");
-        // Somebody already finished it, or it went back to the queue. Either way this kick is done.
-        if (!status || state === "FINISHED" || state === "PENDING") {
-          if (state !== "PENDING") return state === "FINISHED" ? "FINISHED" : "GONE";
-          continue;
-        }
-        if (state === "CLAIMED" || state === "STARTED") {
-          // Whose is it? A person's own open chat taking the event is the good case and needs
-          // nothing from us; this child hosting it is the case where leaving would kill the turn.
-          mine = Boolean(child?.pid) && status.owner_pid === child.pid;
-          break;
-        }
-      }
-      if (!mine) return "RELEASED";
-      // Ours. Hold the session open until the turn it is running has ended, or until ownership
-      // disappears -- a turn cannot be hosted by a process that has stopped hosting it.
+      let hosted = false;
       for (;;) {
+        // The listener itself died. Nothing is concluded from that: the event is untouched and a
+        // later pass may kick again.
+        if (gateway.exit) return hosted ? "HOSTED" : "GATEWAY_GONE";
         await sleep(KICK_POLL_MS);
         const status = await receiver.status(wake.id).catch(() => null);
-        const state = String(status?.state ?? "");
-        if (!status || state === "FINISHED" || state === "PENDING") return "HOSTED";
-        if (status.owner_pid !== child.pid) return "HANDED_OVER";
+        if (!status) return "GONE";
+        const state = String(status.state ?? "");
+        // The turn ended. Conclusive for everyone.
+        if (state === "FINISHED") return hosted ? "HOSTED" : "FINISHED";
+        // Still nobody's. KEEP LISTENING -- this is the state a clock must never end, because this
+        // process is still eligible to become the owner and closing could kill a turn it had just
+        // begun.
+        if (state === "PENDING") continue;
+        if (state !== "CLAIMED" && state !== "STARTED") continue;
+        // Whose is it? A person's own open chat taking the event is the good outcome and needs
+        // nothing from us. This child hosting it is the case where leaving kills the turn.
+        const mine = Boolean(child?.pid) && status.owner_pid === child.pid;
+        if (!mine) return hosted ? "HANDED_OVER" : "RELEASED";
+        hosted = true;
       }
     } catch (error) {
       // A kick that cannot start is not a delivery failure. The event is still queued and still
       // correct; some later pass, or a person opening the chat, will provide an owner.
       this.#event("WAKE_KICK_FAILED", wake, { error: String(error.message).slice(0, 200) });
       return "FAILED";
+    } finally {
+      await gateway.close();
+    }
+  }
+
+  // Opens a gateway ONLY to look, and closes it before anything can act on what it saw.
+  //
+  // A resumed gateway is a live session, and a live session runs the external-turn poller. So the
+  // process opened merely to READ canonical history is itself eligible to become the OWNER of the
+  // very event about to be enqueued -- and it would then be holding a turn when this function's own
+  // cleanup killed it. That destroys a turn nobody observed starting, which is precisely the
+  // dead-STARTED-with-no-marker state the rest of this file is built to avoid creating.
+  //
+  // Nothing that makes an event consumable -- enqueue, reopen -- may run while a gateway opened for
+  // looking is still alive.
+  async #inspect(wake, { capabilities = false } = {}) {
+    const gateway = this.gatewayFactory();
+    try {
+      await gateway.start();
+      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
+      const withheld = capabilities && verdict === "ABSENT"
+        ? await this.#withholdReason(gateway)
+        : null;
+      return { verdict, runtimeSessionId, withheld };
     } finally {
       await gateway.close();
     }
@@ -501,19 +546,21 @@ export class WakeDeliverer {
     }
 
     const state = String(status.state ?? "");
-    // Queued, or taken but not yet started. Hermes recovers a claim whose holder died on its own,
-    // so a dead CLAIMED needs nothing from us either.
+    // Nobody has it, or whoever had it is gone. BOTH need a listener.
+    //
+    // Hermes recovers a dead claim itself, but only from inside a live session's poller -- and if
+    // the process that claimed it died with no chat open, there is no poller anywhere to do the
+    // recovering. The row would sit CLAIMED forever with nothing able to notice. A claim held by a
+    // LIVE owner is the one that needs nothing from us.
     if (state === "PENDING" || state === "CLAIMED") {
-      if (state === "PENDING" && this.kick) await this.kick(wake);
+      if (state === "PENDING" || !status.owner_alive) this.#startKick(wake);
       return "WAITING";
     }
     // A turn in progress, in somebody else's process. The transcript is deliberately not read.
     if (state === "STARTED" && status.owner_alive) return "WAITING";
 
-    const gateway = this.gatewayFactory();
-    try {
-      await gateway.start();
-      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
+    {
+      const { verdict, runtimeSessionId } = await this.#inspect(wake);
       if (state === "STARTED") {
         // The owner is gone. Hermes writes STARTED as soon as the turn thread launches and that
         // thread persists the user row afterwards, so a process killed in between leaves exactly
@@ -521,8 +568,10 @@ export class WakeDeliverer {
         // is the only evidence that authorises saying it again, and this is the only branch acting
         // on it.
         if (verdict === "ABSENT") {
+          // The reading gateway is already closed by #inspect, so it cannot be the one that takes
+          // the event this call is about to make consumable again.
           await receiver.reopen(wake.id, "owner died before the marker became durable");
-          if (this.kick) await this.kick(wake);
+          this.#startKick(wake);
           this.#event("WAKE_REOPENED", wake, {});
           return "REOPENED";
         }
@@ -541,8 +590,6 @@ export class WakeDeliverer {
       }
       this.#settle(wake, verdict, { runtimeSessionId });
       return verdict;
-    } finally {
-      await gateway.close();
     }
   }
 
@@ -564,7 +611,7 @@ export class WakeDeliverer {
        WHERE id = ?`,
     ).run(now(), runtimeSessionId, now(), wake.id);
     this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
-    if (this.kick) await this.kick(wake);
+    this.#startKick(wake);
     return "ENQUEUED";
   }
 
@@ -575,18 +622,16 @@ export class WakeDeliverer {
   }
 
   async #deliverByEnqueue(wake) {
-    const gateway = this.gatewayFactory();
     this.driving.add(wake.id);
     try {
-      await gateway.start();
       // Reconcile first, exactly as the direct path does: whatever this process believed about its
-      // own last attempt, the transcript is the authority.
-      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
+      // own last attempt, the transcript is the authority. Read and capability check happen in one
+      // CLOSED scope -- see #inspect for why nothing may be enqueued while that gateway is alive.
+      const { verdict, runtimeSessionId, withheld } = await this.#inspect(wake, { capabilities: true });
       if (verdict !== "ABSENT") {
         this.#settle(wake, verdict, { runtimeSessionId });
         return verdict;
       }
-      const withheld = await this.#withholdReason(gateway);
       if (withheld) {
         this.release(wake, `submission withheld: ${withheld}`);
         this.#event("WAKE_SUBMISSION_WITHHELD", wake, { reason: wake.reason, withheld });
@@ -595,7 +640,6 @@ export class WakeDeliverer {
       return await this.#enqueue(wake, runtimeSessionId);
     } finally {
       this.driving.delete(wake.id);
-      await gateway.close();
     }
   }
 

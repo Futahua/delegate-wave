@@ -1149,6 +1149,35 @@ test("releasing a routed wake leaves no evidence of a delivery it did not make",
 // "make sure somebody is listening" fail for completely different reasons, and a test that mixed
 // them would report either failure as the other during the live run.
 
+test("a parked kick is not joined by another on every pass", async (t) => {
+  // A kick parks until ownership is settled, so a pass that started a fresh one each time would
+  // spawn an unbounded number of listeners for one conversation -- each individually reasonable,
+  // collectively a fork bomb against a session nobody has open.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
+
+  let started = 0;
+  let release;
+  const parked = new Promise((resolve) => { release = resolve; });
+  const deliverer = routedDeliverer(w, null, ext, {
+    kick: async () => { started += 1; await parked; },
+  });
+
+  await deliverer.pass();
+  await deliverer.pass();
+  await deliverer.pass();
+  assert.equal(started, 1, "one listener for one event, however many passes");
+
+  release();
+  await deliverer.settleKicks();
+  await deliverer.pass();
+  assert.equal(started, 2, "and a new one only once the previous has finished");
+  release();
+  await deliverer.settleKicks();
+});
+
 test("the kick resumes and never writes", async (t) => {
   // The two forbidden moves, and each would undo a different half of the architecture: a submit is
   // this process becoming the second writer the lease exists to refuse, and a lazy resume produces
@@ -1157,39 +1186,76 @@ test("the kick resumes and never writes", async (t) => {
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
+  // Somebody else's chat owns it, which is a conclusive answer and ends the kick.
+  ext.set(wake.id, { state: "CLAIMED", owner_alive: true, owner_pid: 31337 });
 
-  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 400 });
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
   const outcome = await deliverer.resumeKick(wake);
 
-  assert.equal(outcome, "RELEASED", "nobody took it, and that is a complete answer");
+  assert.equal(outcome, "RELEASED", "another process owns it, so this listener has no reason to stay");
   assert.equal(fake.transcript().submits, 0, "a kick must never submit");
   assert.ok((fake.transcript().resumes ?? 0) >= 1, "but it must actually resume");
+});
+
+test("a kick keeps listening while nobody has taken the event", async (t) => {
+  // THE STATE A CLOCK MUST NEVER END.
+  //
+  // The earlier version gave up after fifteen seconds and closed. Between its last look at PENDING
+  // and that close there is no fence: its own poller can claim and start the event in the gap, and
+  // closing then kills a turn nobody ever observed starting -- manufacturing the exact
+  // dead-STARTED-with-no-marker boundary the rest of this file exists to avoid.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
+
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
+  const running = deliverer.resumeKick(wake);
+  const parked = await Promise.race([
+    running.then(() => "ENDED"),
+    new Promise((resolve) => { setTimeout(() => resolve("STILL LISTENING"), 2_500); }),
+  ]);
+  assert.equal(parked, "STILL LISTENING", "a pending event must not be abandoned on a timer");
+
+  // And it ends the moment the answer is conclusive.
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+  assert.equal(await running, "FINISHED");
 });
 
 test("a kick whose own child took the event stays until the turn ends", async (t) => {
   // Closing here would kill the turn this child is hosting -- the same mechanism that produced the
   // PARTIAL boundary in the original research, arrived at from the other direction.
+  //
+  // The premise is stated by reading the pid the stub recorded when the kick resumed it, so the
+  // test is about the pid the kick ACTUALLY sees rather than one asserted from outside.
   const w = world(t);
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
+  ext.set(wake.id, { state: "PENDING", owner_alive: false });
 
-  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 5_000 });
-  // The child's pid is whatever the spawned stub reports, so the premise is stated by mirroring it
-  // back: this event is owned by whichever process the kick started.
-  const gatewayPid = await (async () => {
-    const probe = fake.factory()();
-    await probe.start();
-    const identity = await probe.identity();
-    await probe.close();
-    return identity.pid;
-  })();
-  // Not literally the same process as the kick's child, so the kick must decide on the pid it sees
-  // rather than on the pid recorded here: ownership by a DIFFERENT process is the release case.
-  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: gatewayPid + 1 });
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
+  const running = deliverer.resumeKick(wake);
 
-  const outcome = await deliverer.resumeKick(wake);
-  assert.equal(outcome, "RELEASED", "another process owns the turn, so this child has no reason to stay");
+  // Wait for the listener to exist, then declare it the owner.
+  const deadline = Date.now() + 20_000;
+  let listenerPid = null;
+  while (Date.now() < deadline && !listenerPid) {
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    listenerPid = fake.transcript().lastResumePid ?? null;
+  }
+  assert.ok(listenerPid, "the kick must have resumed a session");
+  ext.set(wake.id, { state: "STARTED", owner_alive: true, owner_pid: listenerPid });
+
+  const held = await Promise.race([
+    running.then(() => "ENDED"),
+    new Promise((resolve) => { setTimeout(() => resolve("HOLDING"), 2_000); }),
+  ]);
+  assert.equal(held, "HOLDING", "it hosts the turn, so it must not close while the turn runs");
+
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+  assert.equal(await running, "HOSTED");
 });
 
 test("a kick gives up quietly when nothing can host the session", async (t) => {
@@ -1198,7 +1264,7 @@ test("a kick gives up quietly when nothing can host the session", async (t) => {
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED, resumeFails: true });
 
-  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 400 });
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
   const outcome = await deliverer.resumeKick(wake);
 
   assert.equal(outcome, "FAILED");
@@ -1216,7 +1282,7 @@ test("a finished event needs no kick at all", async (t) => {
   ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
   const fake = fakeGateway(w, { capabilities: ROUTED });
 
-  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined, kickWaitMs: 5_000 });
+  const deliverer = routedDeliverer(w, fake, ext, { kick: undefined });
   assert.equal(await deliverer.resumeKick(wake), "FINISHED");
 });
 
@@ -1234,9 +1300,72 @@ test("delivery kicks once, and observation only kicks while nobody has taken it"
   assert.deepEqual(kicked, [wake.id], "queued with no owner: kick");
 
   kicked.length = 0;
-  for (const [state, alive] of [["CLAIMED", true], ["CLAIMED", false], ["STARTED", true]]) {
+  for (const [state, alive] of [["CLAIMED", true], ["STARTED", true]]) {
     ext.set(wake.id, { state, owner_alive: alive, owner_pid: 7000 });
     await deliverer.pass();
   }
-  assert.deepEqual(kicked, [], "somebody already has it: no kick");
+  assert.deepEqual(kicked, [], "a LIVE owner already has it: no kick");
+
+  // A CLAIM WHOSE HOLDER DIED STILL NEEDS A LISTENER.
+  //
+  // Hermes recovers a dead claim itself -- but only from inside a live session's poller. If the
+  // process that claimed it died with no chat open, there is no poller anywhere to do the
+  // recovering, and the row sits CLAIMED forever with nothing able to notice.
+  ext.set(wake.id, { state: "CLAIMED", owner_alive: false, owner_pid: 7000 });
+  await deliverer.pass();
+  assert.deepEqual(kicked, [wake.id], "a dead claim with no listener would wedge");
+});
+
+test("no gateway opened for looking is alive when the event becomes consumable", async (t) => {
+  // THE BUG THIS ENCODES.
+  //
+  // A resumed gateway is a live session, and a live session runs the external-turn poller. The
+  // gateway opened merely to READ canonical history is therefore itself eligible to become the
+  // OWNER of the event about to be enqueued -- and it would be holding that turn when the reading
+  // code's own cleanup closed it. Killing a gateway kills the turn it hosts, so this destroys a
+  // turn nobody observed starting and leaves precisely the dead-STARTED-with-no-marker state the
+  // rest of this file exists to avoid creating.
+  //
+  // The ordering IS the fix, so the ordering is what is asserted.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_order");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const timeline = [];
+  const watched = () => {
+    const gateway = fake.factory()();
+    const close = gateway.close.bind(gateway);
+    gateway.close = async () => { timeline.push("close"); return close(); };
+    return gateway;
+  };
+  const spyingExt = {
+    ...ext.factory(),
+    enqueue: async (args) => { timeline.push("enqueue"); return ext.factory().enqueue(args); },
+  };
+
+  const deliverer = new WakeDeliverer({
+    db: w.db,
+    gateway: watched,
+    externalTurns: () => spyingExt,
+    allowEnqueue: true,
+    probe: fakeLiveness().probe,
+    identity: fakeLiveness().identity,
+    investigateAfterMs: 0,
+    kick: null,
+  });
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
+
+  // BOTH must have happened before the order means anything. indexOf returns -1 for a missing
+  // entry, and -1 is less than every real index -- so comparing positions alone would pass
+  // vacuously in exactly the case this test exists to catch: a gateway still open at enqueue time.
+  assert.ok(timeline.includes("enqueue"), `the event was enqueued, got ${timeline.join(" -> ")}`);
+  assert.ok(timeline.includes("close"), `the reading gateway was closed, got ${timeline.join(" -> ")}`);
+  assert.ok(
+    timeline.indexOf("close") < timeline.indexOf("enqueue"),
+    `the reading gateway must be closed first, got ${timeline.join(" -> ")}`,
+  );
 });

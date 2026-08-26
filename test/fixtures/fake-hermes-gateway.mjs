@@ -71,6 +71,9 @@ function handle(request) {
     // Counted so a test can assert that a resume-only kick actually resumed. Without it, "it must
     // resume" is unfalsifiable and passes even if the kick does nothing at all.
     state.resumes = (state.resumes ?? 0) + 1;
+    // Which process resumed, so a test can name the kick's own listener as the event's owner and
+    // check the decision the kick ACTUALLY makes rather than one asserted from outside.
+    state.lastResumePid = process.pid;
     save(state);
     return ok(id, {
       session_id: RUNTIME,
