@@ -75,6 +75,7 @@
 // the watch over a conversation where nothing has gone wrong. So STARTED with a live owner never
 // reaches classifyHistory at all.
 import { recordEvent, transaction } from "../db.js";
+import { HermesCanonicalHistory } from "./hermes-canonical-history.js";
 import { HermesExternalTurns } from "./hermes-external-turns.js";
 import { HermesGateway } from "./hermes-gateway.js";
 import { ALIVE, DEAD, probeProcess, selfIdentity } from "./liveness.js";
@@ -117,7 +118,15 @@ export const REQUIRED_CAPABILITY = "per_session_exclusive_submit";
 // and have no inbox at all -- in which case every enqueued event sits forever with nothing able to
 // consume it, and the queue stalls silently rather than failing. Two guarantees, two names, and a
 // receiver that does not report one of them is a receiver this path will not use.
-export const REQUIRED_CAPABILITIES = ["per_session_exclusive_submit", "session_external_turns_v1"];
+export const REQUIRED_CAPABILITIES = [
+  "per_session_exclusive_submit",
+  "session_external_turns_v1",
+  // Without this the producer cannot SEE its own delivery: a routed wake is a hidden row, and
+  // every other history API returns the display projection, which drops exactly those. A build
+  // with the lease and the inbox but not this one accepts wakes and makes them look permanently
+  // undelivered -- that build existed, so this is not defensive pessimism.
+  "session_canonical_history_v1",
+];
 
 // What the durable transcript says about one marker.
 //
@@ -174,6 +183,48 @@ export function classifyHistory(messages, marker) {
   return "PARTIAL";
 }
 
+// A ROUTED wake, found by EXACT IDENTITY rather than by looking for its marker.
+//
+// classifyHistory above anchors on the newest user row CONTAINING the marker, which was right when
+// the transcript was the tip of one session. Canonical history spans the whole compression
+// lineage, and Hermes's compressor deliberately pins its summaries to role="user" -- so a
+// compaction row derived from a conversation that once contained a wake can itself be a user row
+// carrying that marker. Substring matching would anchor on the derivative, and everything after it
+// -- the real reply -- would be read as belonging to something else.
+//
+// Three conditions, and each rules out a different impostor:
+//
+//   role === "user"           only a user row can BE the delivery
+//   display_kind === "hidden" the routed transport writes hidden rows; a summary that quotes the
+//                             marker is ordinary scaffolding, and compaction references are hidden
+//                             too, which is why this alone is not enough
+//   text === wake.body        byte equality with what was actually sent. A summary about a wake is
+//                             never byte-identical to the wake.
+//
+// Attribution after the anchor is unchanged: the next user turn still closes the window, and an
+// assistant turn reaching it still counts, for exactly the reasons documented above.
+export function classifyRoutedWake(messages, wake) {
+  const rows = Array.isArray(messages) ? messages : [];
+  const body = String(wake?.body ?? "");
+  let at = -1;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (row?.role !== "user") continue;
+    if (row?.display_kind !== "hidden") continue;
+    if (typeof row.text === "string" && row.text === body) { at = index; break; }
+  }
+  if (at < 0) return "ABSENT";
+  for (let index = at + 1; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row?.role === "user") return "AMBIGUOUS";
+    if (row?.role !== "assistant") continue;
+    const spoke = (typeof row.text === "string" && row.text.trim())
+      || row.reasoning || row.reasoning_content || row.reasoning_details || row.codex_reasoning_items;
+    if (spoke) return "DELIVERED";
+  }
+  return "PARTIAL";
+}
+
 // The verdicts that mean "stop, and let a person look".
 //
 // Kept as a set rather than a comparison so that adding a fourth unknowable outcome cannot silently
@@ -194,6 +245,7 @@ export class WakeDeliverer {
     // directly into a session" must not silently come to mean something else.
     allowEnqueue = false,
     externalTurns = () => new HermesExternalTurns(),
+    canonicalHistory = () => new HermesCanonicalHistory(),
     // "Make sure SOME owner exists for this session" -- a separate concern from reading what the
     // receiver says, and injected so a failure in one is never mistaken for a failure in the other.
     // Null disables it entirely, which is what the reconciliation tests use.
@@ -218,6 +270,7 @@ export class WakeDeliverer {
     this.allowSubmit = allowSubmit;
     this.allowEnqueue = allowEnqueue;
     this.externalTurns = externalTurns;
+    this.canonicalHistory = canonicalHistory;
     this.kick = kick === undefined ? (wake) => this.resumeKick(wake) : kick;
     // Kicks in flight, by wake. A kick parks until ownership is settled, so without this every pass
     // over a still-PENDING event would spawn another listener for the same conversation -- an
@@ -389,9 +442,19 @@ export class WakeDeliverer {
   // Why submission may not proceed, or null when it may.
   //
   // Two independent refusals, reported separately so the operator sees which one is speaking.
-  async #withholdReason(gateway) {
+  async #withholdReason(gateway = null) {
     if (this.allowEnqueue) {
-      const capabilities = await gateway.capabilities();
+      // Its own short-lived gateway when none was handed in. The routed path holds no gateway open
+      // any more, and a capability handshake creates no session.
+      const host = gateway ?? this.gatewayFactory();
+      const owned = !gateway;
+      let capabilities;
+      try {
+        if (owned) await host.start();
+        capabilities = await host.capabilities();
+      } finally {
+        if (owned) await host.close();
+      }
       const missing = REQUIRED_CAPABILITIES.filter((name) => capabilities?.[name] !== true);
       if (!missing.length) return null;
       // Withheld, never downgraded. The wake stays queued and this runtime asks again later.
@@ -516,29 +579,15 @@ export class WakeDeliverer {
     }
   }
 
-  // Opens a gateway ONLY to look, and closes it before anything can act on what it saw.
+  // THERE IS NO INSPECTION GATEWAY ANY MORE.
   //
-  // A resumed gateway is a live session, and a live session runs the external-turn poller. So the
-  // process opened merely to READ canonical history is itself eligible to become the OWNER of the
-  // very event about to be enqueued -- and it would then be holding a turn when this function's own
-  // cleanup killed it. That destroys a turn nobody observed starting, which is precisely the
-  // dead-STARTED-with-no-marker state the rest of this file is built to avoid creating.
+  // The routed path used to resume a session simply to read its transcript, which meant the act of
+  // LOOKING could consume an event addressed to that conversation and then destroy the turn it had
+  // started. session.canonical_history reads the durable record without creating a live session at
+  // all, so that whole hazard is gone rather than carefully sequenced around.
   //
-  // Nothing that makes an event consumable -- enqueue, reopen -- may run while a gateway opened for
-  // looking is still alive.
-  async #inspect(wake, { capabilities = false } = {}) {
-    const gateway = this.gatewayFactory();
-    try {
-      await gateway.start();
-      const { verdict, runtimeSessionId } = await this.#reconcileThrough(gateway, wake);
-      const withheld = capabilities && verdict === "ABSENT"
-        ? await this.#withholdReason(gateway)
-        : null;
-      return { verdict, runtimeSessionId, withheld };
-    } finally {
-      await gateway.close();
-    }
-  }
+  // HermesGateway.resume() now appears in exactly one place on this path: resumeKick, whose entire
+  // purpose is to create an owner. If it appears anywhere else, that is the bug.
 
   // Records what the receiver last said. DIAGNOSTIC ONLY.
   //
@@ -588,7 +637,9 @@ export class WakeDeliverer {
     if (state === "STARTED" && status.owner_alive) return "WAITING";
 
     {
-      const { verdict, runtimeSessionId } = await this.#inspect(wake);
+      const canonical = await this.canonicalHistory().read(wake.hermes_session_id);
+      const verdict = classifyRoutedWake(canonical.messages, wake);
+      const runtimeSessionId = canonical.resolvedSessionId;
       if (state === "STARTED") {
         // The owner is gone. Hermes writes STARTED as soon as the turn thread launches and that
         // thread persists the user row afterwards, so a process killed in between leaves exactly
@@ -596,7 +647,7 @@ export class WakeDeliverer {
         // is the only evidence that authorises saying it again, and this is the only branch acting
         // on it.
         if (verdict === "ABSENT") {
-          // The reading gateway is already closed by #inspect, so it cannot be the one that takes
+          // Nothing was resumed to read that history, so no session of ours is eligible to take
           // the event this call is about to make consumable again.
           await receiver.reopen(wake.id, "owner died before the marker became durable");
           this.#startKick(wake);
@@ -621,23 +672,71 @@ export class WakeDeliverer {
     }
   }
 
+  // Is the remote row the event we think it is?
+  //
+  // enqueue() is idempotent on event_id, which makes retrying safe and makes an ID MATCH alone
+  // meaningless: "a row with this id exists" would also be true if something else had written a
+  // different body under it. Adoption is the moment this producer stops driving and starts
+  // trusting, so it verifies every field it knows.
+  //
+  // A mismatch is never reinterpreted as absence. Absence authorises enqueueing; a mismatch means
+  // two systems disagree about what one identity refers to, and the only honest move is to stop.
+  #remoteMatches(remote, wake) {
+    return Boolean(remote)
+      && remote.event_id === wake.id
+      && remote.target_session_key === wake.hermes_session_id
+      && remote.source === "delegate-wave"
+      && remote.body === wake.body;
+  }
+
+  // Records local ENQUEUED, but only from the state this process actually left the row in.
+  //
+  // A compare-and-swap rather than a bare UPDATE: discovering a remote event is something two
+  // recovery paths can do simultaneously, and both would otherwise "adopt" it and carry on driving
+  // the same wake. The single-flight index would eventually refuse one of them, but borrowing the
+  // invariant from another layer is how a subtle state machine ends up depending on a constraint
+  // nobody remembers is load-bearing.
+  #adopt(wake, runtimeSessionId = null) {
+    const changed = this.db.prepare(
+      `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = COALESCE(enqueued_at, ?),
+                              runtime_session_id = COALESCE(?, runtime_session_id),
+                              owner_pid = NULL, owner_started_at = NULL,
+                              gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
+       WHERE id = ? AND state = 'PREPARING'`,
+    ).run(now(), runtimeSessionId, now(), wake.id).changes;
+    return changed === 1;
+  }
+
   // Hands the event to the receiver and stops. Nothing here delivers anything.
   async #enqueue(wake, runtimeSessionId) {
-    await this.externalTurns().enqueue({
+    const receiver = this.externalTurns();
+    // The answer is deliberately ignored. `false` means the id was already there, which is the
+    // ordinary outcome of a retry AND of another recovery path having created it between our
+    // status read and this call. Neither is an error, and neither is a receipt.
+    await receiver.enqueue({
       eventId: wake.id,
       sessionKey: wake.hermes_session_id,
       body: wake.body,
       source: "delegate-wave",
     });
-    // The owner columns are CLEARED on this transition, on purpose. They mean "this delegate-wave
-    // process is driving the delivery", and from here on it is not: the receiver is. Leaving them
-    // set would offer the direct-submit recovery model a row it must never reason about.
-    this.db.prepare(
-      `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ?, runtime_session_id = ?,
-                              owner_pid = NULL, owner_started_at = NULL,
-                              gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
-       WHERE id = ?`,
-    ).run(now(), runtimeSessionId, now(), wake.id);
+
+    // RECEIPT BY READBACK, not by return value.
+    //
+    // Hermes's INSERT OR IGNORE makes enqueueing idempotent, not observable: a `false` says
+    // something occupies this id, not that it is OUR event. So the row is read back and verified
+    // before this producer records that it handed anything over. Until that succeeds the wake
+    // stays PREPARING and recoverable -- claiming ENQUEUED on an unverified write is how a local
+    // record starts describing something that is not there.
+    const remote = await receiver.status(wake.id);
+    if (!this.#remoteMatches(remote, wake)) {
+      const detail = remote
+        ? "the receiver holds a different event under this id"
+        : "the receiver has no record of the event just enqueued";
+      this.release(wake, `enqueue not confirmed: ${detail}`);
+      this.#event("WAKE_ENQUEUE_UNCONFIRMED", wake, { detail });
+      return "UNCONFIRMED";
+    }
+    if (!this.#adopt(wake, runtimeSessionId)) return "LOST_CLAIM";
     this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
     this.#startKick(wake);
     return "ENQUEUED";
@@ -652,20 +751,45 @@ export class WakeDeliverer {
   async #deliverByEnqueue(wake) {
     this.driving.add(wake.id);
     try {
-      // Reconcile first, exactly as the direct path does: whatever this process believed about its
-      // own last attempt, the transcript is the authority. Read and capability check happen in one
-      // CLOSED scope -- see #inspect for why nothing may be enqueued while that gateway is alive.
-      const { verdict, runtimeSessionId, withheld } = await this.#inspect(wake, { capabilities: true });
+      // THE RECEIVER IS ASKED BEFORE THE TRANSCRIPT IS.
+      //
+      // A wake can already be with Hermes while this database still says PREPARING: the enqueue
+      // committed and the process died before recording it. Reading history first would find no
+      // marker -- the owner may not have run the turn yet -- and enqueue a second time under an id
+      // that already exists, learning nothing from the idempotent refusal.
+      const remote = await this.externalTurns().status(wake.id);
+      if (remote) {
+        if (!this.#remoteMatches(remote, wake)) {
+          // Two systems disagree about what one identity means. Never overwritten, never
+          // re-enqueued, never read as absence.
+          this.#settle(wake, "PARTIAL", {
+            detail: "integrity failure: the receiver holds a different event under this wake's id",
+          });
+          this.#event("WAKE_REMOTE_INTEGRITY_FAILURE", wake, {});
+          return "INTEGRITY_FAILURE";
+        }
+        if (!this.#adopt(wake)) return "LOST_CLAIM";
+        this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
+        return "ADOPTED";
+      }
+
+      // No remote event. Now the transcript decides -- READ, never resumed. A live session would
+      // run the poller, be eligible to consume events addressed to this conversation, and kill
+      // whatever turn it started when closed.
+      const canonical = await this.canonicalHistory().read(wake.hermes_session_id);
+      const verdict = classifyRoutedWake(canonical.messages, wake);
       if (verdict !== "ABSENT") {
-        this.#settle(wake, verdict, { runtimeSessionId });
+        this.#settle(wake, verdict, { runtimeSessionId: canonical.resolvedSessionId });
         return verdict;
       }
+
+      const withheld = await this.#withholdReason();
       if (withheld) {
         this.release(wake, `submission withheld: ${withheld}`);
         this.#event("WAKE_SUBMISSION_WITHHELD", wake, { reason: wake.reason, withheld });
         return "WITHHELD";
       }
-      return await this.#enqueue(wake, runtimeSessionId);
+      return await this.#enqueue(wake, canonical.resolvedSessionId);
     } finally {
       this.driving.delete(wake.id);
     }
@@ -826,6 +950,19 @@ export class WakeDeliverer {
   }
 
   async reconcile(wake) {
+    // A ROUTED wake stranded by a dead owner is not reconciled here.
+    //
+    // This path resumes a session and classifies with the legacy marker scan -- both wrong for the
+    // routed transport, and wrong in the direction that hides the failure: resuming creates a live
+    // owner eligible to consume events, and the display projection it reads can never contain a
+    // hidden row, so every routed wake would come back ABSENT.
+    //
+    // The correct recovery for a routed row IS the ordinary ingress, which asks the receiver
+    // first and is safe to repeat. So it goes back to the queue and the next pass runs it.
+    if (this.allowEnqueue && wake.state === "PREPARING") {
+      this.release(wake, "reconciled: owner is gone before the event was confirmed, ingress will re-run");
+      return "PENDING";
+    }
     const gateway = this.gatewayFactory();
     try {
       await gateway.start();

@@ -257,7 +257,7 @@ export class SessionWatcher {
       const alreadyQueued = this.db.prepare(
         `SELECT id FROM wake_outbox
          WHERE watch_id = ? AND reason = ? AND message_id IS ?
-           AND state IN ('PENDING', 'PREPARING', 'SUBMITTED')
+           AND state IN ('PENDING', 'PREPARING', 'SUBMITTED', 'ENQUEUED')
          ORDER BY created_at LIMIT 1`,
       ).get(row.watch_id, reason, messageId);
       if (alreadyQueued) {

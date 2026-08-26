@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { initializeDataRoot, openDatabase } from "../src/db.js";
 import { SessionWatcher, registerWatch, wakeMarker } from "../src/session/watcher.js";
-import { WakeDeliverer, classifyHistory, REQUIRED_CAPABILITY } from "../src/session/wake.js";
+import { WakeDeliverer, classifyHistory, classifyRoutedWake, REQUIRED_CAPABILITY } from "../src/session/wake.js";
 import { HermesGateway, isBusyRefusal, OWNERSHIP_REFUSAL_REASON } from "../src/session/hermes-gateway.js";
 import { ALIVE, DEAD, UNKNOWN } from "../src/session/liveness.js";
 
@@ -832,7 +832,32 @@ test("a wake survives the process that enqueued it", async (t) => {
 // The capabilities the routed path demands. BOTH, always: the lease proves only that concurrent
 // writers are fenced, and a build can enforce that while having no inbox at all -- in which case
 // every enqueued event would sit forever with nothing to consume it.
-const ROUTED = { per_session_exclusive_submit: true, session_external_turns_v1: true };
+const ROUTED = {
+  per_session_exclusive_submit: true,
+  session_external_turns_v1: true,
+  session_canonical_history_v1: true,
+};
+
+// Canonical history, served from the SAME transcript file the fake gateway writes.
+//
+// So a test still says "the conversation contains this" with fake.append(...), and the routed path
+// reads it the way production does -- through the evidence projection, without resuming anything.
+function fakeCanonicalHistory(fake, { resolvedSessionId = "resolved_tip" } = {}) {
+  return () => ({
+    read: async () => ({
+      sessionId: "stored",
+      resolvedSessionId,
+      messages: fake ? fake.transcript().messages : [],
+    }),
+  });
+}
+
+// A delivered routed wake, as it appears in canonical history: a hidden user row whose text is
+// EXACTLY the wake body. Tests must build it this way, because that exactness is the contract --
+// a compaction summary quoting the marker is not a delivery.
+function deliveredRow(wake) {
+  return { role: "user", display_kind: "hidden", text: wake.body };
+}
 
 // A stand-in for the Hermes inbox: rows, and a record of what was asked of it.
 //
@@ -843,11 +868,14 @@ function fakeExternalTurns() {
   const rows = new Map();
   const calls = [];
   const adapter = {
-    enqueue: async ({ eventId, sessionKey, body }) => {
+    // Stores every field the producer verifies on readback. An earlier version dropped `source`,
+    // and the verification correctly refused to adopt -- a stub that omits a field production
+    // depends on does not make the test lenient, it makes it wrong.
+    enqueue: async ({ eventId, sessionKey, body, source }) => {
       calls.push({ op: "enqueue", eventId });
       if (rows.has(eventId)) return false;
       rows.set(eventId, {
-        event_id: eventId, target_session_key: sessionKey, body,
+        event_id: eventId, target_session_key: sessionKey, body, source,
         state: "PENDING", owner_alive: false, owner_pid: null, outcome: null,
       });
       return true;
@@ -883,6 +911,7 @@ function routedDeliverer(w, fake, ext, { allowEnqueue = true, kick = async () =>
     db: w.db,
     gateway: fake ? fake.factory() : () => { throw new Error("the gateway must not be constructed here"); },
     externalTurns: ext.factory,
+    canonicalHistory: fakeCanonicalHistory(fake),
     allowEnqueue,
     probe: fakeLiveness().probe,
     identity: fakeLiveness().identity,
@@ -904,7 +933,10 @@ function enqueuedWake(w, ext, { messages = [] } = {}) {
                             owner_started_at = NULL, gateway_pid = NULL, gateway_started_at = NULL,
                             updated_at = ? WHERE id = ?`,
   ).run(new Date().toISOString(), new Date().toISOString(), wake.id);
-  ext.set(wake.id, { state: "PENDING", owner_alive: false, outcome: null });
+  ext.set(wake.id, {
+    event_id: wake.id, target_session_key: wake.hermes_session_id, body: wake.body,
+    source: "delegate-wave", state: "PENDING", owner_alive: false, outcome: null,
+  });
   return { wake, sessionId, messages };
 }
 
@@ -973,7 +1005,7 @@ test("a dead owner that DID write the marker is judged on the transcript, never 
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
-  fake.append({ role: "user", text: wake.marker });
+  fake.append(deliveredRow(wake));
   fake.append({ role: "assistant", text: "done - the exporter emits json now" });
   ext.set(wake.id, { state: "STARTED", owner_alive: false, owner_pid: 9002 });
 
@@ -991,7 +1023,7 @@ test("a finished turn is judged on the transcript", async (t) => {
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
-  fake.append({ role: "user", text: wake.marker });
+  fake.append(deliveredRow(wake));
   fake.append({ role: "assistant", text: "got it" });
   ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
 
@@ -1051,7 +1083,7 @@ test("another user speaking first is unknowable here too", async (t) => {
   const ext = fakeExternalTurns();
   const { wake } = enqueuedWake(w, ext);
   const fake = fakeGateway(w, { capabilities: ROUTED });
-  fake.append({ role: "user", text: wake.marker });
+  fake.append(deliveredRow(wake));
   fake.append({ role: "user", text: "actually, do the other thing first" });
   fake.append({ role: "assistant", text: "sure" });
   ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
@@ -1110,13 +1142,19 @@ test("the enqueue itself is idempotent, so one wake is one event", async (t) => 
   const deliverer = routedDeliverer(w, fake, ext);
   assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
 
-  // Hand it back to the queue as if the enqueue had been retried, and deliver again.
+  // Hand it back to the queue as if this process had died before recording the handover, and run
+  // ingress again.
   deliverer.release(w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id), "retrying");
-  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ADOPTED"],
+    "the receiver is asked FIRST, so the existing event is adopted rather than offered again");
 
   assert.equal(ext.count(), 1, "one wake, one event in the receiver");
-  assert.equal(ext.ops("enqueue").length, 2, "and it was genuinely offered twice");
+  assert.equal(ext.ops("enqueue").length, 1,
+    "and asking first means the redundant enqueue never happens, rather than being absorbed");
   assert.equal(fake.transcript().submits, 0, "no direct submit on this path, ever");
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED");
+  assert.notEqual(after.enqueued_at, null);
 });
 
 test("releasing a routed wake leaves no evidence of a delivery it did not make", async (t) => {
@@ -1316,58 +1354,31 @@ test("delivery kicks once, and observation only kicks while nobody has taken it"
   assert.deepEqual(kicked, [wake.id], "a dead claim with no listener would wedge");
 });
 
-test("no gateway opened for looking is alive when the event becomes consumable", async (t) => {
-  // THE BUG THIS ENCODES.
+test("routed ingress never resumes a session", async (t) => {
+  // THE HAZARD THIS REPLACED, ASSERTED AS AN ABSENCE.
   //
-  // A resumed gateway is a live session, and a live session runs the external-turn poller. The
-  // gateway opened merely to READ canonical history is therefore itself eligible to become the
-  // OWNER of the event about to be enqueued -- and it would be holding that turn when the reading
-  // code's own cleanup closed it. Killing a gateway kills the turn it hosts, so this destroys a
-  // turn nobody observed starting and leaves precisely the dead-STARTED-with-no-marker state the
-  // rest of this file exists to avoid creating.
+  // Reconciliation used to resume a session just to read its transcript. A resumed session runs
+  // the external-turn poller, is eligible to consume events addressed to that conversation, and
+  // destroys whatever turn it began when its gateway closes -- so the act of LOOKING could take an
+  // event and then kill it. Ordering the close around one enqueue never fixed that, because the
+  // hazard was any OTHER event queued for the same conversation.
   //
-  // The ordering IS the fix, so the ordering is what is asserted.
+  // canonical_history reads the durable record without creating a live session, so the property is
+  // now simply: ingress resumes nothing. Counted at the stub, which records every resume it serves.
   const w = world(t);
   const ext = fakeExternalTurns();
   const sessionId = w.session();
-  registerWatch(w.db, sessionId, "hermes_order");
+  registerWatch(w.db, sessionId, "hermes_noresume");
   w.setState(sessionId, "COMPLETED");
   w.watcher.pass();
   const fake = fakeGateway(w, { capabilities: ROUTED });
 
-  const timeline = [];
-  const watched = () => {
-    const gateway = fake.factory()();
-    const close = gateway.close.bind(gateway);
-    gateway.close = async () => { timeline.push("close"); return close(); };
-    return gateway;
-  };
-  const spyingExt = {
-    ...ext.factory(),
-    enqueue: async (args) => { timeline.push("enqueue"); return ext.factory().enqueue(args); },
-  };
-
-  const deliverer = new WakeDeliverer({
-    db: w.db,
-    gateway: watched,
-    externalTurns: () => spyingExt,
-    allowEnqueue: true,
-    probe: fakeLiveness().probe,
-    identity: fakeLiveness().identity,
-    investigateAfterMs: 0,
-    kick: null,
-  });
+  const deliverer = routedDeliverer(w, fake, ext, { kick: null });
   assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
 
-  // BOTH must have happened before the order means anything. indexOf returns -1 for a missing
-  // entry, and -1 is less than every real index -- so comparing positions alone would pass
-  // vacuously in exactly the case this test exists to catch: a gateway still open at enqueue time.
-  assert.ok(timeline.includes("enqueue"), `the event was enqueued, got ${timeline.join(" -> ")}`);
-  assert.ok(timeline.includes("close"), `the reading gateway was closed, got ${timeline.join(" -> ")}`);
-  assert.ok(
-    timeline.indexOf("close") < timeline.indexOf("enqueue"),
-    `the reading gateway must be closed first, got ${timeline.join(" -> ")}`,
-  );
+  assert.equal(fake.transcript().resumes ?? 0, 0, "ingress must not resume a session");
+  assert.equal(fake.transcript().submits, 0, "and must never submit");
+  assert.equal(ext.ops("enqueue").length, 1);
 });
 
 test("a status read that FAILS is not evidence that the event is gone", async (t) => {
@@ -1476,4 +1487,271 @@ test("a listener that cannot say who it is never resumes at all", async (t) => {
     fake.transcript().resumes ?? 0, 0,
     "and must not have resumed: a session it could not recognise itself owning is one it could kill",
   );
+});
+
+// ── EXACT IDENTITY, NOT RESEMBLANCE ────────────────────────────────────────────────────────────
+
+test("a compaction row quoting the marker is not the delivery", async (t) => {
+  // THE HAZARD CANONICAL HISTORY INTRODUCED, AND WHY THE CLASSIFIER CHANGED.
+  //
+  // Canonical history spans the whole compression lineage, which is exactly what makes it correct
+  // evidence -- and it means far more rows are in scope. Hermes's compressor deliberately pins its
+  // summaries to role="user" (summary_role = "user" in context_compressor.py), so a summary of a
+  // conversation that once contained a wake can itself be a user row carrying that marker.
+  //
+  // The old classifier anchors on the newest user row CONTAINING the marker. It would select the
+  // summary, find no assistant turn after it, and call a delivered wake PARTIAL -- blocking the
+  // watch over a conversation where the answer is sitting right there, earlier in the transcript.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  fake.append(deliveredRow(wake));
+  fake.append({ role: "assistant", text: "done - added the client-side run filter" });
+  // ...later, compaction. A user-role summary that quotes the wake, and a hidden compaction
+  // reference: both plausible impostors, neither byte-identical to what was sent.
+  fake.append({ role: "user", text: `[Summary] earlier the assistant was asked: ${wake.marker}` });
+  fake.append({ role: "user", display_kind: "hidden", text: `[compaction ref] ${wake.marker} rolled up` });
+  ext.set(wake.id, { state: "FINISHED", owner_alive: false, outcome: "completed" });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["DELIVERED"],
+    "the real hidden row is the anchor; a summary that mentions it is not");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "DELIVERED");
+});
+
+test("the legacy classifier is still what the legacy transport uses", (t) => {
+  // The two protocols keep their own readers. classifyHistory anchors on the marker because the
+  // direct-submit path wrote an ordinary visible user row; classifyRoutedWake demands an exact
+  // hidden body because that is what the routed path writes. Feeding either transcript to the
+  // other reader is a category error, and keeping both named makes that visible.
+  const wake = { body: "wake body <<MARKER-1>>", marker: "<<MARKER-1>>" };
+  const legacyRows = [
+    { role: "user", text: "wake body <<MARKER-1>>" },
+    { role: "assistant", text: "on it" },
+  ];
+  // The legacy transport wrote a VISIBLE user row, and its own reader finds it.
+  assert.equal(classifyHistory(legacyRows, wake.marker), "DELIVERED");
+  // The routed reader does not, even though the text is byte-identical: a visible row is not
+  // something the routed transport can have written, so treating it as one would mean claiming a
+  // delivery this protocol never made.
+  assert.equal(classifyRoutedWake(legacyRows, wake), "ABSENT",
+    "byte-equality alone is not enough; the row must be a hidden one");
+  // And the routed reader finds its own.
+  assert.equal(
+    classifyRoutedWake([{ role: "user", display_kind: "hidden", text: wake.body },
+                        { role: "assistant", text: "on it" }], wake),
+    "DELIVERED",
+  );
+  // Resemblance never counts, in either direction.
+  assert.equal(
+    classifyRoutedWake([{ role: "user", display_kind: "hidden", text: `about ${wake.marker}` }], wake),
+    "ABSENT",
+  );
+});
+
+// ── RECEIPT BY READBACK ────────────────────────────────────────────────────────────────────────
+
+test("an enqueue is not believed until the receiver is read back", async (t) => {
+  // enqueue() returning false means "something occupies this id", not "your event is there".
+  // Recording ENQUEUED on the strength of the call alone lets the local record describe a handover
+  // that never happened -- and the producer would then wait forever for a turn nobody was asked to
+  // run.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_readback");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  // A receiver that accepts the write and then has no record of it.
+  const inner = ext.factory();
+  const amnesiac = { ...inner, status: async () => null };
+
+  const deliverer = routedDeliverer(w, fake, ext, { externalTurns: () => amnesiac });
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["UNCONFIRMED"]);
+
+  const after = w.db.prepare("SELECT * FROM wake_outbox").get();
+  assert.equal(after.state, "PENDING", "still recoverable, not recorded as handed over");
+  assert.equal(after.enqueued_at, null);
+  assert.match(after.last_error, /not confirmed/i);
+});
+
+test("a remote event under our id that is not our event is an integrity failure", async (t) => {
+  // The id matches and nothing else does. Never overwritten, never re-enqueued, and never read as
+  // absence -- absence is what authorises enqueueing, and this is the opposite of absence.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_integrity");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  ext.set(wake.id, {
+    event_id: wake.id, target_session_key: wake.hermes_session_id,
+    body: "something nobody here ever sent", source: "delegate-wave",
+    state: "PENDING", owner_alive: false,
+  });
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["INTEGRITY_FAILURE"]);
+
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "PARTIAL");
+  assert.match(after.last_error, /integrity/i);
+  assert.equal(ext.ops("enqueue").length, 0, "and nothing was written over it");
+  assert.equal(
+    w.db.prepare("SELECT state FROM session_watches WHERE id = ?").get(wake.watch_id).state,
+    "BLOCKED",
+  );
+});
+
+test("a crash between the remote enqueue and the local record is recoverable", async (t) => {
+  // THE DUAL-WRITE BOUNDARY, direction A.
+  //
+  // Two databases, no shared transaction. The enqueue commits in Hermes and this process dies
+  // before its own row says so. Asking the receiver FIRST is what makes that survivable: the event
+  // is found, verified field by field, and adopted -- rather than a second event being created, or
+  // the transcript being consulted about a turn the owner has not run yet and read as "nothing
+  // happened".
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_dualwrite");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  // The remote side of a handover this database never learned about.
+  await ext.factory().enqueue({
+    eventId: wake.id, sessionKey: wake.hermes_session_id, body: wake.body, source: "delegate-wave",
+  });
+  assert.equal(ext.count(), 1);
+  // Counted AFTER the setup, which is itself an enqueue call on this stub -- measuring from zero
+  // would have been measuring the test's own arrangement.
+  const enqueuesBefore = ext.ops("enqueue").length;
+
+  const deliverer = routedDeliverer(w, fake, ext);
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ADOPTED"]);
+
+  assert.equal(ext.count(), 1, "no second event was created");
+  assert.equal(ext.ops("enqueue").length, enqueuesBefore,
+    "and none was even attempted: the receiver was asked before anything was written");
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED");
+  assert.equal(after.submitted_at, null, "and the legacy transport was not involved");
+});
+
+test("an event that appears between the status read and the enqueue is still verified", async (t) => {
+  // THE DUAL-WRITE BOUNDARY, direction B.
+  //
+  // status() says absent, another recovery path creates the event, and this one's enqueue returns
+  // its idempotent false. That false is indistinguishable from "already ours" without looking, so
+  // the readback looks -- and adoption still requires every field to match.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_interleaved");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+
+  const inner = ext.factory();
+  let asked = 0;
+  const racy = {
+    ...inner,
+    status: async (eventId) => {
+      asked += 1;
+      // Absent on the first look; by the enqueue, somebody else has created it.
+      if (asked === 1) return null;
+      return inner.status(eventId);
+    },
+    enqueue: async (args) => {
+      await inner.enqueue({ ...args, source: "delegate-wave" });
+      return inner.enqueue(args); // the second returns false, as a real racing retry would
+    },
+  };
+
+  const deliverer = routedDeliverer(w, fake, ext, { externalTurns: () => racy });
+  assert.deepEqual((await deliverer.pass()).map((o) => o.outcome), ["ENQUEUED"]);
+
+  assert.equal(ext.count(), 1, "exactly one event exists");
+  const after = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(after.state, "ENQUEUED");
+});
+
+test("adoption is a compare-and-swap, so two recoveries cannot both drive one wake", async (t) => {
+  // Discovering a remote event is something two processes can do at the same moment. Both would
+  // otherwise adopt it and carry on driving the same wake. The single-flight index would eventually
+  // refuse one, but borrowing the invariant from another layer is how a state machine ends up
+  // depending on a constraint nobody remembers is load-bearing.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  // Already ENQUEUED -- so a second adopter arrives to find the row no longer PREPARING.
+  const deliverer = routedDeliverer(w, null, ext);
+  const current = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(current.state, "ENQUEUED");
+  assert.equal(
+    w.db.prepare(
+      `UPDATE wake_outbox SET state = 'ENQUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARING'`,
+    ).run(new Date().toISOString(), wake.id).changes,
+    0,
+    "the CAS matches only the state this process left the row in",
+  );
+  assert.ok(deliverer);
+});
+
+test("a routed wake stranded in PREPARING goes back to the queue, never to the legacy path", async (t) => {
+  // reconcile() resumes a session and classifies with the legacy marker scan. Both are wrong here,
+  // and wrong in the direction that hides the failure: resuming creates a live owner eligible to
+  // consume events, and the display projection it reads can never contain a hidden row -- so every
+  // routed wake would come back ABSENT and be said again.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_stranded");
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const wake = w.db.prepare("SELECT * FROM wake_outbox").get();
+  w.db.prepare(
+    `UPDATE wake_outbox SET state = 'PREPARING', owner_pid = 999999, owner_started_at = 'gone',
+                            updated_at = ? WHERE id = ?`,
+  ).run("2020-01-01T00:00:00.000Z", wake.id);
+
+  const fake = fakeGateway(w, { capabilities: ROUTED });
+  const deliverer = routedDeliverer(w, fake, ext, {
+    liveness: fakeLiveness(DEAD), kick: null,
+  });
+  const stranded = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(await deliverer.reconcile(stranded), "PENDING");
+
+  assert.equal(fake.transcript().resumes ?? 0, 0, "no session was resumed to recover it");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PENDING");
+});
+
+test("the watcher treats an enqueued wake as already open", async (t) => {
+  // Schema 35 added ENQUEUED, and the watcher's adoption query still listed only the older
+  // in-flight states. A watch re-armed while its completion wake was already with Hermes would
+  // fail to see that wake and try to create another -- the unique index would refuse, so the
+  // symptom is a throw rather than a duplicate, but the query should be right on its own terms.
+  const w = world(t);
+  const ext = fakeExternalTurns();
+  const { wake } = enqueuedWake(w, ext);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
+
+  // Clear the notification marks the way unblock() does, then let the watcher look again.
+  const watch = w.db.prepare("SELECT * FROM session_watches").get();
+  w.db.prepare(
+    "UPDATE session_watches SET state = 'ACTIVE', notified_state = NULL, notified_message_id = NULL WHERE id = ?",
+  ).run(watch.id);
+
+  assert.deepEqual(w.watcher.pass(), [], "the enqueued wake is adopted, not duplicated");
+  assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 1);
 });
