@@ -21,7 +21,7 @@ import { ManagerService } from "../src/manager/service.js";
 import { AutonomousSessionService, modePolicy, SESSION_MODES } from "../src/session/service.js";
 import { SafeIntegrator } from "../src/integration/safe.js";
 import { SessionDriver } from "../src/session/driver.js";
-import { SessionWatcher } from "../src/session/watcher.js";
+import { registerWatch, SessionWatcher } from "../src/session/watcher.js";
 import { runProcess } from "../src/process.js";
 
 const BRIEF = (extra = {}) => ({
@@ -742,4 +742,96 @@ test("no session starves behind sessions that cannot progress", async (t) => {
   for (const id of ids) {
     assert.ok(reached.has(id), `${id} never reached a slot: it starved behind the others`);
   }
+});
+
+
+// --- A deterministic publication failure must not become a machine loop -------------------------
+
+test("a definite publication failure is terminal, not retried forever", async (t) => {
+  // THE FALSIFICATION FOR A BUG THAT RAN FOR 50 MINUTES ON A REAL MACHINE.
+  //
+  // publishAccepted() used to write SEMANTICALLY_ACCEPTED when integrate() returned
+  // published:false. That is exactly the state SessionDriver.pending() claims for a publishing
+  // mode, so the driver re-entered publishAccepted() every couple of seconds: prepare a worktree,
+  // run a validation plan that cannot pass on a clean tree, fail, write a staged_integrations row,
+  // repeat. 1,421 rows for one session and 9,123 for another, ~60 prepared trees a minute, and the
+  // conversation that asked for the work was told NOTHING -- because AUTO + SEMANTICALLY_ACCEPTED
+  // is "mid-flight", and mid-flight is deliberately not a wake-worthy event.
+  //
+  // Asserting the state alone would not have caught it: the old code set a state too. What catches
+  // it is counting the calls. Restore `state: "SEMANTICALLY_ACCEPTED"` in publishAccepted and this
+  // fails on integrateCalls, which is the observation that distinguishes "stopped" from "stuck".
+  const w = await integrating(t, ACCEPTING, "AUTO");
+  registerWatch(w.sessions.db, w.started.session_id, "20260827_151831_1ec1c2");
+
+  let integrateCalls = 0;
+  w.sessions.integrator = {
+    async integrate() {
+      integrateCalls += 1;
+      // What SafeIntegrator returns once its OWN bounded retries are exhausted: a definite no.
+      return { published: false, reason: "VALIDATION_FAILED", attempt: null };
+    },
+  };
+
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+
+  // Far more passes than the failure needs, because the bug was invisible in any single pass.
+  for (let pass = 0; pass < 100; pass += 1) {
+    driver.pass();
+    await new Promise((resolve) => { setTimeout(resolve, 1); });
+  }
+  await driver.drain();
+
+  assert.equal(integrateCalls, 1,
+    `integrate() ran ${integrateCalls} times: a deterministic failure is being retried forever`);
+
+  const polled = w.sessions.poll(w.started.session_id);
+  assert.equal(polled.state, "failed");
+  assert.equal(polled.outcome, "VALIDATION_FAILED");
+  assert.equal(w.sessions.db.prepare(
+    "SELECT COUNT(*) AS n FROM staged_integrations WHERE publish_state = 'PUBLISHED'",
+  ).get().n, 0, "and nothing was published");
+
+  // The failure has to REACH somebody. Stopping quietly would trade an infinite loop for silence.
+  const watcher = new SessionWatcher({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => watcher.stop());
+  const enqueued = watcher.pass();
+  assert.equal(enqueued.length, 1, "exactly one wake for the failure");
+  const wake = w.sessions.db.prepare("SELECT * FROM wake_outbox").get();
+  assert.equal(wake.reason, "FAILED");
+  assert.equal(wake.hermes_session_id, "20260827_151831_1ec1c2");
+
+  // And it is said once, not once per pass.
+  assert.deepEqual(watcher.pass(), []);
+  assert.deepEqual(watcher.pass(), []);
+  assert.equal(w.sessions.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 1);
+  assert.equal(integrateCalls, 1, "and the driver never went back for more");
+});
+
+test("an integrator that exhausts its own bounded retries also stops the session", async (t) => {
+  // The other shape of definite failure: not a bad validation plan but a target branch that keeps
+  // moving, refused by CAS until SafeIntegrator gives up. The session must not outlive that either.
+  const w = await integrating(t, ACCEPTING, "AUTO");
+
+  let integrateCalls = 0;
+  w.sessions.integrator = {
+    async integrate() {
+      integrateCalls += 1;
+      return { published: false, reason: "CAS_REFUSED", attempt: null };
+    },
+  };
+
+  const driver = new SessionDriver({ sessions: w.sessions, intervalMs: 5 });
+  t.after(() => driver.stop());
+  for (let pass = 0; pass < 40; pass += 1) {
+    driver.pass();
+    await new Promise((resolve) => { setTimeout(resolve, 1); });
+  }
+  await driver.drain();
+
+  assert.equal(integrateCalls, 1);
+  const polled = w.sessions.poll(w.started.session_id);
+  assert.equal(polled.state, "failed");
+  assert.equal(polled.outcome, "CAS_REFUSED");
 });

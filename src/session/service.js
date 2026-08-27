@@ -329,9 +329,28 @@ export class AutonomousSessionService {
         this.setState(sessionId, { state: "COMPLETED", outcome: null });
         return this.poll(sessionId);
       }
-      // Prepared but not published: the branch is untouched and the candidate survives. Reported
-      // rather than retried here, because integrate() already exhausted its own bounded retries.
-      this.setState(sessionId, { state: "SEMANTICALLY_ACCEPTED", outcome: result.reason });
+      // A DEFINITE PUBLICATION FAILURE IS TERMINAL. IT MUST NOT BECOME A MACHINE LOOP.
+      //
+      // The branch is untouched and the candidate survives, so nothing is lost by stopping. What
+      // matters is that integrate() has ALREADY exhausted its own bounded retries before returning
+      // published:false -- so this is not "not yet", it is "no". Retrying it here retries nothing
+      // that was not just tried.
+      //
+      // This line used to write SEMANTICALLY_ACCEPTED, which is exactly the state pending() treats
+      // as runnable for a publishing mode. The comment said "reported rather than retried" while
+      // the code re-armed the retry: two seconds later the driver called publishAccepted() again,
+      // prepared another worktree, failed the same deterministic check, and wrote the same row. A
+      // validation plan that cannot pass on a clean tree therefore looped forever, invisibly --
+      // 1,421 prepared trees for one session, 9,123 for another, ~60/min between them, while the
+      // conversation that asked for the work was told nothing at all, because a session sitting in
+      // SEMANTICALLY_ACCEPTED under AUTO is "mid-flight" and mid-flight is not a wake-worthy event.
+      //
+      // FAILED is what makes it visible: the watcher emits exactly one FAILED wake, and pending()
+      // stops claiming the session. The crash-recovery property that motivated the old state is
+      // untouched -- while integrate() is genuinely IN PROGRESS the session is still
+      // SEMANTICALLY_ACCEPTED, so a process death in that window is still rediscovered and retried.
+      // Only a returned, definite failure is terminal.
+      this.setState(sessionId, { state: "FAILED", outcome: result.reason });
       return this.poll(sessionId);
     } catch (error) {
       if (!(error instanceof ConflictRequiresJudgment)) {
