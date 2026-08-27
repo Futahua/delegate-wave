@@ -83,6 +83,10 @@ export class AutonomousSessionService {
   async start({ projectId, intent, mode = "AUTO", maximumCost = null, maxAttempts = 3, hermesSessionId = null }) {
     if (!SESSION_MODES.includes(mode)) throw new Error(`Unknown autonomy mode: ${mode}`);
     if (typeof intent !== "string" || !intent.trim()) throw new Error("intent must be a non-empty string");
+    if (hermesSessionId !== null && (typeof hermesSessionId !== "string" || !hermesSessionId.trim())) {
+      throw new Error("hermesSessionId must be null or a non-empty string");
+    }
+    const watchedSessionId = hermesSessionId === null ? null : hermesSessionId.trim();
     const project = this.dispatcher.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     const policy = modePolicy(mode);
@@ -106,13 +110,13 @@ export class AutonomousSessionService {
       ) VALUES (?, ?, ?, ?, ?, 'WORKING', ?, ?, ?)`).run(
         sessionId, projectId, job.id, intent, mode, maximumCost, now(), now(),
       );
-      if (hermesSessionId) registerWatch(this.db, sessionId, hermesSessionId);
+      if (watchedSessionId) registerWatch(this.db, sessionId, watchedSessionId);
       recordEvent(this.db, {
         kind: "AUTONOMOUS_SESSION_STARTED", entityType: "job", entityId: job.id,
-        payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(hermesSessionId) },
+        payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(watchedSessionId) },
       });
     });
-    return { session_id: sessionId, state: "WORKING", job_id: job.id, mode, watched: Boolean(hermesSessionId) };
+    return { session_id: sessionId, state: "WORKING", job_id: job.id, mode, watched: Boolean(watchedSessionId) };
   }
 
   get(sessionId) {

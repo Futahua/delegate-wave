@@ -268,6 +268,27 @@ test("a session started from a conversation is watched from birth, and its quest
   assert.deepEqual(watcher.pass(), []);
 });
 
+test("simultaneous session starts persist the correct per-conversation watches", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { sessions } = boot([]);
+
+  const [first, second] = await Promise.all([
+    sessions.start({ projectId, intent: "first intent", hermesSessionId: "session_S1" }),
+    sessions.start({ projectId, intent: "second intent", hermesSessionId: "session_S2" }),
+  ]);
+
+  const watches = sessions.db.prepare(
+    `SELECT s.intent, w.hermes_session_id
+       FROM autonomous_sessions s
+       JOIN session_watches w ON w.session_id = s.id
+      WHERE s.id IN (?, ?)`,
+  ).all(first.session_id, second.session_id);
+  assert.deepEqual(
+    Object.fromEntries(watches.map((row) => [row.intent, row.hermes_session_id])),
+    { "first intent": "session_S1", "second intent": "session_S2" },
+  );
+});
+
 test("a session started without a conversation still runs, and nobody is waiting on it", async (t) => {
   // The honest degraded case, stated as a test so it cannot quietly become an exception thrown at a
   // CLI user who has no Hermes session to give.
@@ -281,6 +302,21 @@ test("a session started without a conversation still runs, and nobody is waiting
   t.after(() => watcher.stop());
   assert.deepEqual(watcher.pass(), []);
   assert.equal(sessions.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox").get().n, 0);
+});
+
+test("an invalid explicit watch identity is rejected before creating a job", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, sessions } = boot([]);
+  const before = dispatcher.listJobs().length;
+
+  await assert.rejects(
+    sessions.start({ projectId, intent: "Fix it", hermesSessionId: "   " }),
+    /must be null or a non-empty string/,
+  );
+
+  assert.equal(dispatcher.listJobs().length, before);
+  assert.equal(sessions.db.prepare("SELECT COUNT(*) AS n FROM autonomous_sessions").get().n, 0);
+  assert.equal(sessions.db.prepare("SELECT COUNT(*) AS n FROM session_watches").get().n, 0);
 });
 
 test("the session survives the process dying mid-run", async (t) => {
