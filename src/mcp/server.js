@@ -100,12 +100,14 @@ const TOOLS = Object.freeze([
             + "MANUAL stops with a finished candidate; PLAN never writes.",
         },
         maximum_cost: { type: "number" },
-        hermes_session_id: {
-          type: "string",
-          description: "Your own durable session id. Supply it and delegate-wave will come back to "
-            + "THIS conversation when the work finishes or gets stuck, instead of waiting to be "
-            + "polled. Omit it and the session still runs; nobody is told when it ends.",
-        },
+        // hermes_session_id is deliberately ABSENT from this schema.
+        //
+        // It was here, optional, described as "omit it and nobody is told when it
+        // ends" -- and a model omitted it, so a completed session reported to no
+        // one. Where the answer goes is transport context, not task input: the
+        // calling client stamps it into _meta from the identity already bound to
+        // its turn. A model has no reason to know its own callback address and
+        // every opportunity to get it wrong.
       },
       required: ["project_id", "intent"],
     },
@@ -147,6 +149,13 @@ const TOOLS = Object.freeze([
 ]);
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+// The reserved _meta key carrying the calling conversation's durable session id.
+//
+// Must match CALLER_SESSION_META_KEY in Hermes' tools/mcp_tool.py. Renaming one
+// side silently returns this system to starting sessions nobody is watching --
+// which is exactly how it failed before the key existed.
+const CALLER_SESSION_META_KEY = "io.delegate-wave/hermes-session-id";
+
 const PROJECT_SUMMARY_JOB_LIMIT = 20;
 
 function requiredString(args, name) {
@@ -159,7 +168,7 @@ export class HermesMcpAdapter {
 
   listTools() { return TOOLS; }
 
-  async callTool(name, args = {}) {
+  async callTool(name, args = {}, meta = {}) {
     if (name === "get_status") return this.client.get("/v1/briefing");
     if (name === "get_overview") return this.client.get("/v1/overview");
     if (name === "list_projects") return this.client.get("/v1/projects");
@@ -180,6 +189,46 @@ export class HermesMcpAdapter {
     if (name === "get_attention_needed") return this.client.get("/v1/attention");
     if (name === "get_integration") return this.client.get(`/v1/proposals/${encodeURIComponent(requiredString(args, "proposal_id"))}`);
     if (name === "session_start") {
+      // WHERE THE ANSWER GOES IS NOT THE MODEL'S TO DECIDE.
+      //
+      // This used to read `args.hermes_session_id` -- an optional field on the
+      // model-facing schema, whose own description admitted "omit it and nobody
+      // is told when it ends". A model omitted it, the work ran to completion,
+      // and the conversation that asked for it was never notified. That is not a
+      // model mistake; it is a design that put a callback address in the hands of
+      // something with no reason to know one.
+      //
+      // The calling client stamps it into `_meta` instead, from the session
+      // identity already bound to the turn. See CALLER_SESSION_META_KEY in
+      // Hermes' tools/mcp_tool.py.
+      const fromMeta = String(meta?.[CALLER_SESSION_META_KEY] ?? "").trim();
+      const fromArgs = String(args.hermes_session_id ?? "").trim();
+
+      // A direct or scripted caller may still pass it explicitly -- that path
+      // predates this and is not worth breaking. But the two disagreeing means
+      // somebody is wrong about who is waiting, and guessing between them is how
+      // an answer gets delivered to the wrong conversation.
+      if (fromMeta && fromArgs && fromMeta !== fromArgs) {
+        throw new Error(
+          "hermes_session_id conflicts with the calling session's identity; "
+          + "refusing to guess which conversation is waiting",
+        );
+      }
+      const hermesSessionId = fromMeta || fromArgs || null;
+
+      // Silence is not an acceptable default any more. A session with no return
+      // address runs to completion and tells nobody, which looks identical to
+      // success right up until somebody asks why they were never told.
+      if (!hermesSessionId) {
+        throw new Error(
+          "session_start has no calling conversation to report back to: the MCP "
+          + "client did not supply "
+          + CALLER_SESSION_META_KEY
+          + " and no explicit hermes_session_id was given. Refusing to start work "
+          + "nobody is watching.",
+        );
+      }
+
       // A fresh request id per call, as every mutation through this API requires. Starting a session
       // is a new intent each time rather than a retry of a previous one, so the id is generated here
       // rather than asked of the caller -- an agent has nothing meaningful to derive one from.
@@ -188,7 +237,7 @@ export class HermesMcpAdapter {
         intent: requiredString(args, "intent"),
         mode: args.mode || "AUTO",
         maximumCost: args.maximum_cost ?? null,
-        hermesSessionId: args.hermes_session_id ?? null,
+        hermesSessionId,
       }, `req_${randomUUID()}`);
     }
     if (name === "session_poll") {
@@ -335,7 +384,16 @@ export function runMcpStdio({
       } else if (request.method === "ping") result = {};
       else if (request.method === "tools/list") result = { tools: adapter.listTools() };
       else if (request.method === "tools/call") {
-        const value = await adapter.callTool(request.params?.name, request.params?.arguments || {});
+        // `_meta` reaches the adapter alongside the arguments, because they are not
+        // the same kind of thing. Arguments are what the model asked for; meta is
+        // what the CLIENT knows about the call -- here, which conversation is
+        // waiting for an answer. Dropping it is what let a session start with
+        // nobody registered to be told it had finished.
+        const value = await adapter.callTool(
+          request.params?.name,
+          request.params?.arguments || {},
+          request.params?._meta || {},
+        );
         // The text form is what a person reads. It answers the question rather than restating the
         // payload, and never carries a transcript.
         let text;
