@@ -130,6 +130,23 @@ test("RETHINK from review keeps the candidate, and SYNTHESIS may then repair it"
     "the revision builds on the candidate it was repairing");
 });
 
+test("ACCEPT during post-candidate synthesis is rechecked in REVIEW", async (t) => {
+  const { service, job } = await fixture(t, [
+    { action: "IMPLEMENT", reason: "known", brief: BRIEF() },
+    { action: "RETHINK", reason: "confirm one fact", explorations: [{ question: "still correct?", deliver: ["files"] }] },
+    { action: "ACCEPT", reason: "the surviving candidate is correct" },
+    { action: "ACCEPT", reason: "the review pack proves it" },
+  ]);
+  await service.advance(job.id);
+
+  const run = service.getRun(job.id);
+  assert.equal(run.status, "ACCEPTED");
+  assert.deepEqual(
+    service.turns(run.id).map((turn) => `${turn.phase}/${turn.action}`),
+    ["PLAN/IMPLEMENT", "REVIEW/RETHINK", "SYNTHESIS/ACCEPT", "REVIEW/ACCEPT"],
+  );
+});
+
 test("IMPLEMENT after a rethink abandons the candidate and starts from the base", async (t) => {
   const { dispatcher, service, job } = await fixture(t, [
     { action: "IMPLEMENT", reason: "known", brief: BRIEF() },

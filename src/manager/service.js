@@ -719,6 +719,17 @@ export class ManagerService {
     if (decision.action === "EXPLORE" || decision.action === "RETHINK") {
       return this.openExplorationRound(this.getRun(run.job_id), decision.explorations, decision.reason);
     }
+    // ACCEPT during synthesis cannot be trusted as acceptance: this turn was
+    // shown investigation evidence, not the deterministic candidate review
+    // pack. When a candidate survived a rethink, however, the intent is
+    // unambiguous and safe to honor by moving to REVIEWING. The next paid turn
+    // sees the full diff/validation evidence and must make ACCEPT again there.
+    // This avoids turning a misplaced but recoverable action into an endless
+    // Hermes clarification loop while preserving the acceptance gate.
+    if (decision.action === "ACCEPT" && run.last_candidate_attempt_id) {
+      this.setRun(run.id, { status: "REVIEWING" });
+      return;
+    }
     // Repairing the candidate that survived the rethink.
     //
     // This is the state the manager kept trying to express and the machine could not represent: a

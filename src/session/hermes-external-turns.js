@@ -29,11 +29,40 @@ import { spawn } from "node:child_process";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+// JSON can represent lone UTF-16 surrogates (for example `"\\udc9d"`), but
+// UTF-8 cannot. Windows subprocess pipes expose that mismatch when Python later
+// persists the decoded string: encoding correctly refuses the invalid scalar.
+// Preserve real surrogate pairs and every other character; replace only lone
+// code units at this transport boundary so one malformed manager glyph cannot
+// permanently starve every wake behind it.
+export function replaceLoneSurrogates(value) {
+  let result = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        result += value[index] + value[index + 1];
+        index += 1;
+      } else {
+        result += "\uFFFD";
+      }
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      result += "\uFFFD";
+    } else {
+      result += value[index];
+    }
+  }
+  return result;
+}
+
 // The Hermes-side program. One script for all three operations, reading its arguments as JSON on
 // stdin rather than being formatted into the source -- a session key or a wake body interpolated
 // into Python source is an injection, and wake bodies contain arbitrary text by design.
 const BRIDGE = `
 import json, sys
+sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+sys.stdout.reconfigure(encoding="utf-8", errors="strict")
 out = {"ok": False, "error": "unset"}
 try:
     from tools.session_external_turns import (
@@ -92,7 +121,10 @@ export class HermesExternalTurns {
   }
 
   async #call(op, request) {
-    const payload = JSON.stringify({ op, ...request });
+    const payload = JSON.stringify(
+      { op, ...request },
+      (_key, value) => typeof value === "string" ? replaceLoneSurrogates(value) : value,
+    );
     return new Promise((resolve, reject) => {
       const child = spawn(this.command, ["-c", BRIDGE], {
         cwd: this.cwd ?? undefined,
