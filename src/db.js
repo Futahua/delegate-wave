@@ -1212,6 +1212,31 @@ function migrate(db) {
   // this column exists to close.
   if (!runColumns.includes("stop_code")) {
     db.exec("ALTER TABLE manager_runs ADD COLUMN stop_code TEXT");
+    // BACKFILL FROM THE EVENT LOG RATHER THAN LEAVING EVERY OLD RUN UNKNOWABLE.
+    //
+    // A NULL stop_code is treated as not answerable, which is the safe default but strands a real
+    // clarification that was already waiting when this column landed: the manager asked a genuine
+    // question, and after the upgrade nobody could answer it. MANAGER_HALTED already recorded the
+    // code durably, so the answer exists -- it just was not on the run row.
+    //
+    // Latest halt per run, because a run can halt, resume and halt again; the most recent one is
+    // the state it is actually in. Runs with no MANAGER_HALTED event keep NULL and stay
+    // non-answerable, which for them is the truth rather than a default.
+    db.exec(`
+      UPDATE manager_runs SET stop_code = (
+        SELECT json_extract(events.payload_json, '$.code') FROM events
+        WHERE events.kind = 'MANAGER_HALTED'
+          AND json_extract(events.payload_json, '$.runId') = manager_runs.id
+        ORDER BY events.sequence DESC LIMIT 1
+      ) WHERE stop_code IS NULL
+    `);
+    // And make the status agree with the code we just recovered. A legacy run parked in
+    // AWAITING_HUMAN because it hit a bound is not waiting for anyone; leaving it there would keep
+    // it in a state the new model has no branch for -- neither asked nor ended.
+    db.exec(`
+      UPDATE manager_runs SET status = 'FAILED'
+      WHERE status = 'AWAITING_HUMAN' AND stop_code IS NOT NULL AND stop_code <> 'ESCALATED'
+    `);
   }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   // Readable failure evidence and executor identity. Plain ADD COLUMNs: all five are nullable with
