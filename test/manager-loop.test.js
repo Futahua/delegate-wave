@@ -484,7 +484,11 @@ test("an uncertain manager turn stops the run and is never replayed", async (t) 
   const callsAfterFirst = calls;
 
   const run = service.getRun(job.id);
-  assert.equal(run.status, "AWAITING_HUMAN");
+  // An uncertain turn is an ENDING, not a question. It used to park in AWAITING_HUMAN, which
+  // made it answerable -- and answering resumed the run at PLANNING, i.e. replayed the very
+  // turn this test says is never replayed.
+  assert.equal(run.status, "FAILED");
+  assert.equal(run.stop_code, "UNCERTAIN");
   const review = service.turns(run.id).find((turn) => turn.phase === "REVIEW");
   assert.equal(review.state, "UNCERTAIN", "an accepted-then-lost call is uncertain, not failed");
   assert.equal(dispatcher.getJob(job.id).status, "NEEDS_ATTENTION");
@@ -553,7 +557,7 @@ test("revision rounds are bounded, and cannot exceed the job's authorized attemp
   await service.advance(job.id);
 
   const run = service.getRun(job.id);
-  assert.equal(run.status, "AWAITING_HUMAN");
+  assert.equal(run.status, "FAILED");
   // maxAttempts 3 permits 2 revisions; the third request is refused rather than attempted.
   assert.equal(run.revision_round, 2);
   assert.equal(dispatcher.status(job.id).attempts.length, 3);
@@ -570,4 +574,108 @@ test("a direct job is untouched by any of this", async (t) => {
   assert.equal(received.at(-1).instruction, "plain work", "the objective is its own instruction");
   const proposal = await dispatcher.proposeIntegration({ jobId: direct.id });
   assert.ok(proposal.candidate_commit);
+});
+
+
+// ---------------------------------------------------------------------------
+// A STOP IS NOT A QUESTION.
+//
+// Run 1 spent its entire manager allowance in a loop: the run halted, the session rendered the halt
+// as an answerable question, the answer called resumeFromEscalation(), which returned the run to
+// PLANNING, which called runTurn(), which saw the ceiling and halted again -- producing the
+// identical question. Answering the turn-limit card resumed the same exhausted run, so it could
+// never do anything except re-ask.
+// ---------------------------------------------------------------------------
+
+test("a bounded stop ends the run, and cannot be answered back into the same loop", async (t) => {
+  let calls = 0;
+  // Never decides. Left alone this would run forever; the ceiling is the only thing that stops it.
+  const { dispatcher, service, job } = await fixture(t, async () => {
+    calls += 1;
+    return { action: "EXPLORE", reason: "still looking", explorations: [{ question: "where?" }] };
+  });
+
+  await service.advance(job.id);
+  const run = service.getRun(job.id);
+
+  // 1. It ended. It is NOT parked as something a human can answer.
+  assert.equal(run.status, "FAILED", "a bounded stop is an ending, not a question");
+  // EXPLORATION_LIMIT here rather than TURN_LIMIT -- an endless EXPLORE trips the exploration
+  // bound first. That is the point: TURN_LIMIT was only one manifestation, and every bounded
+  // stop went through the same "park as answerable" path. The dedicated TURN_LIMIT case is
+  // the next test.
+  assert.equal(run.stop_code, "EXPLORATION_LIMIT");
+  assert.notEqual(run.status, "AWAITING_HUMAN");
+
+  // 2. It stopped exactly at the ceiling -- not before, and not by overrunning it.
+  const spent = service.turns(run.id).length;
+  assert.ok(spent <= run.max_turns, "the run never overruns its ceiling");
+
+  // 3. Answering it is impossible. resumeFromEscalation is the door the loop came through, so it
+  //    has to refuse even when called directly.
+  const afterResume = service.resumeFromEscalation(job.id, { reason: "answered" });
+  assert.equal(afterResume.status, "FAILED", "an ended run cannot be resumed by answering it");
+  assert.equal(service.turns(run.id).length, spent, "and no further turn was bought");
+
+  // 4. Ticking again buys nothing and produces no second identical stop.
+  const callsAtCeiling = calls;
+  await service.advance(job.id);
+  await service.advance(job.id);
+  assert.equal(calls, callsAtCeiling, "an ended run never calls the scarce model again");
+  assert.equal(service.turns(run.id).length, spent);
+  assert.equal(service.getRun(job.id).status, "FAILED");
+  assert.equal(dispatcher.getJob(job.id).status, "NEEDS_ATTENTION");
+});
+
+test("a real escalation is still a question, and answering it still resumes the run", async (t) => {
+  // The other half of the fix: proving the loop was not closed by making legitimate clarification
+  // impossible. A question must still be answerable, and the answer must still return it to work.
+  const { service, job } = await fixture(t, [
+    { action: "ESCALATE", reason: "cannot decide alone", question: "Which output format?" },
+    { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+
+  await service.advance(job.id);
+  const parked = service.getRun(job.id);
+  assert.equal(parked.status, "AWAITING_HUMAN", "an ESCALATE is a question");
+  assert.equal(parked.stop_code, "ESCALATED");
+  assert.match(parked.escalation_question, /Which output format\?/);
+
+  const resumed = service.resumeFromEscalation(job.id, { reason: "answered" });
+  assert.equal(resumed.status, "PLANNING", "answering a real question returns the run to work");
+  assert.equal(resumed.escalation_question, null);
+});
+
+test("the turn ceiling itself is terminal, and answering it cannot re-ask the same question", async (t) => {
+  // The literal Run 1 shape. max_turns is lowered so the ceiling is reached before any other
+  // bound, proving the ceiling specifically -- and that the count stays exactly at it.
+  let calls = 0;
+  const { dispatcher, service, job } = await fixture(t, async () => {
+    calls += 1;
+    return { action: "IMPLEMENT", reason: "go", brief: BRIEF() };
+  });
+
+  // Create the run, then bound it hard. advance() creates it on first call.
+  await service.advance(job.id).catch(() => {});
+  const created = service.getRun(job.id);
+  service.db.prepare("UPDATE manager_runs SET max_turns = ?, status = ?, stop_code = NULL WHERE id = ?")
+    .run(service.turns(created.id).length, "PLANNING", created.id);
+
+  const callsBefore = calls;
+  await service.advance(job.id);
+
+  const run = service.getRun(job.id);
+  assert.equal(run.stop_code, "TURN_LIMIT");
+  assert.equal(run.status, "FAILED", "the ceiling ends the run rather than parking a question");
+  assert.equal(calls, callsBefore, "no turn is bought once the ceiling is reached");
+  assert.equal(service.turns(run.id).length, run.max_turns,
+    "the turn count stays exactly at the ceiling");
+
+  // The loop: answer, resume, immediately re-ask. Both doors are now shut.
+  assert.equal(service.resumeFromEscalation(job.id, { reason: "answered" }).status, "FAILED");
+  await service.advance(job.id);
+  assert.equal(service.turns(run.id).length, run.max_turns);
+  assert.equal(calls, callsBefore);
+  assert.equal(dispatcher.getJob(job.id).status, "NEEDS_ATTENTION");
 });

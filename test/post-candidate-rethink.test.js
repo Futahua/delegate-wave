@@ -98,7 +98,7 @@ test("REVISE before any candidate exists is refused", async (t) => {
   await service.advance(job.id);
 
   const run = service.getRun(job.id);
-  assert.equal(run.status, "AWAITING_HUMAN");
+  assert.equal(run.status, "FAILED");
   assert.match(run.escalation_question, /no candidate has been produced yet/);
   assert.equal(run.revision_round, 0, "no revision round was consumed");
 });

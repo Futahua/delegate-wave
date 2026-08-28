@@ -407,14 +407,34 @@ export class ManagerService {
     return this.report(jobId);
   }
 
-  // Stops the run without inventing a next step. Every reason lands the human in the same place --
-  // a job needing a decision -- but the recorded reason distinguishes "the manager asked you
-  // something" from "we do not know whether a scarce call was billed".
+  // Stops the run. TWO OUTCOMES, NOT ONE.
+  //
+  // This used to send every reason to AWAITING_HUMAN -- the ternary here read
+  // `stop.code === "UNCERTAIN" ? "AWAITING_HUMAN" : "AWAITING_HUMAN"`, which is someone noticing
+  // the distinction and not making it. The session then rendered any parked run as an answerable
+  // question, and answering called resumeFromEscalation(), which always returned the run to
+  // PLANNING. For a run stopped at its turn ceiling that is a loop with no exit: PLANNING calls
+  // runTurn(), runTurn() sees the ceiling, halts again, and the identical question is asked again.
+  // Observed in Run 1, where it consumed the whole allowance and then repeated after every answer.
+  //
+  // A QUESTION AND AN ENDING ARE DIFFERENT THINGS.
+  //
+  //   ESCALATED   the manager asked something it cannot decide alone. Answerable, and answering
+  //               resumes the run, because the answer is the missing input.
+  //   everything   the run hit a bound or broke: TURN_LIMIT, EXPLORATION_LIMIT, BUDGET_EXCEEDED,
+  //   else        MALFORMED, TURN_FAILED, UNCERTAIN. There is no question, so there is nothing an
+  //               answer could supply. The run ends and says why.
+  //
+  // UNCERTAIN is deliberately on the ending side even though it wants a human. Its own comment says
+  // an uncertain paid turn must never be replayed, and "answer -> resume at PLANNING" is exactly a
+  // replay. Giving it a real retry/abandon decision is worth doing; quietly resuming it is not.
   halt(run, stop) {
+    const answerable = stop.code === "ESCALATED";
     transaction(this.db, () => {
       this.setRun(run.id, {
-        status: stop.code === "UNCERTAIN" ? "AWAITING_HUMAN" : "AWAITING_HUMAN",
+        status: answerable ? "AWAITING_HUMAN" : "FAILED",
         escalation_question: stop.question ?? stop.message,
+        stop_code: stop.code,
       });
       this.db.prepare("UPDATE jobs SET status = 'NEEDS_ATTENTION', updated_at = ? WHERE id = ?")
         .run(now(), run.job_id);
@@ -1042,6 +1062,11 @@ export class ManagerService {
     const run = this.getRun(jobId);
     if (!run) throw new Error(`Unknown managed job: ${jobId}`);
     if (run.status !== "AWAITING_HUMAN") return run;
+    // Only a run that ASKED can be resumed by an answer. halt() already refuses to park anything
+    // else in AWAITING_HUMAN, so this is a second lock on the same door -- worth having, because a
+    // run parked by an older build carries stop_code NULL, and resuming one of those is precisely
+    // the loop this exists to prevent.
+    if (run.stop_code !== "ESCALATED") return run;
     transaction(this.db, () => {
       this.setRun(run.id, { status: "PLANNING", escalation_question: null });
       this.db.prepare("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?")

@@ -835,3 +835,34 @@ test("an integrator that exhausts its own bounded retries also stops the session
   assert.equal(polled.state, "failed");
   assert.equal(polled.outcome, "CAS_REFUSED");
 });
+
+
+test("a turn-limit stop is reported, not asked -- answering it cannot re-ask it", async (t) => {
+  // The session half of the same defect. tick() used to render ANY parked run as a question, so a
+  // run that had merely run out of turns became a "Needs input" card; answering it resumed the
+  // exhausted run, which immediately produced the identical card. The session must report an
+  // ending as an ending.
+  const { boot, projectId } = await world(t);
+  const { sessions } = boot(async () => (
+    { action: "EXPLORE", reason: "still looking", explorations: [{ question: "where?" }] }
+  ));
+
+  const started = await sessions.start({
+    projectId, intent: "Add a --json flag", mode: "AUTO", hermesSessionId: "20260824_233004_5d8271",
+  });
+  await sessions.tick(started.session_id);
+
+  const state = sessions.get(started.session_id).state;
+  assert.notEqual(state, "WAITING_FOR_HERMES", "a bounded stop must not be posed as a question");
+  assert.equal(state, "FAILED");
+
+  // Nothing to answer, so the door the loop used is shut.
+  assert.throws(() => sessions.answer(started.session_id, "continue"), /not waiting for an answer/);
+
+  // And repeated ticks emit no second identical question.
+  const before = sessions.messages(started.session_id).length;
+  await sessions.tick(started.session_id);
+  await sessions.tick(started.session_id);
+  assert.equal(sessions.messages(started.session_id).length, before,
+    "an ended session does not keep asking");
+});

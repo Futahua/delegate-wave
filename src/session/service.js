@@ -191,6 +191,8 @@ export class AutonomousSessionService {
     // The manager parked itself in AWAITING_HUMAN when it escalated. Hermes IS the human for this
     // purpose -- it holds the intent the question was derived from -- so an answer returns the run to
     // work rather than leaving it waiting for a person who has already been represented.
+    // resumeFromEscalation refuses anything that did not ask a question, so a stray answer to a
+    // non-question is a no-op rather than a restart.
     this.manager.resumeFromEscalation(session.job_id, { reason: "answered by Hermes" });
     return { session_id: sessionId, state: "WORKING" };
   }
@@ -283,7 +285,17 @@ export class AutonomousSessionService {
     }
 
     const run = this.manager.getRun(session.job_id);
-    if (run?.status === "AWAITING_HUMAN") {
+    // Only an actual question is asked as a question. A run that ended at a bound is reported as an
+    // ending: asking about it invites an answer that cannot change anything, and answering it used
+    // to re-ask the identical question forever.
+    if (run?.status === "FAILED" && run.stop_code && run.stop_code !== "ESCALATED") {
+      this.setState(sessionId, {
+        state: "FAILED",
+        outcome: `${run.stop_code}: ${run.escalation_question || "the manager run stopped"}`,
+      });
+      return this.poll(sessionId);
+    }
+    if (run?.status === "AWAITING_HUMAN" && run.stop_code === "ESCALATED") {
       this.ask(sessionId, {
         body: run.escalation_question || "The manager stopped and needs a decision.",
         whyItMatters: "The manager could not proceed without judgment.",
@@ -422,7 +434,7 @@ export class AutonomousSessionService {
       // Reading it here is what lets the question keep its conflict-aware framing instead of falling
       // through to tick()'s generic "the manager needs a decision".
       const parked = this.manager.getRun(session.job_id);
-      if (parked?.status === "AWAITING_HUMAN") {
+      if (parked?.status === "AWAITING_HUMAN" && parked.stop_code === "ESCALATED") {
         this.ask(sessionId, {
           body: parked.escalation_question || "The manager stopped and needs a decision.",
           whyItMatters: "The branch moved while this task was running, and the two behaviours cannot "

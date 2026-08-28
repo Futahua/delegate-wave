@@ -276,6 +276,11 @@ const MANAGER_RUNS_COLUMNS = `
   -- checkable.
   accepted_attempt_id TEXT REFERENCES attempts(id),
   escalation_question TEXT,
+  -- WHY the run stopped, as a code rather than as prose in escalation_question.
+  -- Answerability is decided from this: only ESCALATED means the manager asked a
+  -- question. Every other stop is the run ending, and answering an ending is what
+  -- produced the repeated "Needs input" loop.
+  stop_code TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL`;
 
@@ -1201,6 +1206,13 @@ function migrate(db) {
   if (!jobColumns.includes("internal_kind")) {
     db.exec("ALTER TABLE jobs ADD COLUMN internal_kind TEXT");
   }
+  const runColumns = db.prepare("PRAGMA table_info(manager_runs)").all().map((column) => column.name);
+  // Historical runs carry NULL, which is the truth: nothing recorded why they stopped. A NULL
+  // stop_code is treated as NOT answerable, so an old parked run cannot be resumed into the loop
+  // this column exists to close.
+  if (!runColumns.includes("stop_code")) {
+    db.exec("ALTER TABLE manager_runs ADD COLUMN stop_code TEXT");
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   // Readable failure evidence and executor identity. Plain ADD COLUMNs: all five are nullable with
   // no constraint, so a migrated table matches a fresh one exactly and historical attempts simply
@@ -1465,7 +1477,7 @@ function rebuildConstrainedTables(db) {
       copy: `id, job_id, status, requested_model, actual_model, thread_id, exploration_round,
              revision_round, max_exploration_rounds, max_revision_rounds, max_turns,
              active_child_job_id, last_candidate_attempt_id, accepted_attempt_id,
-             escalation_question, created_at, updated_at`,
+             escalation_question, stop_code, created_at, updated_at`,
       after: [],
     });
   }
