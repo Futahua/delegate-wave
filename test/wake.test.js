@@ -254,7 +254,7 @@ function remoteFor(wake, rest = {}) {
   };
 }
 
-function fakeKickGateways({ onResume = null, onClose = null, resumeError = null } = {}) {
+function fakeKickGateways({ onResume = null, onClose = null, resumeError = null, closeError = null } = {}) {
   const calls = { start: 0, resume: [], close: 0, created: 0 };
   const gateways = [];
   return {
@@ -265,6 +265,7 @@ function fakeKickGateways({ onResume = null, onClose = null, resumeError = null 
       const gateway = {
         exit: null,
         async start() { calls.start += 1; },
+        async identity() { return { pid: 9500 + calls.created, startedAt: `kick-${calls.created}` }; },
         async resume(sessionId) {
           calls.resume.push(sessionId);
           if (onResume) await onResume(sessionId, gateway);
@@ -274,6 +275,7 @@ function fakeKickGateways({ onResume = null, onClose = null, resumeError = null 
         async close() {
           calls.close += 1;
           if (onClose) await onClose(gateway);
+          if (closeError) throw closeError;
         },
       };
       gateways.push(gateway);
@@ -813,6 +815,42 @@ test("successor wake stays fenced until the prior listener has actually closed",
 
   assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["ENQUEUED"]);
   assert.ok(receiver.row(second.id));
+});
+
+test("unproven listener termination keeps the wake durably ENQUEUED", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const gateways = fakeKickGateways({ closeError: new Error("listener exit not proven") });
+  const errors = [];
+  let poll = 0;
+  const routed = routedDeliverer(w, receiver, fakeCanonical([
+    { role: "user", display_kind: "delegate_wave_wake", text: wake.body },
+    { role: "assistant", text: "done" },
+  ]), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      poll += 1;
+      if (poll === 1) receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+    },
+    onError: (error) => errors.push(error),
+  });
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  await routed.settleKicks();
+  assert.equal(errors.length, 1);
+  let local = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(local.state, "ENQUEUED");
+  assert.ok(local.gateway_pid, "the exact listener identity remains for successor death proof");
+
+  assert.deepEqual(await routed.pass(), [], "the same runtime cannot forget its failed teardown");
+  local = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(local.state, "ENQUEUED");
 });
 
 test("missing receiver readback cannot authorize closing a resumed listener", async (t) => {

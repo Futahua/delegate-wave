@@ -184,6 +184,7 @@ export class WakeDeliverer {
     this.kickPollMs = kickPollMs;
     this.sleep = sleepFn;
     this.kicks = new Map();
+    this.kickFailures = new Map();
     // An observer may prove the current attempt terminal while its listener is still a live session
     // for the same conversation. The request is separate from the local wake state so ENQUEUED can
     // keep fencing successor wakes until gateway.close() has actually completed.
@@ -532,10 +533,22 @@ export class WakeDeliverer {
   // Starts one listener per wake without stalling delivery of unrelated conversations. The
   // producer lease ensures no other Delegate Wave runtime may start a competing listener.
   #startKick(wake) {
-    if (!this.kick || this.kicks.has(wake.id)) return false;
+    if (!this.kick || this.kicks.has(wake.id) || this.kickFailures.has(wake.id)) return false;
     const running = Promise.resolve()
       .then(() => this.kick(wake))
-      .catch((error) => { if (this.onError) this.onError(error, wake.id); })
+      .then(
+        (value) => {
+          this.kickFailures.delete(wake.id);
+          return { value, error: null };
+        },
+        (error) => {
+          if (this.onError) this.onError(error, wake.id);
+          // Keep the rejection as data so a background kick never becomes an unhandled promise,
+          // while #closeKick can still refuse to release ENQUEUED when teardown was not proven.
+          this.kickFailures.set(wake.id, error);
+          return { value: null, error };
+        },
+      )
       .finally(() => {
         this.kicks.delete(wake.id);
         this.kickCloseRequested.delete(wake.id);
@@ -545,10 +558,13 @@ export class WakeDeliverer {
   }
 
   async #closeKick(wake) {
+    const priorFailure = this.kickFailures.get(wake.id);
+    if (priorFailure) throw priorFailure;
     const running = this.kicks.get(wake.id);
     if (!running) return;
     this.kickCloseRequested.add(wake.id);
-    await running;
+    const result = await running;
+    if (result?.error) throw result.error;
   }
 
   // Test/diagnostic barrier only. A correct listener may remain parked indefinitely while an event
@@ -656,7 +672,7 @@ export class WakeDeliverer {
     const self = await this.#whoAmI();
     const current = this.get(wake.id);
     if (!current || current.state !== "ENQUEUED") return null;
-    if (this.#isMine(current)) return current;
+    if (this.#isMine(current)) return this.kickFailures.has(current.id) ? null : current;
 
     if (current.owner_pid == null) {
       const changed = this.db.prepare(

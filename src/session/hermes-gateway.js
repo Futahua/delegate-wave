@@ -30,6 +30,7 @@ import { processStartedAt } from "./liveness.js";
 
 const DEFAULT_READY_MS = 60_000;
 const DEFAULT_REQUEST_MS = 120_000;
+const DEFAULT_CLOSE_GRACE_MS = 5_000;
 
 // A refusal that means "not now", as distinct from "not ever".
 //
@@ -78,6 +79,7 @@ export class HermesGateway {
     env = null,
     readyTimeoutMs = DEFAULT_READY_MS,
     requestTimeoutMs = DEFAULT_REQUEST_MS,
+    closeGraceMs = DEFAULT_CLOSE_GRACE_MS,
     onEvent = null,
   } = {}) {
     this.command = command;
@@ -86,6 +88,7 @@ export class HermesGateway {
     this.env = env;
     this.readyTimeoutMs = readyTimeoutMs;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.closeGraceMs = closeGraceMs;
     this.onEvent = onEvent;
     this.child = null;
     this.nextId = 1;
@@ -287,11 +290,35 @@ export class HermesGateway {
     if (!this.child || this.exit) return;
     try { this.child.stdin.end(); } catch { /* already gone */ }
     const child = this.child;
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } resolve(); }, 5_000);
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error = null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("exit", onExit);
+        if (error) reject(error); else resolve();
+      };
+      const onExit = () => finish();
+      // SIGKILL is a request, not evidence. The only successful completion boundary is the child
+      // exit event (or an exit already observed by the permanent handler above).
+      const timer = setTimeout(() => {
+        if (this.exit) { finish(); return; }
+        try {
+          child.kill("SIGKILL");
+        } catch (error) {
+          if (this.exit) finish();
+          else finish(new GatewayError(`Could not prove Hermes gateway termination: ${error.message}`));
+        }
+      }, this.closeGraceMs);
       if (typeof timer.unref === "function") timer.unref();
-      child.once("exit", () => { clearTimeout(timer); resolve(); });
-      try { child.kill(); } catch { clearTimeout(timer); resolve(); }
+      child.once("exit", onExit);
+      try {
+        child.kill();
+      } catch (error) {
+        if (this.exit) finish();
+        else finish(new GatewayError(`Could not prove Hermes gateway termination: ${error.message}`));
+      }
     });
   }
 }
