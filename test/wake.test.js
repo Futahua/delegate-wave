@@ -160,19 +160,23 @@ function fakeExternalTurns() {
   const rows = new Map();
   const calls = { enqueue: 0, get: 0, reopen: 0 };
   let enqueueError = null;
+  let throwAfterStore = false;
+  const getErrors = [];
   const api = {
     async enqueue({ eventId, sessionKey, body, source }) {
       calls.enqueue += 1;
-      if (enqueueError) throw enqueueError;
+      if (enqueueError && !throwAfterStore) throw enqueueError;
       if (rows.has(eventId)) return false;
       rows.set(eventId, {
         event_id: eventId, target_session_key: sessionKey, body, source,
         state: "PENDING", owner_alive: null,
       });
+      if (enqueueError) throw enqueueError;
       return true;
     },
     async get(eventId) {
       calls.get += 1;
+      if (getErrors.length) throw getErrors.shift();
       return rows.has(eventId) ? { ...rows.get(eventId) } : null;
     },
     async reopen(eventId) {
@@ -188,7 +192,11 @@ function fakeExternalTurns() {
     calls,
     put: (row) => rows.set(row.event_id, { ...row }),
     row: (id) => rows.get(id),
-    failEnqueue: (error) => { enqueueError = error; },
+    failEnqueue: (error, { afterStore = false } = {}) => {
+      enqueueError = error;
+      throwAfterStore = afterStore;
+    },
+    failNextGet: (error) => getErrors.push(error),
   };
 }
 
@@ -406,16 +414,113 @@ test("wake-shaped human prose without durable display kind is not delivery evide
   ], wake), "ABSENT");
 });
 
-test("unavailable external-turn adapter leaves wake queued and never submits directly", async (t) => {
+test("failure before enqueue invocation returns safely to PENDING", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
   const receiver = fakeExternalTurns();
-  receiver.failEnqueue(new Error("Hermes receiver unavailable"));
+  receiver.failNextGet(new Error("Hermes receiver unavailable before enqueue"));
   const errors = [];
 
   await routedDeliverer(w, receiver, fakeCanonical(), { onError: (error) => errors.push(error) }).pass();
   assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PENDING");
+  assert.equal(receiver.calls.enqueue, 0);
   assert.equal(errors.length, 1);
+});
+
+test("post-enqueue transport ambiguity preserves PREPARING and restart adopts once", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.failEnqueue(new Error("stdout timed out after commit"), { afterStore: true });
+  const errors = [];
+
+  await routedDeliverer(w, receiver, fakeCanonical(), { onError: (error) => errors.push(error) }).pass();
+  let local = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(local.state, "PREPARING", "invoking enqueue makes a missing receipt ambiguous");
+  assert.match(local.last_error, /outcome uncertain/);
+  assert.equal(receiver.calls.enqueue, 1);
+  assert.equal(errors.length, 1);
+
+  assert.deepEqual((await routedDeliverer(w, receiver).pass()).map((item) => item.outcome), ["ADOPTED"]);
+  local = w.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(local.state, "ENQUEUED");
+  assert.equal(receiver.calls.enqueue, 1, "recovery adopts the committed event without invoking enqueue again");
+});
+
+test("one producer lease serializes ENQUEUED reconciliation across runtimes", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: false }));
+
+  let releaseHistory;
+  let historyStarted;
+  const enteredHistory = new Promise((resolve) => { historyStarted = resolve; });
+  const historyGate = new Promise((resolve) => { releaseHistory = resolve; });
+  const canonicalA = {
+    factory: () => ({
+      async read(sessionId) {
+        historyStarted();
+        await historyGate;
+        return { sessionId, resolvedSessionId: `runtime_${sessionId}`, messages: [] };
+      },
+    }),
+  };
+  const ownerA = { pid: 9101, startedAt: "owner-a" };
+  const ownerB = { pid: 9102, startedAt: "owner-b" };
+  const a = routedDeliverer(w, receiver, canonicalA, {
+    identity: async () => ownerA,
+    probe: async () => ALIVE,
+  });
+  const canonicalB = fakeCanonical([
+    { role: "user", display_kind: "delegate_wave_wake", text: wake.body },
+  ]);
+  const b = routedDeliverer(w, receiver, canonicalB, {
+    identity: async () => ownerB,
+    probe: async (pid, startedAt) => (
+      pid === ownerA.pid && startedAt === ownerA.startedAt ? ALIVE : DEAD
+    ),
+  });
+
+  const passA = a.pass();
+  await enteredHistory;
+  assert.deepEqual(await b.pass(), [], "the second runtime cannot inspect under a live producer lease");
+  assert.equal(canonicalB.calls.read, 0);
+
+  releaseHistory();
+  assert.deepEqual((await passA).map((item) => item.outcome), ["REOPENED"]);
+  receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
+  assert.deepEqual(await b.pass(), [], "the successor Hermes attempt is still owned by producer A");
+  assert.equal(canonicalB.calls.read, 0, "B cannot turn a healthy new attempt into stale PARTIAL evidence");
+  assert.notEqual(w.db.prepare("SELECT state FROM session_watches WHERE id = ?").get(wake.watch_id).state,
+    "BLOCKED");
+});
+
+test("an ENQUEUED observer lease is reclaimed only after its exact owner is proven dead", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare(`UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ?,
+                                        owner_pid = 9301, owner_started_at = 'old-birth' WHERE id = ?`)
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const successor = { pid: 9302, startedAt: "new-birth" };
+  const probes = [];
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    identity: async () => successor,
+    probe: async (pid, startedAt) => {
+      probes.push([pid, startedAt]);
+      return DEAD;
+    },
+  });
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  assert.deepEqual(probes, [[9301, "old-birth"]]);
+  const local = w.db.prepare("SELECT owner_pid, owner_started_at FROM wake_outbox WHERE id = ?").get(wake.id);
+  assert.equal(local.owner_pid, successor.pid);
+  assert.equal(local.owner_started_at, successor.startedAt);
 });
 
 test("a working session produces no wake and no cost", (t) => {

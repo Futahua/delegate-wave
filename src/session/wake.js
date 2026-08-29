@@ -194,6 +194,10 @@ export class WakeDeliverer {
     // process that is no longer driving it would otherwise be unreachable by both rules: the
     // cross-process rule refuses to touch a live owner's work, and the owner had already moved on.
     this.driving = new Set();
+    // A thrown adapter call is ambiguous only after enqueue was invoked: the Python process may
+    // have committed before its stdout or exit status reached Node. The pass-level recovery rule
+    // consults this set to preserve PREPARING in exactly that case.
+    this.enqueueAttempted = new Set();
     // Established once. It is the same answer every time within a process, and it costs a spawn.
     this.self = null;
   }
@@ -362,19 +366,21 @@ export class WakeDeliverer {
       && remote.body === replaceLoneSurrogates(wake.body);
   }
 
-  #adopt(wake, runtimeSessionId = null) {
+  async #adopt(wake, runtimeSessionId = null) {
+    const self = await this.#whoAmI();
     const changed = this.db.prepare(
       `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = COALESCE(enqueued_at, ?),
                               runtime_session_id = COALESCE(?, runtime_session_id),
-                              owner_pid = NULL, owner_started_at = NULL,
+                              owner_pid = ?, owner_started_at = ?,
                               gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
        WHERE id = ? AND state = 'PREPARING'`,
-    ).run(now(), runtimeSessionId, now(), wake.id).changes;
+    ).run(now(), runtimeSessionId, self.pid, self.startedAt, now(), wake.id).changes;
     return changed === 1;
   }
 
   async #enqueue(wake, runtimeSessionId = null) {
     const receiver = this.externalTurns();
+    this.enqueueAttempted.add(wake.id);
     await receiver.enqueue({
       eventId: wake.id,
       sessionKey: wake.hermes_session_id,
@@ -384,7 +390,9 @@ export class WakeDeliverer {
     const remote = await receiver.get(wake.id);
     this.#recordReceiver(wake, remote);
     if (!remote) {
-      this.release(wake, "enqueue not confirmed: receiver has no record after enqueue", "PREPARING");
+      // Enqueue was invoked, so absence is not enough to assert that nothing committed. Keep the
+      // ambiguity explicit; the same owner (or a proven successor) asks again on recovery.
+      this.enqueueAttempted.delete(wake.id);
       this.#event("WAKE_ENQUEUE_UNCONFIRMED", wake, { detail: "remote event absent" });
       return "UNCONFIRMED";
     }
@@ -393,10 +401,13 @@ export class WakeDeliverer {
         detail: "integrity failure: the receiver holds a different event under this wake id",
         expectedState: "PREPARING",
       });
+      this.enqueueAttempted.delete(wake.id);
       this.#event("WAKE_REMOTE_INTEGRITY_FAILURE", wake, {});
       return "INTEGRITY_FAILURE";
     }
-    if (!this.#adopt(wake, runtimeSessionId)) return "LOST_CLAIM";
+    const adopted = await this.#adopt(wake, runtimeSessionId);
+    this.enqueueAttempted.delete(wake.id);
+    if (!adopted) return "LOST_CLAIM";
     this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
     return "ENQUEUED";
   }
@@ -416,7 +427,7 @@ export class WakeDeliverer {
           this.#event("WAKE_REMOTE_INTEGRITY_FAILURE", wake, {});
           return "INTEGRITY_FAILURE";
         }
-        if (!this.#adopt(wake)) return "LOST_CLAIM";
+        if (!await this.#adopt(wake)) return "LOST_CLAIM";
         this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
         return "ADOPTED";
       }
@@ -492,6 +503,38 @@ export class WakeDeliverer {
     }
     this.#settle(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
     return verdict;
+  }
+
+  // Acquire the producer-side observer lease for an already-routed wake. Hermes serializes its own
+  // consumers; this lease independently serializes the producers that may inspect history, reopen,
+  // and (in Stage 4) maintain a dormant-session kick. It is intentionally durable across passes.
+  // Only a matching live owner or a successor that proves that owner dead may act.
+  async #claimEnqueued(wake) {
+    const self = await this.#whoAmI();
+    const current = this.get(wake.id);
+    if (!current || current.state !== "ENQUEUED") return null;
+    if (this.#isMine(current)) return current;
+
+    if (current.owner_pid == null) {
+      const changed = this.db.prepare(
+        `UPDATE wake_outbox SET owner_pid = ?, owner_started_at = ?, updated_at = ?
+         WHERE id = ? AND state = 'ENQUEUED' AND owner_pid IS NULL`,
+      ).run(self.pid, self.startedAt, now(), current.id).changes;
+      return changed === 1 ? this.get(current.id) : null;
+    }
+
+    // A pid without its process birth identity cannot be safely reclaimed. This can only be legacy
+    // or corrupt evidence; time passing does not improve it.
+    if (current.owner_started_at == null) return null;
+    const verdict = await this.probe(current.owner_pid, current.owner_started_at);
+    if (verdict !== DEAD) return null;
+    const changed = this.db.prepare(
+      `UPDATE wake_outbox SET owner_pid = ?, owner_started_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'ENQUEUED' AND owner_pid = ? AND owner_started_at IS ?`,
+    ).run(
+      self.pid, self.startedAt, now(), current.id, current.owner_pid, current.owner_started_at,
+    ).changes;
+    return changed === 1 ? this.get(current.id) : null;
   }
 
   // One wake, start to finish, using one protocol only. Routed delivery never falls back to direct
@@ -682,14 +725,16 @@ export class WakeDeliverer {
   // conversation, so resolving it is what unblocks delivery rather than competing with it.
   async pass({ atMs = Date.now() } = {}) {
     const outcomes = [];
-    // Receiver-owned events hold the single-flight slot. Observe them before claiming anything
-    // else; PENDING/CLAIMED simply remain waiting until Stage 4 supplies a listener.
+    // Receiver-owned events hold the single-flight slot. Acquire their producer observer lease and
+    // inspect them before claiming anything else; PENDING/CLAIMED simply remain waiting until
+    // Stage 4 supplies a listener. Another live Delegate Wave runtime owns the rows it leased.
     const enqueued = this.db.prepare(
       "SELECT * FROM wake_outbox WHERE state = 'ENQUEUED' ORDER BY updated_at",
     ).all();
     for (const wake of enqueued) {
       try {
-        outcomes.push({ wakeId: wake.id, outcome: await this.#observe(wake) });
+        const owned = await this.#claimEnqueued(wake);
+        if (owned) outcomes.push({ wakeId: wake.id, outcome: await this.#observe(owned) });
       } catch (error) {
         // Failure to ask the receiver is not evidence about what it did. Keep ENQUEUED and retry
         // observation later; never fall back to direct submit.
@@ -722,7 +767,14 @@ export class WakeDeliverer {
       // no longer driving it.
       const current = this.get(claimed.id);
       if (current?.state === "PREPARING") {
-        this.release(claimed, String(error.message).slice(0, 500));
+        if (this.allowEnqueue && this.enqueueAttempted.delete(claimed.id)) {
+          // The receiver may have committed. PREPARING is the durable statement that readback is
+          // still owed; a later pass asks by the stable wake id and adopts rather than guessing.
+          this.db.prepare("UPDATE wake_outbox SET last_error = ?, updated_at = ? WHERE id = ? AND state = 'PREPARING'")
+            .run(`enqueue outcome uncertain: ${String(error.message).slice(0, 450)}`, now(), claimed.id);
+        } else {
+          this.release(claimed, String(error.message).slice(0, 500));
+        }
       } else if (current?.state === "SUBMITTED") {
         try {
           outcomes.push({ wakeId: current.id, outcome: await this.reconcile(current) });
