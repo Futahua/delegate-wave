@@ -600,6 +600,43 @@ test("a dormant PENDING event resumes its session without prompt.submit", async 
   assert.equal("submit" in gateways.gateways[0], false, "the listener has no prompt submission surface");
 });
 
+test("enqueue and adoption defer kicking until receiver-state observation", async (t) => {
+  {
+    const w = world(t);
+    completedWake(w, "hermes_new_pending");
+    const receiver = fakeExternalTurns();
+    let kicks = 0;
+    const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+      kick: async () => { kicks += 1; },
+    });
+    assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["ENQUEUED"]);
+    await routed.settleKicks();
+    assert.equal(kicks, 0, "enqueue readback is a receipt, not a kick decision");
+    assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+    await routed.settleKicks();
+    assert.equal(kicks, 1, "the following PENDING observation supplies kick authority");
+  }
+
+  for (const [state, owner_alive] of [
+    ["PENDING", null], ["CLAIMED", false], ["CLAIMED", true],
+    ["STARTED", true], ["FINISHED", false],
+  ]) {
+    const w = world(t);
+    const wake = completedWake(w, `hermes_adopt_${state}_${owner_alive}`);
+    const receiver = fakeExternalTurns();
+    receiver.put(remoteFor(wake, { state, owner_alive }));
+    let kicks = 0;
+    const routed = routedDeliverer(w, receiver, fakeCanonical([
+      { role: "user", display_kind: "delegate_wave_wake", text: wake.body },
+      { role: "assistant", text: "done" },
+    ]), { kick: async () => { kicks += 1; } });
+
+    assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["ADOPTED"]);
+    await routed.settleKicks();
+    assert.equal(kicks, 0, `${state}/${owner_alive} adoption must not speculate about listener need`);
+  }
+});
+
 test("dead CLAIMED needs a listener; live CLAIMED does not", async (t) => {
   for (const ownerAlive of [false, true]) {
     const w = world(t);
@@ -622,6 +659,8 @@ test("dead CLAIMED needs a listener; live CLAIMED does not", async (t) => {
 test("kick remains alive through PENDING and live STARTED until FINISHED", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
   const receiver = fakeExternalTurns();
   receiver.put(remoteFor(wake));
   const gateways = fakeKickGateways();
@@ -644,9 +683,44 @@ test("kick remains alive through PENDING and live STARTED until FINISHED", async
   assert.deepEqual(gateways.calls.resume, [wake.hermes_session_id]);
 });
 
+test("dead old STARTED cannot close the listener that hosts its reopened successor", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: false }));
+  const gateways = fakeKickGateways();
+  let polls = 0;
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      polls += 1;
+      if (polls === 2) {
+        // Stage-3 observer found no marker and reopened between listener observations.
+        receiver.put(remoteFor(wake, { state: "PENDING", owner_alive: null }));
+      }
+      if (polls === 3) {
+        // The still-live resumed gateway becomes the legitimate owner of the successor attempt.
+        receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
+      }
+      if (polls === 5) receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+      if (polls < 5) assert.equal(gateways.calls.close, 0, "old-owner death cannot close the successor host");
+    },
+  });
+
+  assert.equal(await routed.resumeKick(wake), "HOSTED");
+  assert.equal(polls, 5);
+  assert.equal(gateways.calls.close, 1);
+});
+
 test("missing receiver readback cannot authorize closing a resumed listener", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
   const receiver = fakeExternalTurns();
   const gateways = fakeKickGateways();
   let polls = 0;
@@ -670,6 +744,8 @@ test("missing receiver readback cannot authorize closing a resumed listener", as
 test("ambiguous session.resume timeout is monitored instead of closing a possible owner", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
   const receiver = fakeExternalTurns();
   receiver.put(remoteFor(wake));
   const gateways = fakeKickGateways({ resumeError: new Error("session.resume timed out") });

@@ -418,7 +418,6 @@ export class WakeDeliverer {
     this.enqueueAttempted.delete(wake.id);
     if (!adopted) return "LOST_CLAIM";
     this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
-    this.#startKick(this.get(wake.id));
     return "ENQUEUED";
   }
 
@@ -439,7 +438,6 @@ export class WakeDeliverer {
         }
         if (!await this.#adopt(wake)) return "LOST_CLAIM";
         this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
-        this.#startKick(this.get(wake.id));
         return "ADOPTED";
       }
 
@@ -562,6 +560,17 @@ export class WakeDeliverer {
       for (;;) {
         if (gateway.exit) return sawLiveStarted ? "HOST_GONE" : "GATEWAY_GONE";
         await this.sleep(this.kickPollMs);
+        // Reconciliation is the close authority. STARTED/dead only describes the old attempt; the
+        // observer may reopen it, and this same listener may immediately host the successor. Keep
+        // the gateway until the local evidence is settled or the receiver reaches FINISHED.
+        try {
+          const local = this.get(wake.id);
+          if (!local || local.state !== "ENQUEUED") return "RECONCILED";
+        } catch {
+          // A closed/temporarily unavailable producer DB supplies no permission to kill a possible
+          // host. The supervising process can terminate both together during actual shutdown.
+          continue;
+        }
         let status;
         try {
           status = await receiver.get(wake.id);
@@ -581,7 +590,7 @@ export class WakeDeliverer {
         if (state === "FINISHED") return sawLiveStarted ? "HOSTED" : "FINISHED";
         if (state === "PENDING" || state === "CLAIMED") continue;
         if (state === "STARTED") {
-          if (status.owner_alive === false) return "OWNER_DIED";
+          if (status.owner_alive === false) continue;
           // True means a turn is live. Unknown is kept open too: inability to prove liveness cannot
           // authorize destroying the only listener that might be hosting it.
           if (status.owner_alive === true) sawLiveStarted = true;
