@@ -62,7 +62,14 @@ test("external-turn bridge maps all Hermes module operations through JSON stdin"
   const body = "quotes \" and newline\nvalid 😃 lone \uDC9D";
 
   assert.equal(await adapter.present(), true);
-  assert.equal(await adapter.enqueue({ eventId: "wake_1", sessionKey: "S 1", body }), false);
+  const displayMetadata = {
+    reason: "QUESTION",
+    delegate_session_id: "asess_1",
+    delegate_message_id: "msg_1",
+  };
+  assert.equal(await adapter.enqueue({
+    eventId: "wake_1", sessionKey: "S 1", body, displayMetadata,
+  }), false);
   assert.deepEqual(await adapter.get("wake_1"), {
     event_id: "wake_1", state: "PENDING", owner_alive: false,
   });
@@ -72,6 +79,7 @@ test("external-turn bridge maps all Hermes module operations through JSON stdin"
     {
       op: "enqueue", event_id: "wake_1", target_session_key: "S 1",
       body: replaceLoneSurrogates(body), source: "delegate-wave",
+      display_metadata: displayMetadata,
     },
     { op: "get", event_id: "wake_1" },
     { op: "reopen", event_id: "wake_1", reason: "owner died" },

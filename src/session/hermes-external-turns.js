@@ -79,6 +79,7 @@ try:
             target_session_key=request["session_key"],
             body=request["body"],
             source=request.get("source") or "delegate-wave",
+            display_metadata=request.get("display_metadata"),
         )}
     elif op == "status":
         out = {"ok": True, "result": get_external_turn(request["event_id"])}
@@ -180,9 +181,10 @@ export class HermesExternalTurns {
   // False is a SUCCESS, not a conflict: the event id is delegate-wave's own wake id, so a producer
   // that could not tell whether its last attempt landed may safely say it again and will not create
   // a second turn. That idempotence is what makes the enqueue step safely retryable at all.
-  async enqueue({ eventId, sessionKey, body, source = "delegate-wave" }) {
+  async enqueue({ eventId, sessionKey, body, source = "delegate-wave", displayMetadata = null }) {
     return this.#call("enqueue", {
       event_id: eventId, session_key: sessionKey, body, source,
+      display_metadata: displayMetadata,
     });
   }
 

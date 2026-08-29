@@ -164,12 +164,13 @@ function fakeExternalTurns() {
   const getErrors = [];
   const getErrorsAt = new Map();
   const api = {
-    async enqueue({ eventId, sessionKey, body, source }) {
+    async enqueue({ eventId, sessionKey, body, source, displayMetadata }) {
       calls.enqueue += 1;
       if (enqueueError && !throwAfterStore) throw enqueueError;
       if (rows.has(eventId)) return false;
       rows.set(eventId, {
         event_id: eventId, target_session_key: sessionKey, body, source,
+        display_metadata: displayMetadata,
         state: "PENDING", owner_alive: null,
       });
       if (enqueueError) throw enqueueError;
@@ -248,6 +249,11 @@ function remoteFor(wake, rest = {}) {
     target_session_key: wake.hermes_session_id,
     body: wake.body,
     source: "delegate-wave",
+    display_metadata: {
+      reason: wake.reason,
+      delegate_session_id: wake.session_id,
+      ...(wake.message_id ? { delegate_message_id: wake.message_id } : {}),
+    },
     state: "PENDING",
     owner_alive: null,
     ...rest,

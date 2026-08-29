@@ -373,11 +373,20 @@ export class WakeDeliverer {
   }
 
   #remoteMatches(remote, wake) {
+    const expectedMetadata = {
+      reason: wake.reason,
+      delegate_session_id: wake.session_id,
+      ...(wake.message_id ? { delegate_message_id: wake.message_id } : {}),
+    };
+    const metadataMatches = remote?.display_metadata
+      && Object.keys(remote.display_metadata).length === Object.keys(expectedMetadata).length
+      && Object.entries(expectedMetadata).every(([key, value]) => remote.display_metadata[key] === value);
     return Boolean(remote)
       && remote.event_id === wake.id
       && remote.target_session_key === wake.hermes_session_id
       && remote.source === "delegate-wave"
-      && remote.body === replaceLoneSurrogates(wake.body);
+      && remote.body === replaceLoneSurrogates(wake.body)
+      && metadataMatches;
   }
 
   async #adopt(wake, runtimeSessionId = null) {
@@ -400,6 +409,11 @@ export class WakeDeliverer {
       sessionKey: wake.hermes_session_id,
       body: wake.body,
       source: "delegate-wave",
+      displayMetadata: {
+        reason: wake.reason,
+        delegate_session_id: wake.session_id,
+        ...(wake.message_id ? { delegate_message_id: wake.message_id } : {}),
+      },
     });
     const remote = await receiver.get(wake.id);
     this.#recordReceiver(wake, remote);
