@@ -4,6 +4,9 @@ import http from "node:http";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+
+// The reserved _meta key the MCP client stamps the calling conversation into.
+const CALLER_META_KEY = "io.delegate-wave/hermes-session-id";
 import { hermesControlClient, HermesMcpAdapter, runMcpStdio } from "../src/mcp/server.js";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -124,7 +127,10 @@ test("the Hermes MCP adapter cannot reach any operator-scoped route", async () =
       project_id: "p", job_id: "j", proposal_id: "x", goal: "g", idempotency_key: "k",
       intent: "do the thing", session_id: "s", answer: "yes",
     };
-    await adapter.callTool(tool.name, args);
+    // Every call carries the caller identity the client stamps in production.
+    // session_start now refuses without one rather than starting work nobody is
+    // watching, so a sweep over every tool has to supply it.
+    await adapter.callTool(tool.name, args, { [CALLER_META_KEY]: "session_probe" });
   }
   // Two mutations, and both are bounded. A work proposal decides nothing on its own, and a session
   // acts only inside the envelope the user granted it -- neither can approve an arbitrary proposal,
@@ -152,7 +158,7 @@ test("every mutation the adapter performs carries a request id", async () => {
     await adapter.callTool(tool.name, {
       project_id: "p", job_id: "j", proposal_id: "x", goal: "g", idempotency_key: "k",
       intent: "do the thing", session_id: "s", answer: "yes",
-    });
+    }, { [CALLER_META_KEY]: "session_probe" });
   }
   assert.ok(posts.length >= 3, "the mutating tools were exercised");
   for (const post of posts) {
