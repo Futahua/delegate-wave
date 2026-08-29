@@ -323,6 +323,40 @@ test("restart adopts a matching remote event after crash before local ENQUEUED",
   assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
 });
 
+test("upgrade adopts pre-metadata PREPARING and ENQUEUED wakes without weakening new wakes", async (t) => {
+  for (const state of ["PREPARING", "ENQUEUED"]) {
+    const w = world(t);
+    const wake = completedWake(w, `hermes_legacy_${state}`);
+    w.db.prepare(`UPDATE wake_outbox
+                     SET receiver_protocol = 1, state = ?, enqueued_at = ?,
+                         owner_pid = 7003, owner_started_at = 'dead', updated_at = ?
+                   WHERE id = ?`).run(
+      state, state === "ENQUEUED" ? new Date().toISOString() : null,
+      "2020-01-01T00:00:00.000Z", wake.id,
+    );
+    const legacy = { ...remoteFor(wake), display_metadata: null };
+    const receiver = fakeExternalTurns();
+    receiver.put(legacy);
+
+    const outcomes = await routedDeliverer(w, receiver).pass();
+    assert.deepEqual(outcomes.map((item) => item.outcome),
+      [state === "PREPARING" ? "ADOPTED" : "WAITING"]);
+    assert.equal(receiver.calls.enqueue, 0);
+    assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state,
+      "ENQUEUED");
+  }
+
+  const w = world(t);
+  const wake = completedWake(w, "hermes_new_missing_metadata");
+  assert.equal(wake.receiver_protocol, 2);
+  const receiver = fakeExternalTurns();
+  receiver.put({ ...remoteFor(wake), display_metadata: null });
+  assert.deepEqual((await routedDeliverer(w, receiver).pass()).map((item) => item.outcome),
+    ["INTEGRITY_FAILURE"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state,
+    "PARTIAL");
+});
+
 test("receiver collision fails closed and blocks the watch", async (t) => {
   const w = world(t);
   const wake = completedWake(w);

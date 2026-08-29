@@ -77,6 +77,8 @@ test("fresh schema gives ENQUEUED its own evidence and single-flight slot", (t) 
   const second = seedParents(db, "two", "same_conversation");
 
   insertWake(db, first, { id: "wake_enqueued", state: "ENQUEUED", enqueuedAt: first.at });
+  assert.equal(db.prepare("SELECT receiver_protocol FROM wake_outbox WHERE id = 'wake_enqueued'")
+    .get().receiver_protocol, 2, "fresh wakes use the typed-metadata receiver protocol");
   assert.throws(
     () => insertWake(db, second, { id: "wake_second", state: "PREPARING" }),
     /UNIQUE constraint failed/,
@@ -156,6 +158,7 @@ test("schema 34 migration preserves every legacy state without relabelling it", 
   assert.equal(row.enqueued_at, null);
   assert.equal(row.last_receiver_state, null);
   assert.equal(row.last_receiver_observed_at, null);
+  assert.equal(row.receiver_protocol, 1, "pre-upgrade wakes retain legacy receiver identity rules");
   assert.equal(row.attempts, 3);
   assert.equal(row.last_error, "pipe lost");
   assert.equal(row.runtime_session_id, "runtime_old");
@@ -175,5 +178,28 @@ test("schema 34 migration preserves every legacy state without relabelling it", 
   assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
   assert.throws(() => db.prepare("DELETE FROM wake_outbox WHERE id = 'wake_legacy'").run(),
     /wake_outbox is immutable/);
+  db.close();
+});
+
+test("schema 35 migration marks existing wakes legacy but defaults future rows to typed metadata", (t) => {
+  const database = fixture(t);
+  let db = openDatabase(database);
+  const old = seedParents(db, "schema35-old");
+  insertWake(db, old, { id: "wake_schema35", state: "PENDING" });
+  db.exec("ALTER TABLE wake_outbox DROP COLUMN receiver_protocol");
+  db.prepare("UPDATE metadata SET value = '35' WHERE key = 'schema_version'").run();
+  db.close();
+
+  db = openDatabase(database);
+  assert.equal(db.prepare("SELECT receiver_protocol FROM wake_outbox WHERE id = 'wake_schema35'")
+    .get().receiver_protocol, 1);
+  const fresh = seedParents(db, "schema36-new");
+  insertWake(db, fresh, { id: "wake_schema36", state: "PENDING" });
+  assert.equal(db.prepare("SELECT receiver_protocol FROM wake_outbox WHERE id = 'wake_schema36'")
+    .get().receiver_protocol, 2);
+  const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wake_outbox'")
+    .get().sql;
+  assert.match(ddl, /receiver_protocol INTEGER NOT NULL DEFAULT 2 CHECK \(receiver_protocol IN \(1, 2\)\)/);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
   db.close();
 });

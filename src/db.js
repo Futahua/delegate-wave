@@ -28,7 +28,9 @@ import { managedPaths } from "./paths.js";
 //     proven dead rather than from one that has merely been slow.
 // 35: routed wakes have their own ENQUEUED state and receiver observations; legacy SUBMITTED rows
 //     remain explicit recovery history rather than being reinterpreted as inbox events.
-export const SCHEMA_VERSION = "35";
+// 36: receiver_protocol distinguishes pre-metadata routed wakes from newly created typed wakes, so
+//     an in-flight schema-35 handoff remains adoptable across upgrade without weakening new events.
+export const SCHEMA_VERSION = "36";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -97,6 +99,7 @@ const WAKE_OUTBOX_COLUMNS = `
   message_id TEXT REFERENCES autonomous_session_messages(id),
   marker TEXT NOT NULL UNIQUE,
   body TEXT NOT NULL,
+  receiver_protocol INTEGER NOT NULL DEFAULT 2 CHECK (receiver_protocol IN (1, 2)),
   -- SUBMITTED is evidence from the legacy direct prompt.submit protocol. ENQUEUED is evidence that
   -- wake.id was read back from Hermes' external-turn inbox. Migration never reinterprets one as the
   -- other; Stage 3 will make ENQUEUED the only state newly produced by routed delivery.
@@ -1289,6 +1292,9 @@ function migrate(db) {
       // SUBMITTED row is never relabelled ENQUEUED merely because the inbox now exists.
       ["enqueued_at", "TEXT"],
       ["last_receiver_state", "TEXT"], ["last_receiver_observed_at", "TEXT"],
+      // Schema 36. Every row already on disk predates typed receiver metadata. New rows explicitly
+      // use protocol 2 at creation; this default exists only to truthfully backfill old evidence.
+      ["receiver_protocol", "INTEGER NOT NULL DEFAULT 1"],
     ]) {
       if (!wakeColumns.includes(column)) db.exec(`ALTER TABLE wake_outbox ADD COLUMN ${column} ${type}`);
     }
@@ -1381,13 +1387,17 @@ function rebuildConstrainedTables(db) {
       ],
     });
   }
-  if (definition("wake_outbox") && !definition("wake_outbox").includes("'ENQUEUED'")) {
+  if (definition("wake_outbox") && (
+    !definition("wake_outbox").includes("'ENQUEUED'")
+    || !definition("wake_outbox").includes("receiver_protocol IN (1, 2)")
+  )) {
     pending.push({
       name: "wake_outbox",
       columns: WAKE_OUTBOX_COLUMNS,
       // Named rather than positional: migration columns are appended physically, not placed where
       // the canonical definition declares them.
       copy: `id, watch_id, session_id, hermes_session_id, reason, message_id, marker, body,
+             receiver_protocol,
              state, attempts, last_error, reconciled_at, runtime_session_id, submitted_at,
              enqueued_at, last_receiver_state, last_receiver_observed_at,
              owner_pid, owner_started_at, gateway_pid, gateway_started_at, created_at, updated_at`,

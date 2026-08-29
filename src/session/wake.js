@@ -381,12 +381,18 @@ export class WakeDeliverer {
     const metadataMatches = remote?.display_metadata
       && Object.keys(remote.display_metadata).length === Object.keys(expectedMetadata).length
       && Object.entries(expectedMetadata).every(([key, value]) => remote.display_metadata[key] === value);
+    // Protocol 1 rows were durably created before typed receiver metadata existed. Only those
+    // already-recorded wakes may adopt a metadata-less Hermes row after an upgrade. Protocol 2 is
+    // stamped when the watcher creates a wake, before any delivery attempt, so a new event can
+    // never gain this exception merely because its remote metadata is absent.
+    const legacyMetadataMatches = wake.receiver_protocol === 1
+      && (remote?.display_metadata == null);
     return Boolean(remote)
       && remote.event_id === wake.id
       && remote.target_session_key === wake.hermes_session_id
       && remote.source === "delegate-wave"
       && remote.body === replaceLoneSurrogates(wake.body)
-      && metadataMatches;
+      && (metadataMatches || legacyMetadataMatches);
   }
 
   async #adopt(wake, runtimeSessionId = null) {

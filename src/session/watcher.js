@@ -282,8 +282,8 @@ export class SessionWatcher {
       transaction(this.db, () => {
         this.db.prepare(`INSERT INTO wake_outbox(
           id, watch_id, session_id, hermes_session_id, reason, message_id, marker, body,
-          state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`).run(
+          receiver_protocol, state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, 'PENDING', ?, ?)`).run(
           wakeId, row.watch_id, row.session_id, row.hermes_session_id, reason, messageId,
           marker, body, now(), now(),
         );
