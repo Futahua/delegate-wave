@@ -251,13 +251,14 @@ export class SessionWatcher {
       // it -- so the person gets told twice about one thing.
       //
       // An open wake for the same logical event is therefore adopted rather than duplicated. Open
-      // means PENDING, PREPARING or SUBMITTED: still on its way. DELIVERED and PARTIAL are
+      // means PENDING, PREPARING, legacy SUBMITTED, or routed ENQUEUED: still on its way.
+      // DELIVERED and PARTIAL are
       // deliberately NOT open -- once a person has cleared a PARTIAL and no queued copy survives,
       // re-announcing that event is exactly what they asked for.
       const alreadyQueued = this.db.prepare(
         `SELECT id FROM wake_outbox
          WHERE watch_id = ? AND reason = ? AND message_id IS ?
-           AND state IN ('PENDING', 'PREPARING', 'SUBMITTED')
+           AND state IN ('PENDING', 'PREPARING', 'SUBMITTED', 'ENQUEUED')
          ORDER BY created_at LIMIT 1`,
       ).get(row.watch_id, reason, messageId);
       if (alreadyQueued) {

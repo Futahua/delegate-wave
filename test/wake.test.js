@@ -226,6 +226,45 @@ test("watching is idempotent per conversation", (t) => {
   assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM session_watches").get().n, 2);
 });
 
+test("an ENQUEUED logical event remains open and is not recreated", (t) => {
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_enqueued_dedup");
+  w.setState(sessionId, "COMPLETED");
+  assert.equal(w.watcher.pass().length, 1);
+  const wake = w.db.prepare("SELECT * FROM wake_outbox WHERE session_id = ?").get(sessionId);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  // Simulate a watcher restart that lost its denormalized notification cursor. The durable open
+  // outbox row must still be enough to suppress a duplicate logical event.
+  w.db.prepare(`UPDATE session_watches
+    SET notified_state = NULL, notified_message_id = NULL WHERE session_id = ?`).run(sessionId);
+
+  assert.deepEqual(w.watcher.pass(), []);
+  assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM wake_outbox WHERE session_id = ?")
+    .get(sessionId).n, 1);
+});
+
+test("an ENQUEUED wake fences a later pending wake for the same conversation", async (t) => {
+  const w = world(t);
+  const first = w.session();
+  const second = w.session();
+  registerWatch(w.db, first, "hermes_enqueued_fence");
+  registerWatch(w.db, second, "hermes_enqueued_fence");
+  w.setState(first, "COMPLETED");
+  w.setState(second, "COMPLETED");
+  w.watcher.pass();
+  const wakes = w.db.prepare("SELECT * FROM wake_outbox ORDER BY created_at, id").all();
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wakes[0].id);
+
+  const fake = fakeGateway(w);
+  assert.deepEqual(await deliverer(w, fake).pass(), []);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wakes[1].id).state,
+    "PENDING");
+  assert.equal(fake.transcript().submits, 0);
+});
+
 test("history classification follows the measured crash boundaries", () => {
   const marker = wakeMarker("wake_x");
   assert.equal(classifyHistory([], marker), "ABSENT");

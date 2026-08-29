@@ -195,7 +195,7 @@ export class WakeDeliverer {
   // Takes the oldest deliverable wake, or nothing.
   //
   // The claim is the same INSERT-shaped bet the rest of this system makes: the partial unique index
-  // over (hermes_session_id) WHERE state IN ('PREPARING','SUBMITTED') is what actually enforces one
+  // over (hermes_session_id) WHERE state IN ('PREPARING','SUBMITTED','ENQUEUED') is what enforces one
   // delivery per conversation, so two racing processes do not both take the same conversation --
   // one of them simply fails to claim and moves on.
   async #whoAmI() {
@@ -218,7 +218,8 @@ export class WakeDeliverer {
         const row = this.db.prepare(
           `SELECT * FROM wake_outbox WHERE state = 'PENDING'
              AND hermes_session_id NOT IN (
-               SELECT hermes_session_id FROM wake_outbox WHERE state IN ('PREPARING', 'SUBMITTED')
+               SELECT hermes_session_id FROM wake_outbox
+               WHERE state IN ('PREPARING', 'SUBMITTED', 'ENQUEUED')
              )
              -- A BLOCKED watch blocks what is ALREADY QUEUED, not merely what would be enqueued next.
              --
