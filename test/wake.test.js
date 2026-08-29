@@ -254,7 +254,7 @@ function remoteFor(wake, rest = {}) {
   };
 }
 
-function fakeKickGateways({ onResume = null, resumeError = null } = {}) {
+function fakeKickGateways({ onResume = null, onClose = null, resumeError = null } = {}) {
   const calls = { start: 0, resume: [], close: 0, created: 0 };
   const gateways = [];
   return {
@@ -271,7 +271,10 @@ function fakeKickGateways({ onResume = null, resumeError = null } = {}) {
           if (resumeError) throw resumeError;
           return { runtimeSessionId: `runtime_${sessionId}`, durableSessionId: sessionId };
         },
-        async close() { calls.close += 1; },
+        async close() {
+          calls.close += 1;
+          if (onClose) await onClose(gateway);
+        },
       };
       gateways.push(gateway);
       return gateway;
@@ -575,6 +578,30 @@ test("an ENQUEUED observer lease is reclaimed only after its exact owner is prov
   assert.equal(local.owner_started_at, successor.startedAt);
 });
 
+test("a dead producer's live listener preserves the ENQUEUED fence across runtimes", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare(`UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ?,
+                 owner_pid = 9401, owner_started_at = 'dead-owner',
+                 gateway_pid = 9402, gateway_started_at = 'live-listener' WHERE id = ?`)
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const answers = new Map([[9401, DEAD], [9402, ALIVE]]);
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    identity: async () => ({ pid: 9403, startedAt: "successor" }),
+    probe: async (pid) => answers.get(pid) ?? UNKNOWN,
+  });
+
+  assert.deepEqual(await routed.pass(), []);
+  assert.equal(receiver.calls.get, 0, "a successor cannot inspect beneath an orphan listener");
+  assert.equal(w.db.prepare("SELECT owner_pid FROM wake_outbox WHERE id = ?").get(wake.id).owner_pid, 9401);
+
+  answers.set(9402, DEAD);
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  assert.equal(w.db.prepare("SELECT owner_pid FROM wake_outbox WHERE id = ?").get(wake.id).owner_pid, 9403);
+});
+
 test("a dormant PENDING event resumes its session without prompt.submit", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
@@ -714,6 +741,78 @@ test("dead old STARTED cannot close the listener that hosts its reopened success
   assert.equal(await routed.resumeKick(wake), "HOSTED");
   assert.equal(polls, 5);
   assert.equal(gateways.calls.close, 1);
+});
+
+test("successor wake stays fenced until the prior listener has actually closed", async (t) => {
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_successive");
+  const questionId = w.ask(sessionId, "Which format?");
+  w.watcher.pass();
+  w.answer(sessionId, questionId);
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const [first, second] = w.db.prepare("SELECT * FROM wake_outbox ORDER BY created_at").all();
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), first.id);
+
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(first));
+  let releasePoll;
+  let pollEntered;
+  const pollIsWaiting = new Promise((resolve) => { pollEntered = resolve; });
+  const pollGate = new Promise((resolve) => { releasePoll = resolve; });
+  let releaseClose;
+  let closeEntered;
+  const closeIsWaiting = new Promise((resolve) => { closeEntered = resolve; });
+  const closeGate = new Promise((resolve) => { releaseClose = resolve; });
+  const gateways = fakeKickGateways({
+    onClose: async () => {
+      closeEntered();
+      await closeGate;
+    },
+  });
+  const canonical = fakeCanonical([
+    { role: "user", display_kind: "delegate_wave_wake", text: first.body },
+    { role: "assistant", text: "The answer was recorded." },
+  ]);
+  const routed = routedDeliverer(w, receiver, canonical, {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      pollEntered();
+      await pollGate;
+    },
+  });
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  await pollIsWaiting;
+  receiver.put(remoteFor(first, { state: "FINISHED", owner_alive: false }));
+  let terminalPassDone = false;
+  const terminalPass = routed.pass().then((result) => {
+    terminalPassDone = true;
+    return result;
+  });
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(terminalPassDone, false);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(first.id).state, "ENQUEUED");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "PENDING");
+  assert.equal(receiver.row(second.id), undefined, "the old listener cannot consume a wake not yet handed over");
+
+  releasePoll();
+  await closeIsWaiting;
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(first.id).state, "ENQUEUED",
+    "the durable fence remains until gateway.close resolves");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "PENDING");
+  releaseClose();
+  assert.deepEqual((await terminalPass).map((item) => item.outcome), ["DELIVERED"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(first.id).state, "DELIVERED");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(second.id).state, "PENDING",
+    "successor waits for a fresh pass after listener teardown");
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["ENQUEUED"]);
+  assert.ok(receiver.row(second.id));
 });
 
 test("missing receiver readback cannot authorize closing a resumed listener", async (t) => {

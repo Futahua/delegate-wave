@@ -184,6 +184,10 @@ export class WakeDeliverer {
     this.kickPollMs = kickPollMs;
     this.sleep = sleepFn;
     this.kicks = new Map();
+    // An observer may prove the current attempt terminal while its listener is still a live session
+    // for the same conversation. The request is separate from the local wake state so ENQUEUED can
+    // keep fencing successor wakes until gateway.close() has actually completed.
+    this.kickCloseRequested = new Set();
     this.investigateAfterMs = investigateAfterMs;
     this.turnDeadlineMs = turnDeadlineMs;
     this.probe = probe;
@@ -452,14 +456,14 @@ export class WakeDeliverer {
     const status = await receiver.get(wake.id);
     this.#recordReceiver(wake, status);
     if (!status) {
-      this.#settle(wake, "PARTIAL", {
+      await this.#settleObserved(wake, "PARTIAL", {
         detail: "receiver has no record of an event recorded locally as ENQUEUED",
         expectedState: "ENQUEUED",
       });
       return "PARTIAL";
     }
     if (!this.#remoteMatches(status, wake)) {
-      this.#settle(wake, "PARTIAL", {
+      await this.#settleObserved(wake, "PARTIAL", {
         detail: "integrity failure: the receiver event no longer matches this wake",
         expectedState: "ENQUEUED",
       });
@@ -473,14 +477,14 @@ export class WakeDeliverer {
     }
     if (state === "STARTED" && status.owner_alive === true) return "WAITING";
     if (state === "STARTED" && status.owner_alive !== false) {
-      this.#settle(wake, "PARTIAL", {
+      await this.#settleObserved(wake, "PARTIAL", {
         detail: "receiver STARTED state did not report a definite owner-liveness verdict",
         expectedState: "ENQUEUED",
       });
       return "PARTIAL";
     }
     if (state !== "STARTED" && state !== "FINISHED") {
-      this.#settle(wake, "PARTIAL", {
+      await this.#settleObserved(wake, "PARTIAL", {
         detail: `unknown receiver state: ${state || "missing"}`,
         expectedState: "ENQUEUED",
       });
@@ -503,19 +507,26 @@ export class WakeDeliverer {
         this.#event("WAKE_REOPENED", wake, {});
         return "REOPENED";
       }
-      this.#settle(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
+      await this.#settleObserved(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
       return verdict;
     }
     if (verdict === "ABSENT") {
-      this.#settle(wake, "PARTIAL", {
+      await this.#settleObserved(wake, "PARTIAL", {
         runtimeSessionId,
         detail: "receiver reports FINISHED but canonical history has no typed wake marker",
         expectedState: "ENQUEUED",
       });
       return "PARTIAL";
     }
-    this.#settle(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
+    await this.#settleObserved(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
     return verdict;
+  }
+
+  // Close the listener while ENQUEUED still owns the conversation's unique-index slot, then and
+  // only then release that durable fence by recording the terminal verdict.
+  async #settleObserved(wake, verdict, options) {
+    await this.#closeKick(wake);
+    return this.#settle(wake, verdict, options);
   }
 
   // Starts one listener per wake without stalling delivery of unrelated conversations. The
@@ -525,9 +536,19 @@ export class WakeDeliverer {
     const running = Promise.resolve()
       .then(() => this.kick(wake))
       .catch((error) => { if (this.onError) this.onError(error, wake.id); })
-      .finally(() => { this.kicks.delete(wake.id); });
+      .finally(() => {
+        this.kicks.delete(wake.id);
+        this.kickCloseRequested.delete(wake.id);
+      });
     this.kicks.set(wake.id, running);
     return true;
+  }
+
+  async #closeKick(wake) {
+    const running = this.kicks.get(wake.id);
+    if (!running) return;
+    this.kickCloseRequested.add(wake.id);
+    await running;
   }
 
   // Test/diagnostic barrier only. A correct listener may remain parked indefinitely while an event
@@ -543,8 +564,17 @@ export class WakeDeliverer {
     // broken, fail before anything exists that could claim the event and then be killed by cleanup.
     const receiver = this.externalTurns();
     const gateway = this.gatewayFactory();
+    let child = null;
     try {
       await gateway.start();
+      child = typeof gateway.identity === "function" ? await gateway.identity() : null;
+      if (child?.pid) {
+        const self = await this.#whoAmI();
+        this.db.prepare(
+          `UPDATE wake_outbox SET gateway_pid = ?, gateway_started_at = ?, updated_at = ?
+           WHERE id = ? AND state = 'ENQUEUED' AND owner_pid = ? AND owner_started_at IS ?`,
+        ).run(child.pid, child.startedAt ?? null, now(), wake.id, self.pid, self.startedAt).changes;
+      }
       try {
         await gateway.resume(wake.hermes_session_id);
       } catch (error) {
@@ -559,7 +589,9 @@ export class WakeDeliverer {
       let sawLiveStarted = false;
       for (;;) {
         if (gateway.exit) return sawLiveStarted ? "HOST_GONE" : "GATEWAY_GONE";
+        if (this.kickCloseRequested.has(wake.id)) return "RECONCILED";
         await this.sleep(this.kickPollMs);
+        if (this.kickCloseRequested.has(wake.id)) return "RECONCILED";
         // Reconciliation is the close authority. STARTED/dead only describes the old attempt; the
         // observer may reopen it, and this same listener may immediately host the successor. Keep
         // the gateway until the local evidence is settled or the receiver reaches FINISHED.
@@ -581,6 +613,7 @@ export class WakeDeliverer {
           });
           continue;
         }
+        if (this.kickCloseRequested.has(wake.id)) return "RECONCILED";
         if (!status) {
           // Local ENQUEUED and remote absence disagree. That is not proof that the resumed session
           // is harmless to close; keep the listener and let Stage-3 reconciliation surface PARTIAL.
@@ -604,6 +637,14 @@ export class WakeDeliverer {
       return "FAILED";
     } finally {
       await gateway.close();
+      // Clear only this listener's durable identity. A newer listener may have been established
+      // after this one exited, and cleanup from an old finally block must not erase its fence.
+      if (child?.pid) {
+        this.db.prepare(
+          `UPDATE wake_outbox SET gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
+           WHERE id = ? AND gateway_pid = ? AND gateway_started_at IS ?`,
+        ).run(now(), wake.id, child.pid, child.startedAt ?? null);
+      }
     }
   }
 
@@ -630,6 +671,13 @@ export class WakeDeliverer {
     if (current.owner_started_at == null) return null;
     const verdict = await this.probe(current.owner_pid, current.owner_started_at);
     if (verdict !== DEAD) return null;
+    if (current.gateway_pid != null) {
+      // The producer died, but its resumed listener may still be a live session for this
+      // conversation. Do not let a successor reconcile away the fence beneath that process.
+      if (current.gateway_started_at == null) return null;
+      const listener = await this.probe(current.gateway_pid, current.gateway_started_at);
+      if (listener !== DEAD) return null;
+    }
     const changed = this.db.prepare(
       `UPDATE wake_outbox SET owner_pid = ?, owner_started_at = ?, updated_at = ?
        WHERE id = ? AND state = 'ENQUEUED' AND owner_pid = ? AND owner_started_at IS ?`,
@@ -842,6 +890,12 @@ export class WakeDeliverer {
         // observation later; never fall back to direct submit.
         if (this.onError) this.onError(error, wake.id);
       }
+    }
+    // A terminal routed wake has only just released its per-conversation fence after listener
+    // teardown. Do not hand a successor to Hermes in the tail of the same pass; the next pass starts
+    // from a fresh receiver/local snapshot and may claim it normally.
+    if (outcomes.some(({ outcome }) => outcome === "DELIVERED" || outcome === "PARTIAL" || outcome === "AMBIGUOUS")) {
+      return outcomes;
     }
     for (const wake of await this.reclaimable({ atMs })) {
       try {
