@@ -234,8 +234,8 @@ export async function startControlServer({
 
   // Routed delivery and legacy recovery are separately gated. Once routed delivery is selected it
   // never falls back to prompt.submit: an unavailable or incompatible receiver leaves the same wake
-  // safely queued. The gateway remains available only to the legacy path in this stage; waking a
-  // dormant conversation is deliberately deferred to the next stage.
+  // safely queued. In routed mode the gateway may only resume a dormant conversation so Hermes's
+  // own poller can consume the event; it never submits the wake body itself.
   const allowEnqueue = process.env.DELEGATE_WAVE_WAKE_ENQUEUE === "1";
   const deliverer = (allowEnqueue ? HermesExternalTurns.configured() : HermesGateway.configured())
     ? new WakeDeliverer({

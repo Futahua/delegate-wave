@@ -50,6 +50,8 @@ const now = () => new Date().toISOString();
 // another process wrote a second ago; it never permits reclaiming anything. Waiting longer changes
 // only when the question is asked, never what the answer is allowed to be.
 const DEFAULT_INVESTIGATE_AFTER_MS = 60_000;
+const DEFAULT_KICK_POLL_MS = 500;
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 // The capability Hermes must positively report before a single wake may be submitted.
 //
@@ -154,6 +156,9 @@ export class WakeDeliverer {
     allowEnqueue = false,
     externalTurns = () => new HermesExternalTurns(),
     canonicalHistory = () => new HermesCanonicalHistory(),
+    kick = undefined,
+    kickPollMs = DEFAULT_KICK_POLL_MS,
+    sleepFn = sleep,
     investigateAfterMs = DEFAULT_INVESTIGATE_AFTER_MS,
     // A HARD CANCELLATION POLICY, off by default, and not a timeout in any softer sense.
     //
@@ -175,6 +180,10 @@ export class WakeDeliverer {
     this.allowEnqueue = allowEnqueue;
     this.externalTurns = externalTurns;
     this.canonicalHistory = canonicalHistory;
+    this.kick = kick === undefined ? (wake) => this.resumeKick(wake) : kick;
+    this.kickPollMs = kickPollMs;
+    this.sleep = sleepFn;
+    this.kicks = new Map();
     this.investigateAfterMs = investigateAfterMs;
     this.turnDeadlineMs = turnDeadlineMs;
     this.probe = probe;
@@ -409,6 +418,7 @@ export class WakeDeliverer {
     this.enqueueAttempted.delete(wake.id);
     if (!adopted) return "LOST_CLAIM";
     this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
+    this.#startKick(this.get(wake.id));
     return "ENQUEUED";
   }
 
@@ -429,6 +439,7 @@ export class WakeDeliverer {
         }
         if (!await this.#adopt(wake)) return "LOST_CLAIM";
         this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
+        this.#startKick(this.get(wake.id));
         return "ADOPTED";
       }
 
@@ -458,7 +469,10 @@ export class WakeDeliverer {
     }
 
     const state = String(status.state ?? "");
-    if (state === "PENDING" || state === "CLAIMED") return "WAITING";
+    if (state === "PENDING" || state === "CLAIMED") {
+      if (state === "PENDING" || status.owner_alive === false) this.#startKick(wake);
+      return "WAITING";
+    }
     if (state === "STARTED" && status.owner_alive === true) return "WAITING";
     if (state === "STARTED" && status.owner_alive !== false) {
       this.#settle(wake, "PARTIAL", {
@@ -487,6 +501,7 @@ export class WakeDeliverer {
           this.#event("WAKE_REOPEN_REFUSED", wake, {});
           return "WAITING";
         }
+        this.#startKick(wake);
         this.#event("WAKE_REOPENED", wake, {});
         return "REOPENED";
       }
@@ -505,9 +520,87 @@ export class WakeDeliverer {
     return verdict;
   }
 
+  // Starts one listener per wake without stalling delivery of unrelated conversations. The
+  // producer lease ensures no other Delegate Wave runtime may start a competing listener.
+  #startKick(wake) {
+    if (!this.kick || this.kicks.has(wake.id)) return false;
+    const running = Promise.resolve()
+      .then(() => this.kick(wake))
+      .catch((error) => { if (this.onError) this.onError(error, wake.id); })
+      .finally(() => { this.kicks.delete(wake.id); });
+    this.kicks.set(wake.id, running);
+    return true;
+  }
+
+  // Test/diagnostic barrier only. A correct listener may remain parked indefinitely while an event
+  // is PENDING, so production shutdown must not await this and then invent a timeout-based close.
+  async settleKicks() {
+    await Promise.all([...this.kicks.values()]);
+  }
+
+  // Creates a legitimate Hermes session owner and nothing else. In particular this never calls
+  // prompt.submit: Hermes's own external-turn poller claims and starts the durable event.
+  async resumeKick(wake) {
+    // Construct the read-only receiver client before creating a live session. If configuration is
+    // broken, fail before anything exists that could claim the event and then be killed by cleanup.
+    const receiver = this.externalTurns();
+    const gateway = this.gatewayFactory();
+    try {
+      await gateway.start();
+      try {
+        await gateway.resume(wake.hermes_session_id);
+      } catch (error) {
+        if (gateway.exit || error.code != null) throw error;
+        // The request crossed the process boundary and timed out without a protocol refusal. The
+        // session may already be live and eligible to claim W, so closing is forbidden. Continue
+        // observing exactly as after an acknowledged resume.
+        this.#event("WAKE_KICK_RESUME_UNCERTAIN", wake, {
+          error: String(error.message).slice(0, 200),
+        });
+      }
+      let sawLiveStarted = false;
+      for (;;) {
+        if (gateway.exit) return sawLiveStarted ? "HOST_GONE" : "GATEWAY_GONE";
+        await this.sleep(this.kickPollMs);
+        let status;
+        try {
+          status = await receiver.get(wake.id);
+        } catch (error) {
+          // Failure to observe is not authority to close a process that may now host the turn.
+          this.#event("WAKE_KICK_STATUS_FAILED", wake, {
+            error: String(error.message).slice(0, 200),
+          });
+          continue;
+        }
+        if (!status) {
+          // Local ENQUEUED and remote absence disagree. That is not proof that the resumed session
+          // is harmless to close; keep the listener and let Stage-3 reconciliation surface PARTIAL.
+          continue;
+        }
+        const state = String(status.state ?? "");
+        if (state === "FINISHED") return sawLiveStarted ? "HOSTED" : "FINISHED";
+        if (state === "PENDING" || state === "CLAIMED") continue;
+        if (state === "STARTED") {
+          if (status.owner_alive === false) return "OWNER_DIED";
+          // True means a turn is live. Unknown is kept open too: inability to prove liveness cannot
+          // authorize destroying the only listener that might be hosting it.
+          if (status.owner_alive === true) sawLiveStarted = true;
+          continue;
+        }
+        // An incompatible future state supplies no safe close boundary. Stay alive and let the
+        // ordinary Stage-3 observer fail closed rather than turning uncertainty into a process kill.
+      }
+    } catch (error) {
+      this.#event("WAKE_KICK_FAILED", wake, { error: String(error.message).slice(0, 200) });
+      return "FAILED";
+    } finally {
+      await gateway.close();
+    }
+  }
+
   // Acquire the producer-side observer lease for an already-routed wake. Hermes serializes its own
   // consumers; this lease independently serializes the producers that may inspect history, reopen,
-  // and (in Stage 4) maintain a dormant-session kick. It is intentionally durable across passes.
+  // and maintain a dormant-session kick. It is intentionally durable across passes.
   // Only a matching live owner or a successor that proves that owner dead may act.
   async #claimEnqueued(wake) {
     const self = await this.#whoAmI();
@@ -726,8 +819,8 @@ export class WakeDeliverer {
   async pass({ atMs = Date.now() } = {}) {
     const outcomes = [];
     // Receiver-owned events hold the single-flight slot. Acquire their producer observer lease and
-    // inspect them before claiming anything else; PENDING/CLAIMED simply remain waiting until
-    // Stage 4 supplies a listener. Another live Delegate Wave runtime owns the rows it leased.
+    // inspect them before claiming anything else. PENDING and dead CLAIMED events get one listener;
+    // another live Delegate Wave runtime owns the rows it leased.
     const enqueued = this.db.prepare(
       "SELECT * FROM wake_outbox WHERE state = 'ENQUEUED' ORDER BY updated_at",
     ).all();

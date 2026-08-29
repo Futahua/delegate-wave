@@ -162,6 +162,7 @@ function fakeExternalTurns() {
   let enqueueError = null;
   let throwAfterStore = false;
   const getErrors = [];
+  const getErrorsAt = new Map();
   const api = {
     async enqueue({ eventId, sessionKey, body, source }) {
       calls.enqueue += 1;
@@ -176,6 +177,7 @@ function fakeExternalTurns() {
     },
     async get(eventId) {
       calls.get += 1;
+      if (getErrorsAt.has(calls.get)) throw getErrorsAt.get(calls.get);
       if (getErrors.length) throw getErrors.shift();
       return rows.has(eventId) ? { ...rows.get(eventId) } : null;
     },
@@ -197,6 +199,7 @@ function fakeExternalTurns() {
       throwAfterStore = afterStore;
     },
     failNextGet: (error) => getErrors.push(error),
+    failGetCall: (call, error) => getErrorsAt.set(call, error),
   };
 }
 
@@ -222,6 +225,7 @@ function routedDeliverer(w, receiver, canonical = fakeCanonical(), rest = {}) {
     allowSubmit: true,
     externalTurns: receiver.factory,
     canonicalHistory: canonical.factory,
+    kick: null,
     gateway: () => { throw new Error("routed delivery must not construct a Hermes gateway"); },
     probe: fakeLiveness(DEAD).probe,
     identity: fakeLiveness(DEAD).identity,
@@ -247,6 +251,31 @@ function remoteFor(wake, rest = {}) {
     state: "PENDING",
     owner_alive: null,
     ...rest,
+  };
+}
+
+function fakeKickGateways({ onResume = null, resumeError = null } = {}) {
+  const calls = { start: 0, resume: [], close: 0, created: 0 };
+  const gateways = [];
+  return {
+    calls,
+    gateways,
+    factory: () => {
+      calls.created += 1;
+      const gateway = {
+        exit: null,
+        async start() { calls.start += 1; },
+        async resume(sessionId) {
+          calls.resume.push(sessionId);
+          if (onResume) await onResume(sessionId, gateway);
+          if (resumeError) throw resumeError;
+          return { runtimeSessionId: `runtime_${sessionId}`, durableSessionId: sessionId };
+        },
+        async close() { calls.close += 1; },
+      };
+      gateways.push(gateway);
+      return gateway;
+    },
   };
 }
 
@@ -447,6 +476,22 @@ test("post-enqueue transport ambiguity preserves PREPARING and restart adopts on
   assert.equal(receiver.calls.enqueue, 1, "recovery adopts the committed event without invoking enqueue again");
 });
 
+test("successful enqueue followed by failed readback also preserves PREPARING", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  // First get is the pre-enqueue absence check; second is the receipt readback.
+  receiver.failGetCall(2, new Error("readback transport failed"));
+
+  await routedDeliverer(w, receiver, fakeCanonical()).pass();
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PREPARING");
+  assert.equal(receiver.calls.enqueue, 1);
+  assert.ok(receiver.row(wake.id), "the receiver commit happened before readback failed");
+
+  assert.deepEqual((await routedDeliverer(w, receiver).pass()).map((item) => item.outcome), ["ADOPTED"]);
+  assert.equal(receiver.calls.enqueue, 1);
+});
+
 test("one producer lease serializes ENQUEUED reconciliation across runtimes", async (t) => {
   const w = world(t);
   const wake = completedWake(w);
@@ -470,9 +515,12 @@ test("one producer lease serializes ENQUEUED reconciliation across runtimes", as
   };
   const ownerA = { pid: 9101, startedAt: "owner-a" };
   const ownerB = { pid: 9102, startedAt: "owner-b" };
+  let kicksA = 0;
+  let kicksB = 0;
   const a = routedDeliverer(w, receiver, canonicalA, {
     identity: async () => ownerA,
     probe: async () => ALIVE,
+    kick: async () => { kicksA += 1; },
   });
   const canonicalB = fakeCanonical([
     { role: "user", display_kind: "delegate_wave_wake", text: wake.body },
@@ -482,6 +530,7 @@ test("one producer lease serializes ENQUEUED reconciliation across runtimes", as
     probe: async (pid, startedAt) => (
       pid === ownerA.pid && startedAt === ownerA.startedAt ? ALIVE : DEAD
     ),
+    kick: async () => { kicksB += 1; },
   });
 
   const passA = a.pass();
@@ -491,6 +540,9 @@ test("one producer lease serializes ENQUEUED reconciliation across runtimes", as
 
   releaseHistory();
   assert.deepEqual((await passA).map((item) => item.outcome), ["REOPENED"]);
+  await a.settleKicks();
+  assert.equal(kicksA, 1);
+  assert.equal(kicksB, 0, "the runtime without the producer lease cannot kick");
   receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
   assert.deepEqual(await b.pass(), [], "the successor Hermes attempt is still owned by producer A");
   assert.equal(canonicalB.calls.read, 0, "B cannot turn a healthy new attempt into stale PARTIAL evidence");
@@ -521,6 +573,159 @@ test("an ENQUEUED observer lease is reclaimed only after its exact owner is prov
   const local = w.db.prepare("SELECT owner_pid, owner_started_at FROM wake_outbox WHERE id = ?").get(wake.id);
   assert.equal(local.owner_pid, successor.pid);
   assert.equal(local.owner_started_at, successor.startedAt);
+});
+
+test("a dormant PENDING event resumes its session without prompt.submit", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const gateways = fakeKickGateways({
+    onResume: () => receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false })),
+  });
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {},
+  });
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  await routed.settleKicks();
+  assert.deepEqual(gateways.calls.resume, [wake.hermes_session_id]);
+  assert.equal(gateways.calls.start, 1);
+  assert.equal(gateways.calls.close, 1);
+  assert.equal("submit" in gateways.gateways[0], false, "the listener has no prompt submission surface");
+});
+
+test("dead CLAIMED needs a listener; live CLAIMED does not", async (t) => {
+  for (const ownerAlive of [false, true]) {
+    const w = world(t);
+    const wake = completedWake(w, `hermes_claimed_${ownerAlive}`);
+    w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), wake.id);
+    const receiver = fakeExternalTurns();
+    receiver.put(remoteFor(wake, { state: "CLAIMED", owner_alive: ownerAlive }));
+    let kicks = 0;
+    const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+      kick: async () => { kicks += 1; },
+    });
+
+    assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+    await routed.settleKicks();
+    assert.equal(kicks, ownerAlive ? 0 : 1);
+  }
+});
+
+test("kick remains alive through PENDING and live STARTED until FINISHED", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const gateways = fakeKickGateways();
+  let polls = 0;
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      polls += 1;
+      if (polls === 2) receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
+      if (polls === 4) receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+      if (polls < 4) assert.equal(gateways.calls.close, 0, "elapsed polls cannot authorize closing");
+    },
+  });
+
+  assert.equal(await routed.resumeKick(wake), "HOSTED");
+  assert.equal(polls, 4);
+  assert.equal(gateways.calls.close, 1);
+  assert.deepEqual(gateways.calls.resume, [wake.hermes_session_id]);
+});
+
+test("missing receiver readback cannot authorize closing a resumed listener", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  const gateways = fakeKickGateways();
+  let polls = 0;
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      polls += 1;
+      if (polls === 2) receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
+      if (polls === 3) receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+      if (polls < 3) assert.equal(gateways.calls.close, 0);
+    },
+  });
+
+  assert.equal(await routed.resumeKick(wake), "HOSTED");
+  assert.equal(polls, 3);
+  assert.equal(gateways.calls.close, 1);
+});
+
+test("ambiguous session.resume timeout is monitored instead of closing a possible owner", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const gateways = fakeKickGateways({ resumeError: new Error("session.resume timed out") });
+  let polls = 0;
+  const events = [];
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      polls += 1;
+      if (polls === 1) receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: true }));
+      if (polls === 2) receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+      if (polls < 2) assert.equal(gateways.calls.close, 0);
+    },
+    onEvent: (kind) => events.push(kind),
+  });
+
+  assert.equal(await routed.resumeKick(wake), "HOSTED");
+  assert.equal(gateways.calls.close, 1);
+  assert.ok(events.includes("WAKE_KICK_RESUME_UNCERTAIN"));
+});
+
+test("a killed listener can be replaced without changing the durable event", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  const gateways = fakeKickGateways();
+  let firstPoll = true;
+  const routed = routedDeliverer(w, receiver, fakeCanonical(), {
+    kick: undefined,
+    gateway: gateways.factory,
+    kickPollMs: 0,
+    sleepFn: async () => {
+      if (firstPoll) {
+        firstPoll = false;
+        gateways.gateways.at(-1).exit = { code: 9 };
+      } else {
+        receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+      }
+    },
+  });
+
+  await routed.pass();
+  await routed.settleKicks();
+  assert.equal(gateways.calls.created, 1);
+  assert.equal(receiver.calls.enqueue, 0);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
+
+  await routed.pass();
+  await routed.settleKicks();
+  assert.equal(gateways.calls.created, 2, "a later pass may supply a fresh legitimate listener");
+  assert.equal(receiver.calls.enqueue, 0);
 });
 
 test("a working session produces no wake and no cost", (t) => {
