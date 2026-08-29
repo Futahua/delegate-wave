@@ -22,7 +22,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { initializeDataRoot, openDatabase } from "../src/db.js";
 import { SessionWatcher, registerWatch, wakeMarker } from "../src/session/watcher.js";
-import { WakeDeliverer, classifyHistory, REQUIRED_CAPABILITY } from "../src/session/wake.js";
+import {
+  WakeDeliverer, classifyHistory, classifyRoutedWake, REQUIRED_CAPABILITY,
+} from "../src/session/wake.js";
 import { HermesGateway, isBusyRefusal, OWNERSHIP_REFUSAL_REASON } from "../src/session/hermes-gateway.js";
 import { ALIVE, DEAD, UNKNOWN } from "../src/session/liveness.js";
 
@@ -154,9 +156,267 @@ function deliverer(w, fake, { allowSubmit = false, liveness = fakeLiveness(), ..
   });
 }
 
+function fakeExternalTurns() {
+  const rows = new Map();
+  const calls = { enqueue: 0, get: 0, reopen: 0 };
+  let enqueueError = null;
+  const api = {
+    async enqueue({ eventId, sessionKey, body, source }) {
+      calls.enqueue += 1;
+      if (enqueueError) throw enqueueError;
+      if (rows.has(eventId)) return false;
+      rows.set(eventId, {
+        event_id: eventId, target_session_key: sessionKey, body, source,
+        state: "PENDING", owner_alive: null,
+      });
+      return true;
+    },
+    async get(eventId) {
+      calls.get += 1;
+      return rows.has(eventId) ? { ...rows.get(eventId) } : null;
+    },
+    async reopen(eventId) {
+      calls.reopen += 1;
+      const row = rows.get(eventId);
+      if (!row) return false;
+      rows.set(eventId, { ...row, state: "PENDING", owner_alive: null });
+      return true;
+    },
+  };
+  return {
+    factory: () => api,
+    calls,
+    put: (row) => rows.set(row.event_id, { ...row }),
+    row: (id) => rows.get(id),
+    failEnqueue: (error) => { enqueueError = error; },
+  };
+}
+
+function fakeCanonical(messages = []) {
+  const calls = { read: 0 };
+  return {
+    calls,
+    factory: () => ({
+      async read(sessionId) {
+        calls.read += 1;
+        return { sessionId, resolvedSessionId: `runtime_${sessionId}`, messages };
+      },
+    }),
+  };
+}
+
+function routedDeliverer(w, receiver, canonical = fakeCanonical(), rest = {}) {
+  return new WakeDeliverer({
+    db: w.db,
+    allowEnqueue: true,
+    // If routed delivery ever falls through, this makes the test fail loudly rather than merely
+    // observing that no legacy submission happened.
+    allowSubmit: true,
+    externalTurns: receiver.factory,
+    canonicalHistory: canonical.factory,
+    gateway: () => { throw new Error("routed delivery must not construct a Hermes gateway"); },
+    probe: fakeLiveness(DEAD).probe,
+    identity: fakeLiveness(DEAD).identity,
+    investigateAfterMs: 0,
+    ...rest,
+  });
+}
+
+function completedWake(w, hermesSessionId = "hermes_routed") {
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, hermesSessionId);
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  return w.db.prepare("SELECT * FROM wake_outbox WHERE session_id = ?").get(sessionId);
+}
+
+function remoteFor(wake, rest = {}) {
+  return {
+    event_id: wake.id,
+    target_session_key: wake.hermes_session_id,
+    body: wake.body,
+    source: "delegate-wave",
+    state: "PENDING",
+    owner_alive: null,
+    ...rest,
+  };
+}
+
 // The capability a real Hermes does not yet report. Granting it in a test is granting the PREMISE
 // of the upstream lease, which is exactly what those tests are for.
 const EXCLUSIVE = { [REQUIRED_CAPABILITY]: true };
+
+test("routed wake is enqueued once and adopted from exact receiver readback", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  const routed = routedDeliverer(w, receiver);
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["ENQUEUED"]);
+  assert.equal(receiver.calls.enqueue, 1);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  assert.equal(receiver.calls.enqueue, 1, "observing the same wake must never enqueue it again");
+});
+
+test("restart adopts a matching remote event after crash before local ENQUEUED", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake));
+  w.db.prepare(`UPDATE wake_outbox SET state = 'PREPARING', owner_pid = 7001,
+                                       owner_started_at = 'dead', updated_at = ? WHERE id = ?`)
+    .run("2020-01-01T00:00:00.000Z", wake.id);
+
+  const outcomes = await routedDeliverer(w, receiver).pass();
+  assert.deepEqual(outcomes.map((item) => item.outcome), ["ADOPTED"]);
+  assert.equal(receiver.calls.enqueue, 0, "the durable event is the receipt; it is adopted, not rewritten");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "ENQUEUED");
+});
+
+test("receiver collision fails closed and blocks the watch", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { body: `${wake.body} forged` }));
+
+  assert.deepEqual((await routedDeliverer(w, receiver).pass()).map((item) => item.outcome),
+    ["INTEGRITY_FAILURE"]);
+  assert.equal(receiver.calls.enqueue, 0);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PARTIAL");
+  assert.equal(w.db.prepare("SELECT state FROM session_watches WHERE id = ?").get(wake.watch_id).state, "BLOCKED");
+});
+
+test("routed readback compares the transport-normalized lone-surrogate body", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const malformed = `${wake.body}\uDC9D`;
+  w.db.prepare("UPDATE wake_outbox SET body = ? WHERE id = ?").run(malformed, wake.id);
+  const receiver = fakeExternalTurns();
+  // The real Python bridge repairs this at its UTF-8 boundary; model that exact remote receipt.
+  receiver.put(remoteFor({ ...wake, body: malformed }, { body: `${wake.body}\uFFFD` }));
+  w.db.prepare(`UPDATE wake_outbox SET state = 'PREPARING', owner_pid = 7002,
+                                       owner_started_at = 'dead', updated_at = ? WHERE id = ?`)
+    .run("2020-01-01T00:00:00.000Z", wake.id);
+
+  assert.deepEqual((await routedDeliverer(w, receiver).pass()).map((item) => item.outcome), ["ADOPTED"]);
+});
+
+test("PENDING, CLAIMED, and live STARTED receiver events wait without reading history", async (t) => {
+  for (const [state, owner_alive] of [["PENDING", null], ["CLAIMED", false], ["STARTED", true]]) {
+    const w = world(t);
+    const wake = completedWake(w, `hermes_${state}`);
+    w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), wake.id);
+    const receiver = fakeExternalTurns();
+    receiver.put(remoteFor(wake, { state, owner_alive }));
+    const canonical = fakeCanonical([{ role: "user", display_kind: "delegate_wave_wake", text: wake.body }]);
+
+    assert.deepEqual((await routedDeliverer(w, receiver, canonical).pass()).map((item) => item.outcome),
+      ["WAITING"]);
+    assert.equal(canonical.calls.read, 0, `${state} is not evidence that history is ready to classify`);
+    assert.equal(receiver.calls.reopen, 0);
+  }
+});
+
+test("dead STARTED without typed marker reopens exactly once", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: false }));
+  const routed = routedDeliverer(w, receiver, fakeCanonical([]));
+
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["REOPENED"]);
+  assert.equal(receiver.calls.reopen, 1);
+  assert.deepEqual((await routed.pass()).map((item) => item.outcome), ["WAITING"]);
+  assert.equal(receiver.calls.reopen, 1);
+});
+
+test("dead STARTED with typed marker but no reply becomes PARTIAL and never reopens", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { state: "STARTED", owner_alive: false }));
+  const canonical = fakeCanonical([{ role: "user", display_kind: "delegate_wave_wake", text: wake.body }]);
+
+  assert.deepEqual((await routedDeliverer(w, receiver, canonical).pass()).map((item) => item.outcome),
+    ["PARTIAL"]);
+  assert.equal(receiver.calls.reopen, 0);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PARTIAL");
+});
+
+test("PARTIAL question blocks a queued completion from passing the same watch", async (t) => {
+  const w = world(t);
+  const sessionId = w.session();
+  registerWatch(w.db, sessionId, "hermes_blocked_routed");
+  w.ask(sessionId, "Which API should I use?");
+  w.watcher.pass();
+  const question = w.db.prepare("SELECT * FROM wake_outbox WHERE session_id = ?").get(sessionId);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), question.id);
+
+  w.setState(sessionId, "COMPLETED");
+  w.watcher.pass();
+  const completion = w.db.prepare("SELECT * FROM wake_outbox WHERE session_id = ? AND id != ?")
+    .get(sessionId, question.id);
+  assert.equal(completion.state, "PENDING");
+
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(question, { state: "STARTED", owner_alive: false }));
+  const canonical = fakeCanonical([
+    { role: "user", display_kind: "delegate_wave_wake", text: question.body },
+  ]);
+  const outcomes = await routedDeliverer(w, receiver, canonical).pass();
+
+  assert.deepEqual(outcomes.map((item) => item.outcome), ["PARTIAL"]);
+  assert.equal(w.db.prepare("SELECT state FROM session_watches WHERE id = ?").get(question.watch_id).state,
+    "BLOCKED");
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(completion.id).state,
+    "PENDING", "a later terminal wake cannot overtake an ambiguous question");
+  assert.equal(receiver.calls.enqueue, 0);
+});
+
+test("FINISHED with typed marker and attributable assistant response is DELIVERED", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  w.db.prepare("UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), wake.id);
+  const receiver = fakeExternalTurns();
+  receiver.put(remoteFor(wake, { state: "FINISHED", owner_alive: false }));
+  const canonical = fakeCanonical([
+    { role: "user", display_kind: "delegate_wave_wake", text: wake.body },
+    { role: "assistant", text: "I checked the delegated result; validation passed." },
+  ]);
+
+  assert.deepEqual((await routedDeliverer(w, receiver, canonical).pass()).map((item) => item.outcome),
+    ["DELIVERED"]);
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "DELIVERED");
+});
+
+test("wake-shaped human prose without durable display kind is not delivery evidence", () => {
+  const wake = { marker: "[delegate-wave-wake:wake_human]" };
+  assert.equal(classifyRoutedWake([
+    { role: "user", text: `Delegate Wave finished. ${wake.marker}` },
+    { role: "assistant", text: "Looks complete." },
+  ], wake), "ABSENT");
+});
+
+test("unavailable external-turn adapter leaves wake queued and never submits directly", async (t) => {
+  const w = world(t);
+  const wake = completedWake(w);
+  const receiver = fakeExternalTurns();
+  receiver.failEnqueue(new Error("Hermes receiver unavailable"));
+  const errors = [];
+
+  await routedDeliverer(w, receiver, fakeCanonical(), { onError: (error) => errors.push(error) }).pass();
+  assert.equal(w.db.prepare("SELECT state FROM wake_outbox WHERE id = ?").get(wake.id).state, "PENDING");
+  assert.equal(errors.length, 1);
+});
 
 test("a working session produces no wake and no cost", (t) => {
   const w = world(t);

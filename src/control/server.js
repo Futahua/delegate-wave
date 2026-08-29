@@ -17,6 +17,7 @@ import { SessionDriver } from "../session/driver.js";
 import { SessionWatcher } from "../session/watcher.js";
 import { WakeDeliverer } from "../session/wake.js";
 import { HermesGateway } from "../session/hermes-gateway.js";
+import { HermesExternalTurns } from "../session/hermes-external-turns.js";
 import { SafeIntegrator } from "../integration/safe.js";
 import { providerForModel } from "../manager/provider.js";
 
@@ -231,23 +232,17 @@ export async function startControlServer({
     },
   }).start();
 
-  // Delivery is constructed only when a Hermes agent directory is configured, and it does not submit
-  // even then.
-  //
-  // THREE separate gates, because they refuse three different things. Without a configured gateway
-  // there is nothing to spawn at all. Without the environment flag, an operator has not asked for
-  // submission. And without Hermes itself reporting that it enforces per-session exclusivity, the
-  // flag authorises nothing -- that last one is checked per delivery, inside the deliverer, because
-  // it is a fact about the receiver rather than about this configuration, and no environment
-  // variable may be allowed to assert it.
-  //
-  // Everything before the mutation runs regardless: resume, canonical history, marker
-  // reconciliation, PARTIAL handling.
-  const deliverer = HermesGateway.configured()
+  // Routed delivery and legacy recovery are separately gated. Once routed delivery is selected it
+  // never falls back to prompt.submit: an unavailable or incompatible receiver leaves the same wake
+  // safely queued. The gateway remains available only to the legacy path in this stage; waking a
+  // dormant conversation is deliberately deferred to the next stage.
+  const allowEnqueue = process.env.DELEGATE_WAVE_WAKE_ENQUEUE === "1";
+  const deliverer = (allowEnqueue ? HermesExternalTurns.configured() : HermesGateway.configured())
     ? new WakeDeliverer({
       db: dispatcher.db,
       gateway: () => new HermesGateway(),
-      allowSubmit: process.env.DELEGATE_WAVE_WAKE_SUBMIT === "1",
+      allowEnqueue,
+      allowSubmit: !allowEnqueue && process.env.DELEGATE_WAVE_WAKE_SUBMIT === "1",
       onEvent: (kind, payload) => {
         recordEvent(dispatcher.db, { kind, entityType: "job", entityId: "runtime", payload });
       },

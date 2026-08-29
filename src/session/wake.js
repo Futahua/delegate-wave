@@ -1,15 +1,16 @@
-// Delivering a wake, and knowing honestly whether it was delivered.
+// Delivering a wake without becoming another writer in the Hermes conversation.
 //
-// Everything hard about this file comes from one measured fact: the receiver has no idempotency and
-// no receipt. `prompt.submit` returns `{"status": "streaming"}` before a single row is durable, and
-// submitting the same wake twice produces two independent agent turns. So the acknowledgement is
-// worth nothing as evidence, and this deliverer never treats it as evidence.
+// New wakes use Hermes' durable external-turn inbox. enqueue is idempotent on wake.id, but its
+// boolean result is not a receipt: false only says that id already exists. Delegate Wave reads the
+// remote row back and verifies every field before recording ENQUEUED locally. The legacy
+// prompt.submit path remains below solely to reconcile installations that have not switched; routed
+// delivery never falls back to it.
 //
-// CANONICAL HISTORY IS THE DELIVERY AUTHORITY.
+// HERMES OWNS EXECUTION; CANONICAL HISTORY OWNS AMBIGUOUS OUTCOMES.
 //
-// Every state transition here is decided by reading the durable Hermes transcript and looking for
-// the wake's opaque marker. The measured crash boundaries are exactly three, and they are exactly
-// the three branches below:
+// PENDING/CLAIMED and live STARTED events are left to Hermes. Only FINISHED, or STARTED with a
+// receiver-proven dead owner, permits canonical-history reconciliation. Routed evidence is a typed
+// user timeline row (`display_kind=delegate_wave_wake`) containing this wake's opaque marker:
 //
 //   marker absent                 nothing durable happened      retry permitted
 //   marker + an assistant reply   the wake landed and was read   suppress retry
@@ -23,17 +24,10 @@
 // evidence does not support, which is the one thing this system is not allowed to do. So PARTIAL
 // stops the watch and says so, and a person decides.
 //
-// THE SUBMIT IS GATED, DELIBERATELY, AND BY TWO SEPARATE THINGS.
+// LEGACY DIRECT SUBMIT IS ISOLATED.
 //
-// Hermes has no cross-process per-session exclusivity today (research section 7): two gateways can
-// resume the same durable session from independent snapshots and both append turns. Until the
-// narrow upstream fix lands -- a per-session lease enforced AT `prompt.submit`, independent of
-// `max_concurrent_sessions` -- the last step is withheld rather than attempted.
-//
-// An operator setting `allowSubmit` is NOT sufficient. The receiver must also positively report
-// that it enforces per-session exclusivity, and a receiver that says nothing is treated as one that
-// does not. Otherwise the flag is a foot-gun that survives a Hermes downgrade, an unexpected PATH,
-// or a copied config, and does its damage in a real conversation.
+// Existing SUBMITTED rows retain their old reconciliation path. New routed code never creates that
+// state and never calls prompt.submit, even if the external-turn adapter is absent or incompatible.
 //
 // TIME IS NOT EVIDENCE OF DEATH.
 //
@@ -42,14 +36,9 @@
 // looks reasonable and creates the exact race this subsystem exists to prevent: a slow-but-healthy
 // delivery gets its wake reclaimed, and then two processes submit the same marker.
 //
-// AND NOT ON A PREFLIGHT.
-//
-// There is deliberately no `ownership_state` computed before submitting. A preflight "is it idle?"
-// observation is stale the instant it is taken -- the user can start a turn in the interval -- and
-// check-then-submit would reintroduce the exact race it appears to close. The future typed BUSY at
-// `prompt.submit` is the atomic gate; here, BUSY is an ordinary outcome that leaves the wake
-// PENDING, not an error.
 import { recordEvent, transaction } from "../db.js";
+import { HermesCanonicalHistory } from "./hermes-canonical-history.js";
+import { HermesExternalTurns, replaceLoneSurrogates } from "./hermes-external-turns.js";
 import { HermesGateway } from "./hermes-gateway.js";
 import { ALIVE, DEAD, probeProcess, selfIdentity } from "./liveness.js";
 
@@ -124,6 +113,29 @@ export function classifyHistory(messages, marker) {
   return "PARTIAL";
 }
 
+// Routed delivery evidence is a typed timeline event, never marker-shaped human prose. The next
+// user row closes attribution exactly as it does for the legacy classifier.
+export function classifyRoutedWake(messages, wake) {
+  const rows = Array.isArray(messages) ? messages : [];
+  let at = -1;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (row?.role !== "user") continue;
+    if (row?.display_kind !== "delegate_wave_wake") continue;
+    if (typeof row.text === "string" && row.text.includes(wake.marker)) { at = index; break; }
+  }
+  if (at < 0) return "ABSENT";
+  for (let index = at + 1; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row?.role === "user") return "AMBIGUOUS";
+    if (row?.role !== "assistant") continue;
+    const spoke = (typeof row.text === "string" && row.text.trim())
+      || row.reasoning || row.reasoning_content || row.reasoning_details || row.codex_reasoning_items;
+    if (spoke) return "DELIVERED";
+  }
+  return "PARTIAL";
+}
+
 // The verdicts that mean "stop, and let a person look".
 //
 // Kept as a set rather than a comparison so that adding a fourth unknowable outcome cannot silently
@@ -139,6 +151,9 @@ export class WakeDeliverer {
     // The one line that changes when Hermes can refuse a second writer. Off by default, on purpose:
     // see the header.
     allowSubmit = false,
+    allowEnqueue = false,
+    externalTurns = () => new HermesExternalTurns(),
+    canonicalHistory = () => new HermesCanonicalHistory(),
     investigateAfterMs = DEFAULT_INVESTIGATE_AFTER_MS,
     // A HARD CANCELLATION POLICY, off by default, and not a timeout in any softer sense.
     //
@@ -157,6 +172,9 @@ export class WakeDeliverer {
     this.db = db;
     this.gatewayFactory = gateway;
     this.allowSubmit = allowSubmit;
+    this.allowEnqueue = allowEnqueue;
+    this.externalTurns = externalTurns;
+    this.canonicalHistory = canonicalHistory;
     this.investigateAfterMs = investigateAfterMs;
     this.turnDeadlineMs = turnDeadlineMs;
     this.probe = probe;
@@ -257,31 +275,31 @@ export class WakeDeliverer {
   // Back to the queue, with why. Not a failure state: BUSY, an unreachable gateway and a withheld
   // submission are all ordinary conditions on this path, and all of them mean the same thing --
   // nothing was delivered, and the same wake is still the right thing to say.
-  release(wake, reason) {
+  release(wake, reason, expectedState = null) {
     this.db.prepare(
       `UPDATE wake_outbox SET state = 'PENDING', last_error = ?, submitted_at = NULL,
                               owner_pid = NULL, owner_started_at = NULL,
                               gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
-       WHERE id = ?`,
-    ).run(reason, now(), wake.id);
+       WHERE id = ? AND (? IS NULL OR state = ?)`,
+    ).run(reason, now(), wake.id, expectedState, expectedState);
   }
 
   // Writes the verdict down. AMBIGUOUS is recorded as the PARTIAL STATE with its own explanation:
   // the handling is identical -- stop, and let a person look -- while the reason a person needs in
   // order to act is completely different. One means nothing answered; the other means somebody else
   // spoke first and attribution is no longer possible from this side.
-  #settle(wake, verdict, { runtimeSessionId = null } = {}) {
+  #settle(wake, verdict, { runtimeSessionId = null, detail = null, expectedState = null } = {}) {
     const state = verdict === "AMBIGUOUS" ? "PARTIAL" : verdict;
-    const detail = verdict === "AMBIGUOUS"
+    const recordedDetail = detail ?? (verdict === "AMBIGUOUS"
       ? "ambiguous: another user turn arrived before any answer, so no reply can be attributed to this wake"
-      : null;
-    transaction(this.db, () => {
-      this.db.prepare(
+      : null);
+    const changed = transaction(this.db, () => {
+      const result = this.db.prepare(
         `UPDATE wake_outbox SET state = ?, reconciled_at = ?, last_error = COALESCE(?, last_error),
                                 runtime_session_id = COALESCE(?, runtime_session_id), updated_at = ?
-         WHERE id = ?`,
-      ).run(state, now(), detail, runtimeSessionId, now(), wake.id);
-      if (HALTING.has(verdict)) {
+         WHERE id = ? AND (? IS NULL OR state = ?)`,
+      ).run(state, now(), recordedDetail, runtimeSessionId, now(), wake.id, expectedState, expectedState);
+      if (result.changes === 1 && HALTING.has(verdict)) {
         // The conversation's state is now unknown to us, so this watch stops -- whatever it said
         // before. BLOCKED rather than CLOSED even for a watch already closed by a terminal session,
         // because the two mean different things to whoever looks next: CLOSED is "there is nothing
@@ -289,12 +307,15 @@ export class WakeDeliverer {
         this.db.prepare("UPDATE session_watches SET state = 'BLOCKED', updated_at = ? WHERE id = ?")
           .run(now(), wake.watch_id);
       }
+      return result.changes === 1;
     });
+    if (!changed) return false;
     this.#event(verdict === "DELIVERED" ? "WAKE_DELIVERED" : "WAKE_PARTIAL", wake, {
       // The event carries the true verdict even where the column collapses two of them, so triage
       // reads what was actually observed rather than what the state machine needed to call it.
       verdict, runtimeSessionId,
     });
+    return true;
   }
 
   // Reads canonical history for one wake and records what it proves.
@@ -326,8 +347,161 @@ export class WakeDeliverer {
     ).run(child.pid, child.startedAt ?? null, now(), wake.id);
   }
 
-  // One wake, start to finish.
+  #recordReceiver(wake, status) {
+    this.db.prepare(
+      `UPDATE wake_outbox SET last_receiver_state = ?, last_receiver_observed_at = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(status?.state ?? null, now(), now(), wake.id);
+  }
+
+  #remoteMatches(remote, wake) {
+    return Boolean(remote)
+      && remote.event_id === wake.id
+      && remote.target_session_key === wake.hermes_session_id
+      && remote.source === "delegate-wave"
+      && remote.body === replaceLoneSurrogates(wake.body);
+  }
+
+  #adopt(wake, runtimeSessionId = null) {
+    const changed = this.db.prepare(
+      `UPDATE wake_outbox SET state = 'ENQUEUED', enqueued_at = COALESCE(enqueued_at, ?),
+                              runtime_session_id = COALESCE(?, runtime_session_id),
+                              owner_pid = NULL, owner_started_at = NULL,
+                              gateway_pid = NULL, gateway_started_at = NULL, updated_at = ?
+       WHERE id = ? AND state = 'PREPARING'`,
+    ).run(now(), runtimeSessionId, now(), wake.id).changes;
+    return changed === 1;
+  }
+
+  async #enqueue(wake, runtimeSessionId = null) {
+    const receiver = this.externalTurns();
+    await receiver.enqueue({
+      eventId: wake.id,
+      sessionKey: wake.hermes_session_id,
+      body: wake.body,
+      source: "delegate-wave",
+    });
+    const remote = await receiver.get(wake.id);
+    this.#recordReceiver(wake, remote);
+    if (!remote) {
+      this.release(wake, "enqueue not confirmed: receiver has no record after enqueue", "PREPARING");
+      this.#event("WAKE_ENQUEUE_UNCONFIRMED", wake, { detail: "remote event absent" });
+      return "UNCONFIRMED";
+    }
+    if (!this.#remoteMatches(remote, wake)) {
+      this.#settle(wake, "PARTIAL", {
+        detail: "integrity failure: the receiver holds a different event under this wake id",
+        expectedState: "PREPARING",
+      });
+      this.#event("WAKE_REMOTE_INTEGRITY_FAILURE", wake, {});
+      return "INTEGRITY_FAILURE";
+    }
+    if (!this.#adopt(wake, runtimeSessionId)) return "LOST_CLAIM";
+    this.#event("WAKE_ENQUEUED_TO_RECEIVER", wake, { reason: wake.reason });
+    return "ENQUEUED";
+  }
+
+  async #deliverByEnqueue(wake) {
+    this.driving.add(wake.id);
+    try {
+      const receiver = this.externalTurns();
+      const remote = await receiver.get(wake.id);
+      this.#recordReceiver(wake, remote);
+      if (remote) {
+        if (!this.#remoteMatches(remote, wake)) {
+          this.#settle(wake, "PARTIAL", {
+            detail: "integrity failure: the receiver holds a different event under this wake id",
+            expectedState: "PREPARING",
+          });
+          this.#event("WAKE_REMOTE_INTEGRITY_FAILURE", wake, {});
+          return "INTEGRITY_FAILURE";
+        }
+        if (!this.#adopt(wake)) return "LOST_CLAIM";
+        this.#event("WAKE_REMOTE_ADOPTED", wake, { reason: wake.reason });
+        return "ADOPTED";
+      }
+
+      return this.#enqueue(wake);
+    } finally {
+      this.driving.delete(wake.id);
+    }
+  }
+
+  async #observe(wake) {
+    const receiver = this.externalTurns();
+    const status = await receiver.get(wake.id);
+    this.#recordReceiver(wake, status);
+    if (!status) {
+      this.#settle(wake, "PARTIAL", {
+        detail: "receiver has no record of an event recorded locally as ENQUEUED",
+        expectedState: "ENQUEUED",
+      });
+      return "PARTIAL";
+    }
+    if (!this.#remoteMatches(status, wake)) {
+      this.#settle(wake, "PARTIAL", {
+        detail: "integrity failure: the receiver event no longer matches this wake",
+        expectedState: "ENQUEUED",
+      });
+      return "PARTIAL";
+    }
+
+    const state = String(status.state ?? "");
+    if (state === "PENDING" || state === "CLAIMED") return "WAITING";
+    if (state === "STARTED" && status.owner_alive === true) return "WAITING";
+    if (state === "STARTED" && status.owner_alive !== false) {
+      this.#settle(wake, "PARTIAL", {
+        detail: "receiver STARTED state did not report a definite owner-liveness verdict",
+        expectedState: "ENQUEUED",
+      });
+      return "PARTIAL";
+    }
+    if (state !== "STARTED" && state !== "FINISHED") {
+      this.#settle(wake, "PARTIAL", {
+        detail: `unknown receiver state: ${state || "missing"}`,
+        expectedState: "ENQUEUED",
+      });
+      return "PARTIAL";
+    }
+
+    const canonical = await this.canonicalHistory().read(wake.hermes_session_id);
+    const verdict = classifyRoutedWake(canonical.messages, wake);
+    const runtimeSessionId = canonical.resolvedSessionId;
+    if (state === "STARTED") {
+      if (verdict === "ABSENT") {
+        const reopened = await receiver.reopen(wake.id, "owner died before the typed wake became durable");
+        if (!reopened) {
+          // The receiver owns this CAS. A refusal means its state changed after our read; that is
+          // evidence to observe again, never permission to replay or classify from a stale row.
+          this.#event("WAKE_REOPEN_REFUSED", wake, {});
+          return "WAITING";
+        }
+        this.#event("WAKE_REOPENED", wake, {});
+        return "REOPENED";
+      }
+      this.#settle(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
+      return verdict;
+    }
+    if (verdict === "ABSENT") {
+      this.#settle(wake, "PARTIAL", {
+        runtimeSessionId,
+        detail: "receiver reports FINISHED but canonical history has no typed wake marker",
+        expectedState: "ENQUEUED",
+      });
+      return "PARTIAL";
+    }
+    this.#settle(wake, verdict, { runtimeSessionId, expectedState: "ENQUEUED" });
+    return verdict;
+  }
+
+  // One wake, start to finish, using one protocol only. Routed delivery never falls back to direct
+  // submit when its adapter is unavailable or incompatible.
   async deliver(wake) {
+    if (this.allowEnqueue) return this.#deliverByEnqueue(wake);
+    return this.#deliverBySubmit(wake);
+  }
+
+  async #deliverBySubmit(wake) {
     const gateway = this.gatewayFactory();
     this.driving.add(wake.id);
     try {
@@ -482,6 +656,11 @@ export class WakeDeliverer {
   }
 
   async reconcile(wake) {
+    if (this.allowEnqueue && wake.state === "PREPARING") {
+      // The remote event may have committed immediately before the local process died. Re-running
+      // routed ingress asks Hermes first and adopts the same wake.id; it never submits a prompt.
+      return this.#deliverByEnqueue(wake);
+    }
     const gateway = this.gatewayFactory();
     try {
       await gateway.start();
@@ -503,6 +682,20 @@ export class WakeDeliverer {
   // conversation, so resolving it is what unblocks delivery rather than competing with it.
   async pass({ atMs = Date.now() } = {}) {
     const outcomes = [];
+    // Receiver-owned events hold the single-flight slot. Observe them before claiming anything
+    // else; PENDING/CLAIMED simply remain waiting until Stage 4 supplies a listener.
+    const enqueued = this.db.prepare(
+      "SELECT * FROM wake_outbox WHERE state = 'ENQUEUED' ORDER BY updated_at",
+    ).all();
+    for (const wake of enqueued) {
+      try {
+        outcomes.push({ wakeId: wake.id, outcome: await this.#observe(wake) });
+      } catch (error) {
+        // Failure to ask the receiver is not evidence about what it did. Keep ENQUEUED and retry
+        // observation later; never fall back to direct submit.
+        if (this.onError) this.onError(error, wake.id);
+      }
+    }
     for (const wake of await this.reclaimable({ atMs })) {
       try {
         outcomes.push({ wakeId: wake.id, outcome: await this.reconcile(wake) });
