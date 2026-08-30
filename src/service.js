@@ -30,6 +30,7 @@ import {
   createBackup, listBackups, verifyBackup, restoreBackup, rollbackIntegration,
   readRestoreMarker, clearRestoreMarker,
 } from "./recovery.js";
+import { buildJobPresentation } from "./presentation/job-presentation.js";
 
 const ROOTS_ONLY = "parent_job_id IS NULL";
 
@@ -2830,7 +2831,11 @@ export class Dispatcher {
     });
     const validations = this.db.prepare(`SELECT v.* FROM validation_runs v
       JOIN attempts a ON a.id = v.attempt_id WHERE a.job_id = ? ORDER BY v.started_at`).all(jobId);
-    return { job, attempts, validations, family: this.jobFamily(jobId) };
+    const family = this.jobFamily(jobId);
+    const presentation = buildJobPresentation({
+      db: this.db, paths: this.paths, job, attempts, validations, family,
+    });
+    return { job, attempts, validations, family, presentation };
   }
 
   // The detailed view: a root with the work it commissioned, and what the whole thing cost.

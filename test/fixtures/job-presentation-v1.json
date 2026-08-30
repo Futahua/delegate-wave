@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "revision": "fixture-revision",
+  "generated_at": "2026-08-30T00:00:00.000Z",
+  "phase": { "id": "reviewing", "label": "Reviewing", "active": true },
+  "actors": [
+    { "id": "manager:mrun_fixture", "role": "manager", "label": "Manager", "state": "working", "current": "reviewing", "started_at": "2026-08-30T00:00:00.000Z" },
+    { "id": "worker:attempt_fixture", "role": "worker", "label": "Implementation worker", "state": "completed", "attempt_id": "attempt_fixture", "started_at": "2026-08-30T00:01:00.000Z", "finished_at": "2026-08-30T00:03:00.000Z" }
+  ],
+  "live_activity": [],
+  "settled_groups": [
+    { "id": "attempt:attempt_fixture", "actor_id": "worker:attempt_fixture", "label": "Worker completed", "state": "completed", "summary": "2 files changed · validation passed", "attempt_id": "attempt_fixture", "started_at": "2026-08-30T00:01:00.000Z", "finished_at": "2026-08-30T00:03:00.000Z" }
+  ],
+  "evidence": [
+    { "id": "validation:validation_fixture", "occurred_at": "2026-08-30T00:04:00.000Z", "kind": "validation", "state": "passed", "summary": "Validation passed: node --test", "attempt_id": "attempt_fixture", "source": { "table": "validation_runs", "id": "validation_fixture" }, "authority": "evidence" }
+  ],
+  "changed_files": { "count": 2, "files": [{ "path": "src/session/wake.js" }, { "path": "test/wake.test.js" }] }
+}
