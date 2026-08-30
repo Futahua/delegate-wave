@@ -32,6 +32,8 @@ export const ROUTES = Object.freeze([
   // authority is exercised; polling and answering continue a session that was already permitted.
   { method: "POST", pattern: /^\/v1\/sessions$/, command: "session.start", mutation: true, scope: SCOPES.SESSION },
   { method: "GET", pattern: /^\/v1\/sessions\/([^/]+)$/, command: "session.poll", params: ["sessionId"], scope: SCOPES.READ },
+  { method: "GET", pattern: /^\/v1\/sessions$/, command: "session.list", scope: SCOPES.READ },
+  { method: "GET", pattern: /^\/v1\/sessions\/([^/]+)\/timeline$/, command: "session.timeline", params: ["sessionId"], scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/answer$/, command: "session.answer", params: ["sessionId"], mutation: true, scope: SCOPES.SESSION },
   { method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/tick$/, command: "session.tick", params: ["sessionId"], mutation: true, scope: SCOPES.SESSION },
   { method: "GET", pattern: /^\/v1\/overview$/, command: "overview", scope: SCOPES.READ },

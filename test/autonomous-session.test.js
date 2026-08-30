@@ -23,6 +23,7 @@ import { SafeIntegrator } from "../src/integration/safe.js";
 import { SessionDriver } from "../src/session/driver.js";
 import { SessionWatcher } from "../src/session/watcher.js";
 import { runProcess } from "../src/process.js";
+import { buildSessionTimeline, listSessionPresentations } from "../src/presentation/session-timeline.js";
 
 const BRIEF = (extra = {}) => ({
   diagnosis: "the export layer is missing a flag",
@@ -235,7 +236,7 @@ test("a session started from a conversation is watched from birth, and its quest
   // inside the same transaction as the session, because a session that finished between the two
   // writes would be a finished session nobody was watching.
   const { boot, projectId } = await world(t);
-  const { sessions } = boot([
+  const { dispatcher, sessions } = boot([
     { action: "ESCALATE", reason: "needs judgment", question: "Which export format did they mean?" },
     { action: "IMPLEMENT", reason: "go", brief: BRIEF() },
     { action: "ACCEPT", reason: "done" },
@@ -249,10 +250,16 @@ test("a session started from a conversation is watched from birth, and its quest
   assert.equal(started.watched, true);
   const watch = sessions.db.prepare("SELECT * FROM session_watches WHERE session_id = ?").get(started.session_id);
   assert.equal(watch.hermes_session_id, "20260824_233004_5d8271");
+  const indexed = listSessionPresentations(sessions.db).find((item) => item.id === started.session_id);
+  assert.equal(indexed.origin_hermes_session_id, "20260824_233004_5d8271");
+  assert.equal(indexed.intent, "Add a --json flag");
   // Nothing to say yet: the session is working, which is the ordinary case and costs nothing.
   assert.deepEqual(watcher.pass(), []);
 
   await sessions.tick(started.session_id);
+  const timeline = buildSessionTimeline({ db: sessions.db, paths: dispatcher.paths, sessionId: started.session_id });
+  assert.equal(timeline.session.id, started.session_id);
+  assert.equal(timeline.spans.some((span) => span.actor === "manager"), true);
   assert.equal(sessions.get(started.session_id).state, "WAITING_FOR_HERMES");
   const enqueued = watcher.pass();
   assert.equal(enqueued.length, 1);

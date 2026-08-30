@@ -31,6 +31,7 @@ import {
   readRestoreMarker, clearRestoreMarker,
 } from "./recovery.js";
 import { buildJobPresentation } from "./presentation/job-presentation.js";
+import { buildSessionTimeline, listSessionPresentations } from "./presentation/session-timeline.js";
 
 const ROOTS_ONLY = "parent_job_id IS NULL";
 
@@ -718,6 +719,7 @@ export class Dispatcher {
         proposals_awaiting_decision: pendingProposalTotal,
       },
       work,
+      sessions: listSessionPresentations(this.db).slice(0, OVERVIEW_WORK_LIMIT),
       projects,
       attention,
       truncated: projectTotal > projects.length || totalAttention > attention.length,
@@ -734,6 +736,7 @@ export class Dispatcher {
       else if (overview.attention.length) overview.attention.pop();
       else if (overview.projects.length) overview.projects.pop();
       else if (overview.work.length) overview.work.pop();
+      else if (overview.sessions.length) overview.sessions.pop();
       else throw new Error("Overview metadata exceeds its serialized size limit");
     }
     return overview;
@@ -2896,7 +2899,9 @@ export class Dispatcher {
     const presentation = buildJobPresentation({
       db: this.db, paths: this.paths, job, attempts, validations, family,
     });
-    return { job, attempts, validations, family, presentation };
+    const session = this.db.prepare("SELECT id FROM autonomous_sessions WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1").get(jobId);
+    const session_timeline = session ? buildSessionTimeline({ db: this.db, paths: this.paths, sessionId: session.id }) : null;
+    return { job, attempts, validations, family, presentation, session_timeline };
   }
 
   // The detailed view: a root with the work it commissioned, and what the whole thing cost.

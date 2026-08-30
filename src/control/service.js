@@ -78,6 +78,12 @@ export class ControlService {
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       "session.poll": () => this.sessions.poll(args.sessionId),
+      "session.list": () => this.dispatcher.overview().sessions,
+      "session.timeline": () => {
+        const session = this.dispatcher.db.prepare("SELECT job_id FROM autonomous_sessions WHERE id = ?").get(args.sessionId);
+        if (!session?.job_id) throw new ControlError("SESSION_TIMELINE_UNAVAILABLE", `Session ${args.sessionId} has no root job`, 409);
+        return this.dispatcher.status(session.job_id).session_timeline;
+      },
       attention: () => this.dispatcher.attention(),
       briefing: () => this.dispatcher.briefing(),
     };
