@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { FakeBackend } from "../src/backend.js";
 import { initializeDataRoot } from "../src/db.js";
 import { Dispatcher } from "../src/service.js";
-import { normalizeOpenCodeActivity, readJsonlTail } from "../src/presentation/activity-open-code.js";
+import { normalizeOpenCodeActivity, normalizeOpenCodeActivityPage, readJsonlTail } from "../src/presentation/activity-open-code.js";
 import { derivePhase, derivePhaseSteps } from "../src/presentation/phase.js";
 import { projectEvidence } from "../src/presentation/evidence.js";
 import { projectAttention } from "../src/presentation/job-presentation.js";
@@ -108,6 +108,30 @@ test("OpenCode runtime state exposes a slow tool before JSON completion and the 
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
+});
+
+test("paged OpenCode history lets terminal JSONL completion beat stale runtime state", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-paged-tool-"));
+  const databasePath = path.join(temp, "opencode-state.db");
+  const events = path.join(temp, "opencode-events.jsonl");
+  try {
+    const db = new DatabaseSync(databasePath);
+    db.exec("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+    db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run("part_1", "message_1", "session_1", 1788048000000, JSON.stringify({
+      type: "tool", callID: "same_call", tool: "bash", state: { status: "running", input: { command: "node --test" } },
+    }));
+    db.close();
+    fs.writeFileSync(events, `${JSON.stringify({ type: "tool_result", part: {
+      callID: "same_call", tool: "bash", state: { status: "completed", input: { command: "node --test" }, output: "passed" },
+    } })}\n`);
+    const page = normalizeOpenCodeActivityPage({
+      attempt: { id: "attempt_page", started_at: "2026-08-30T00:00:00Z" }, filePath: events, runtimeDatabasePath: databasePath,
+    });
+    assert.equal(page.activities.length, 1);
+    assert.equal(page.activities[0].id, "attempt_page:opencode:same_call");
+    assert.equal(page.activities[0].lifecycle, "completed");
+    assert.equal(page.activities[0].detail, "passed");
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
 test("phase steps contain work history only and keep a planning question in planning", () => {

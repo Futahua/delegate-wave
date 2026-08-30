@@ -227,14 +227,16 @@ export function normalizeOpenCodeActivityPage({
   const runtime = before === null || before === undefined || before === ""
     ? readOpenCodeRuntimeParts(runtimeDatabasePath, { limit: boundedLimit }) : { events: [] };
   const byId = new Map();
-  for (const { event, ordinal } of events) {
-    const item = normalizeEvent(event, attempt, ordinal);
-    if (item) byId.set(item.id, item);
-  }
   runtime.events.forEach((event, ordinal) => {
     const item = normalizeEvent(event, attempt, lines.length + ordinal);
     if (item) byId.set(item.id, item);
   });
+  // Runtime supplies pre-completion truth, but the terminal JSONL receipt is durable authority for
+  // the same provider call. Insert it last so completion/error can never regress to running.
+  for (const { event, ordinal } of events) {
+    const item = normalizeEvent(event, attempt, ordinal);
+    if (item) byId.set(item.id, item);
+  }
   const activities = [...byId.values()];
   if (malformed) activities.push({
     id: `${attempt.id}:opencode:malformed:${start}:${end}`,
