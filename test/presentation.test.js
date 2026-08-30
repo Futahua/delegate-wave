@@ -8,7 +8,7 @@ import { FakeBackend } from "../src/backend.js";
 import { initializeDataRoot } from "../src/db.js";
 import { Dispatcher } from "../src/service.js";
 import { normalizeOpenCodeActivity, readJsonlTail } from "../src/presentation/activity-open-code.js";
-import { derivePhaseSteps } from "../src/presentation/phase.js";
+import { derivePhase, derivePhaseSteps } from "../src/presentation/phase.js";
 import { projectEvidence } from "../src/presentation/evidence.js";
 import { projectAttention } from "../src/presentation/job-presentation.js";
 import { runProcess } from "../src/process.js";
@@ -121,6 +121,20 @@ test("phase steps contain work history only and keep a planning question in plan
   assert.equal(steps.find((step) => step.id === "planning").state, "active");
   assert.equal(steps.find((step) => step.id === "reviewing").state, "future");
   assert.equal(steps.some((step) => ["needs_input", "completed", "failed"].includes(step.id)), false);
+});
+
+test("in-flight validation is the active work step before its validation row exists", () => {
+  const input = {
+    job: { status: "RUNNING" },
+    managerRun: { status: "IMPLEMENTING" },
+    managerTurns: [{ phase: "PLAN", state: "COMPLETED" }],
+    attempts: [{ id: "attempt_1", job_id: "job_1", terminal_state: "SUCCEEDED", validation_state: "PENDING" }],
+    validations: [], childJobs: [],
+  };
+  assert.equal(derivePhase({ job: input.job, managerRun: input.managerRun, attempts: input.attempts }).id, "validating");
+  const steps = derivePhaseSteps(input);
+  assert.equal(steps.find((step) => step.id === "implementing").state, "done");
+  assert.equal(steps.find((step) => step.id === "validating").state, "active");
 });
 
 test("failed attempts produce durable failure evidence and manager decisions keep their kind", () => {

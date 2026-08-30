@@ -29,6 +29,8 @@ const WORK_STAGES = [
 
 function workContext({ managerRun, managerTurns, attempts, validations, childJobs }) {
   const lastTurn = managerTurns.at(-1);
+  const validationPending = attempts.some((attempt) =>
+    attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING");
   if (managerRun?.status === "AWAITING_HUMAN") {
     if (lastTurn?.phase === "REVIEW") return "reviewing";
     if (["PLAN", "SYNTHESIS"].includes(lastTurn?.phase)) return "planning";
@@ -37,6 +39,7 @@ function workContext({ managerRun, managerTurns, attempts, validations, childJob
     return "planning";
   }
   if (managerRun?.status === "REVIEWING") return "reviewing";
+  if (validationPending) return "validating";
   if (validations.some((validation) => !validation.finished_at)) return "validating";
   if (managerRun?.status === "EXPLORING") return "exploring";
   if (managerRun?.status === "IMPLEMENTING" || attempts.some((attempt) => attempt.terminal_state === null)) return "implementing";
@@ -50,7 +53,9 @@ export function derivePhaseSteps({ job, managerRun, managerTurns = [], attempts 
   if (managerRun || managerTurns.some((turn) => ["PLAN", "SYNTHESIS"].includes(turn.phase))) observed.add("planning");
   if (childJobs.some((child) => child.internal_kind === "MANAGER_EXPLORATION")) observed.add("exploring");
   if (attempts.some((attempt) => !childJobs.some((child) => child.id === attempt.job_id))) observed.add("implementing");
-  if (validations.length) observed.add("validating");
+  const validationPending = attempts.some((attempt) =>
+    attempt.terminal_state === "SUCCEEDED" && attempt.validation_state === "PENDING");
+  if (validations.length || validationPending) observed.add("validating");
   if (managerTurns.some((turn) => turn.phase === "REVIEW")) observed.add("reviewing");
 
   const current = workContext({ managerRun, managerTurns, attempts, validations, childJobs });
