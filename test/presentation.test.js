@@ -3,10 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { FakeBackend } from "../src/backend.js";
 import { initializeDataRoot } from "../src/db.js";
 import { Dispatcher } from "../src/service.js";
 import { normalizeOpenCodeActivity, readJsonlTail } from "../src/presentation/activity-open-code.js";
+import { derivePhaseSteps } from "../src/presentation/phase.js";
+import { projectEvidence } from "../src/presentation/evidence.js";
+import { projectAttention } from "../src/presentation/job-presentation.js";
 import { runProcess } from "../src/process.js";
 
 async function command(name, args, cwd) {
@@ -78,6 +82,66 @@ test("JSONL reader bounds the artifact tail and discards a cut leading fragment"
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
+});
+
+test("OpenCode runtime state exposes a slow tool before JSON completion and the same row settles", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-live-tool-"));
+  const databasePath = path.join(temp, "opencode-state.db");
+  const events = path.join(temp, "opencode-events.jsonl");
+  try {
+    const db = new DatabaseSync(databasePath);
+    db.exec("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+    const running = { type: "tool", callID: "slow_1", tool: "bash", state: { status: "running", input: { command: "node slow-test.js" }, time: { start: 1788048000000 } } };
+    db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run("part_1", "message_1", "session_1", 1788048000000, JSON.stringify(running));
+    db.close();
+    fs.writeFileSync(events, "");
+    const before = normalizeOpenCodeActivity({ attempt: { id: "attempt_slow", started_at: "2026-08-30T00:00:00Z" }, filePath: events, runtimeDatabasePath: databasePath });
+    assert.equal(before.activities.length, 1);
+    assert.equal(before.activities[0].id, "attempt_slow:opencode:slow_1");
+    assert.equal(before.activities[0].lifecycle, "updated");
+
+    fs.writeFileSync(events, `${JSON.stringify({ type: "tool_use", part: { callID: "slow_1", tool: "bash", state: { status: "completed", input: { command: "node slow-test.js" }, output: "passed" } } })}\n`);
+    const after = normalizeOpenCodeActivity({ attempt: { id: "attempt_slow", started_at: "2026-08-30T00:00:00Z" }, filePath: events, runtimeDatabasePath: databasePath });
+    assert.equal(after.activities.length, 1);
+    assert.equal(after.activities[0].id, before.activities[0].id);
+    assert.equal(after.activities[0].lifecycle, "completed");
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("phase steps contain work history only and keep a planning question in planning", () => {
+  const steps = derivePhaseSteps({
+    job: { status: "NEEDS_ATTENTION" },
+    managerRun: { status: "AWAITING_HUMAN" },
+    managerTurns: [{ phase: "PLAN", state: "COMPLETED" }],
+    attempts: [], validations: [], childJobs: [],
+  });
+  assert.deepEqual(steps.map((step) => step.id), ["planning", "exploring", "implementing", "validating", "reviewing"]);
+  assert.equal(steps.find((step) => step.id === "planning").state, "active");
+  assert.equal(steps.find((step) => step.id === "reviewing").state, "future");
+  assert.equal(steps.some((step) => ["needs_input", "completed", "failed"].includes(step.id)), false);
+});
+
+test("failed attempts produce durable failure evidence and manager decisions keep their kind", () => {
+  const evidence = projectEvidence({
+    validations: [],
+    managerTurns: [{ id: "turn_1", state: "COMPLETED", action: "REVISE", phase: "REVIEW", started_at: "2026-08-30T00:00:00Z", finished_at: "2026-08-30T00:00:01Z" }],
+    attempts: [{ id: "attempt_1", ordinal: 1, terminal_state: "FAILED", validation_state: "NOT_RUN", started_at: "2026-08-30T00:00:02Z", finished_at: "2026-08-30T00:00:03Z", failure: { message: "executor stopped" } }],
+  });
+  assert.equal(evidence.some((item) => item.kind === "manager_decision"), true);
+  assert.deepEqual(evidence.find((item) => item.kind === "failure"), {
+    id: "failure:attempt_1", occurred_at: "2026-08-30T00:00:03Z", kind: "failure", state: "failed",
+    summary: "executor stopped", attempt_id: "attempt_1", source: { table: "attempts", id: "attempt_1" }, authority: "evidence",
+  });
+});
+
+test("AWAITING_HUMAN presents the exact durable escalation question", () => {
+  assert.deepEqual(projectAttention(
+    { status: "NEEDS_ATTENTION" },
+    { status: "AWAITING_HUMAN", escalation_question: "Should archived runs be included?" },
+    [],
+  ), { kind: "question", summary: "Should archived runs be included?" });
 });
 
 test("job status remains backward compatible and appends deterministic presentation", async (t) => {

@@ -3,9 +3,16 @@
   "revision": "fixture-revision",
   "generated_at": "2026-08-30T00:00:00.000Z",
   "phase": { "id": "reviewing", "label": "Reviewing", "active": true },
+  "phase_steps": [
+    { "id": "planning", "label": "Planning", "state": "done" },
+    { "id": "exploring", "label": "Exploring", "state": "future" },
+    { "id": "implementing", "label": "Implementing", "state": "done" },
+    { "id": "validating", "label": "Validating", "state": "done" },
+    { "id": "reviewing", "label": "Reviewing", "state": "active" }
+  ],
   "actors": [
     { "id": "manager:mrun_fixture", "role": "manager", "label": "Manager", "state": "working", "current": "reviewing", "started_at": "2026-08-30T00:00:00.000Z" },
-    { "id": "worker:attempt_fixture", "role": "worker", "label": "Implementation worker", "state": "completed", "attempt_id": "attempt_fixture", "started_at": "2026-08-30T00:01:00.000Z", "finished_at": "2026-08-30T00:03:00.000Z" }
+    { "id": "worker:attempt_fixture", "role": "worker", "label": "Implementation worker", "work_kind": "implementation", "state": "completed", "attempt_id": "attempt_fixture", "started_at": "2026-08-30T00:01:00.000Z", "finished_at": "2026-08-30T00:03:00.000Z" }
   ],
   "live_activity": [],
   "settled_groups": [

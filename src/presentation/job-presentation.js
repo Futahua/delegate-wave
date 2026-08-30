@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { normalizeOpenCodeActivity } from "./activity-open-code.js";
 import { projectEvidence } from "./evidence.js";
-import { derivePhase } from "./phase.js";
+import { derivePhase, derivePhaseSteps } from "./phase.js";
 
 function parseJson(value, fallback) {
   try {
@@ -21,6 +21,11 @@ function actorState(attempt) {
 function attemptLabel(attempt, job) {
   if (job.internal_kind === "MANAGER_EXPLORATION" || job.mode === "read") return "Exploration worker";
   return attempt.ordinal > 1 ? `Revision worker ${attempt.ordinal}` : "Implementation worker";
+}
+
+function workKind(attempt, ownerJob) {
+  if (ownerJob.internal_kind === "MANAGER_EXPLORATION") return "exploration";
+  return attempt.ordinal > 1 ? "revision" : "implementation";
 }
 
 function projectActors({ job, managerRun, attempts, childJobs }) {
@@ -44,6 +49,7 @@ function projectActors({ job, managerRun, attempts, childJobs }) {
       id: `worker:${attempt.id}`,
       role: "worker",
       label: attemptLabel(attempt, ownerJob),
+      work_kind: workKind(attempt, ownerJob),
       state: actorState(attempt),
       current: attempt.terminal_state === null ? "Working" : attempt.validation_state === "PENDING" ? "Validating" : undefined,
       attempt_id: attempt.id,
@@ -128,8 +134,8 @@ function changedFiles(attempts) {
   return { count: paths.size, files: [...paths].sort().map((filePath) => ({ path: filePath })) };
 }
 
-function attention(job, managerRun, attempts) {
-  if (managerRun?.status === "AWAITING_HUMAN") return { kind: "question", summary: "Delegate Wave needs input before it can continue." };
+export function projectAttention(job, managerRun, attempts) {
+  if (managerRun?.status === "AWAITING_HUMAN") return { kind: "question", summary: managerRun.escalation_question || "Delegate Wave needs input before it can continue." };
   const failed = attempts.find((attempt) => attempt.terminal_state === "FAILED");
   if (job.status === "NEEDS_ATTENTION" && failed) return { kind: "failure", summary: failed.failure?.message ?? "A worker attempt failed and needs attention." };
   if (job.status === "NEEDS_ATTENTION") return { kind: "approval", summary: "This job needs attention before it can continue." };
@@ -160,19 +166,22 @@ export function buildJobPresentation({ db, paths, job, attempts, validations, fa
   const liveActivity = [...managerActivity(managerTurns), ...activeAttempts.flatMap((attempt) => normalizeOpenCodeActivity({
     attempt: { ...attempt, actor_role: "worker" },
     filePath: path.join(paths.artifacts, job.project_id, attempt.id, "opencode-events.jsonl"),
+    runtimeDatabasePath: path.join(paths.tmp, "executor", attempt.id, "opencode-state.db"),
   }).activities)].sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
   const phase = derivePhase({ job, managerRun, attempts: allAttempts });
+  const phaseSteps = derivePhaseSteps({ job, managerRun, managerTurns, attempts: allAttempts, validations: allValidations, childJobs });
   const actors = projectActors({ job, managerRun, attempts: allAttempts, childJobs });
   const evidence = projectEvidence({ validations: allValidations, managerTurns, attempts: allAttempts });
   const projection = {
     schema: 1,
     phase,
+    phase_steps: phaseSteps,
     actors,
     live_activity: liveActivity,
     settled_groups: settledGroups(allAttempts),
     evidence,
     ...(changedFiles(allAttempts) ? { changed_files: changedFiles(allAttempts) } : {}),
-    ...(attention(job, managerRun, allAttempts) ? { attention: attention(job, managerRun, allAttempts) } : {}),
+    ...(projectAttention(job, managerRun, allAttempts) ? { attention: projectAttention(job, managerRun, allAttempts) } : {}),
     ...(outcome(job, allAttempts) ? { outcome: outcome(job, allAttempts) } : {}),
   };
   const revision = crypto.createHash("sha256").update(JSON.stringify(projection)).digest("hex");

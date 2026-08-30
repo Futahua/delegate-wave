@@ -29,6 +29,18 @@ export function projectEvidence({ validations = [], managerTurns = [], attempts 
     });
   }
   for (const attempt of attempts) {
+    if (attempt.terminal_state === "FAILED" || attempt.terminal_state === "CANCELLED" || attempt.failure) {
+      evidence.push({
+        id: `failure:${attempt.id}`,
+        occurred_at: attempt.finished_at ?? attempt.started_at,
+        kind: "failure",
+        state: "failed",
+        summary: attempt.failure?.message ?? `Attempt ${attempt.ordinal} ${String(attempt.terminal_state ?? "failed").toLowerCase()}`,
+        attempt_id: attempt.id,
+        source: { table: "attempts", id: attempt.id },
+        authority: "evidence",
+      });
+    }
     if (!attempt.result_commit) continue;
     evidence.push({
       id: `candidate:${attempt.id}`,

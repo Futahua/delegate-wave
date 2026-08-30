@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 
 export const DEFAULT_TAIL_BYTES = 256 * 1024;
 export const DEFAULT_ACTIVITY_LIMIT = 200;
@@ -10,6 +11,15 @@ function text(value) {
 
 function firstText(...values) {
   return values.map(text).find(Boolean) ?? "";
+}
+
+function occurredAt(...values) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return new Date(value).toISOString();
+    const valueText = text(value);
+    if (valueText) return valueText;
+  }
+  return "";
 }
 
 function stableEventId(attemptId, event, ordinal) {
@@ -60,7 +70,7 @@ function normalizeEvent(event, attempt, ordinal) {
   const type = String(event.type ?? "").toLowerCase();
   const tool = firstText(part.tool, part.name, event.tool);
   const input = part.input ?? part.state?.input ?? event.input ?? {};
-  const occurredAt = firstText(event.timestamp, event.occurred_at, part.timestamp, attempt.started_at);
+  const timestamp = occurredAt(event.timestamp, event.occurred_at, part.timestamp, part.state?.time?.start, attempt.started_at);
 
   if (tool || type.includes("tool")) {
     const detail = firstText(
@@ -69,7 +79,7 @@ function normalizeEvent(event, attempt, ordinal) {
     );
     return {
       id: stableEventId(attempt.id, event, ordinal),
-      occurred_at: occurredAt,
+      occurred_at: timestamp,
       actor_id: `worker:${attempt.id}`,
       actor_role: attempt.actor_role ?? "worker",
       kind: toolKind(tool),
@@ -87,7 +97,7 @@ function normalizeEvent(event, attempt, ordinal) {
     if (!narration) return null;
     return {
       id: stableEventId(attempt.id, event, ordinal),
-      occurred_at: occurredAt,
+      occurred_at: timestamp,
       actor_id: `worker:${attempt.id}`,
       actor_role: attempt.actor_role ?? "worker",
       kind: "narration",
@@ -97,6 +107,43 @@ function normalizeEvent(event, attempt, ordinal) {
     };
   }
   return null;
+}
+
+// OpenCode 1.14.28's `run --format json` deliberately emits a tool part only after it is completed
+// or errors (packages/opencode/src/cli/cmd/run.ts at v1.14.28). Its isolated state database is the
+// actual pre-completion source: the runtime upserts the same part ID/callID for pending, running,
+// completed and error states. This reader is intentionally read-only and schema-checked. If a future
+// OpenCode changes that private projection, live motion disappears rather than being fabricated;
+// the terminal JSONL receipt remains available.
+export function readOpenCodeRuntimeParts(databasePath, { limit = DEFAULT_ACTIVITY_LIMIT } = {}) {
+  if (!databasePath || !fs.existsSync(databasePath)) return { events: [], compatible: false };
+  let db;
+  try {
+    db = new DatabaseSync(databasePath, { readOnly: true });
+    const columns = db.prepare("PRAGMA table_info(part)").all().map((column) => column.name);
+    if (!["id", "message_id", "session_id", "time_created", "data"].every((name) => columns.includes(name))) {
+      return { events: [], compatible: false };
+    }
+    const rows = db.prepare("SELECT id, message_id, session_id, time_created, data FROM part ORDER BY time_created DESC, id DESC LIMIT ?")
+      .all(limit).reverse();
+    const events = [];
+    for (const row of rows) {
+      let data;
+      try { data = JSON.parse(row.data); } catch { continue; }
+      if (data?.type !== "tool") continue;
+      events.push({
+        type: "tool_use",
+        timestamp: row.time_created,
+        sessionID: row.session_id,
+        part: { id: row.id, messageID: row.message_id, sessionID: row.session_id, ...data },
+      });
+    }
+    return { events, compatible: true };
+  } catch {
+    return { events: [], compatible: false };
+  } finally {
+    try { db?.close(); } catch { /* read-only observer owns no runtime state */ }
+  }
 }
 
 export function readJsonlTail(filePath, { maxBytes = DEFAULT_TAIL_BYTES } = {}) {
@@ -127,10 +174,11 @@ export function readJsonlTail(filePath, { maxBytes = DEFAULT_TAIL_BYTES } = {}) 
   return { events, malformed, truncated: start > 0 };
 }
 
-export function normalizeOpenCodeActivity({ attempt, filePath, limit = DEFAULT_ACTIVITY_LIMIT, maxBytes } = {}) {
+export function normalizeOpenCodeActivity({ attempt, filePath, runtimeDatabasePath, limit = DEFAULT_ACTIVITY_LIMIT, maxBytes } = {}) {
   const tail = readJsonlTail(filePath, { maxBytes });
+  const runtime = readOpenCodeRuntimeParts(runtimeDatabasePath, { limit });
   const byId = new Map();
-  tail.events.forEach((event, ordinal) => {
+  [...runtime.events, ...tail.events].forEach((event, ordinal) => {
     const item = normalizeEvent(event, attempt, ordinal);
     if (item) byId.set(item.id, item);
   });
