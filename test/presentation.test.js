@@ -134,6 +134,57 @@ test("paged OpenCode history lets terminal JSONL completion beat stale runtime s
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
+test("terminal JSONL preserves interleaved narration and tool chronology despite runtime rows", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-transcript-order-"));
+  const databasePath = path.join(temp, "opencode-state.db");
+  const events = path.join(temp, "opencode-events.jsonl");
+  try {
+    const db = new DatabaseSync(databasePath);
+    db.exec("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+    for (const [index, callID] of ["tool_a", "tool_b", "tool_c"].entries()) db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run(
+      `part_${index}`, "message_1", "session_1", index + 1,
+      JSON.stringify({ type: "tool", callID, tool: "bash", state: { status: "running", input: { command: callID } } }),
+    );
+    db.close();
+    fs.writeFileSync(events, [
+      { type: "text", timestamp: "2026-08-30T00:00:00Z", part: { id: "text_a", text: "Narration A" } },
+      { type: "tool_result", timestamp: "2026-08-30T00:00:01Z", part: { callID: "tool_a", tool: "bash", state: { status: "completed", input: { command: "tool_a" }, output: "A" } } },
+      { type: "text", timestamp: "2026-08-30T00:00:02Z", part: { id: "text_b", text: "Narration B" } },
+      { type: "tool_result", timestamp: "2026-08-30T00:00:03Z", part: { callID: "tool_b", tool: "read", state: { status: "completed", input: { file_path: "router.js" }, output: "body" } } },
+      { type: "text", timestamp: "2026-08-30T00:00:04Z", part: { id: "text_c", text: "Narration C" } },
+      { type: "tool_result", timestamp: "2026-08-30T00:00:05Z", part: { callID: "tool_c", tool: "bash", state: { status: "completed", input: { command: "tool_c" }, output: "C" } } },
+      { type: "text", timestamp: "2026-08-30T00:00:06Z", part: { id: "text_d", text: "Narration D" } },
+    ].map(JSON.stringify).join("\n"));
+    const page = normalizeOpenCodeActivityPage({ attempt: { id: "attempt_order", started_at: "2026-08-30T00:00:00Z" }, filePath: events, runtimeDatabasePath: databasePath });
+    assert.deepEqual(page.activities.map((item) => item.kind === "narration" ? item.title : item.tool.name),
+      ["Narration A", "bash", "Narration B", "read", "Narration C", "bash", "Narration D"]);
+    assert.equal(page.activities[1].lifecycle, "completed");
+    assert.equal(page.activities[3].tool.input.file_path, "router.js");
+    assert.equal(page.activities[3].tool.output, "body");
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("runtime-only active tool joins the live tail without moving terminal events", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-runtime-tail-"));
+  const databasePath = path.join(temp, "opencode-state.db");
+  const events = path.join(temp, "opencode-events.jsonl");
+  try {
+    const db = new DatabaseSync(databasePath);
+    db.exec("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+    db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run("part_a", "message_1", "session_1", 2, JSON.stringify({ type: "tool", callID: "tool_a", tool: "bash", state: { status: "running", input: { command: "tool_a" } } }));
+    db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run("part_b", "message_1", "session_1", 1788048003000, JSON.stringify({ type: "tool", callID: "tool_b", tool: "bash", state: { status: "running", input: { command: "tool_b" }, time: { start: "2026-08-30T00:00:03Z" } } }));
+    db.close();
+    fs.writeFileSync(events, [
+      { type: "text", timestamp: "2026-08-30T00:00:00Z", part: { id: "text_a", text: "Narration A" } },
+      { type: "tool_result", timestamp: "2026-08-30T00:00:01Z", part: { callID: "tool_a", tool: "bash", state: { status: "completed", input: { command: "tool_a" }, output: "done" } } },
+      { type: "text", timestamp: "2026-08-30T00:00:02Z", part: { id: "text_b", text: "Narration B" } },
+    ].map(JSON.stringify).join("\n"));
+    const page = normalizeOpenCodeActivityPage({ attempt: { id: "attempt_tail", started_at: "2026-08-30T00:00:00Z" }, filePath: events, runtimeDatabasePath: databasePath });
+    assert.deepEqual(page.activities.map((item) => item.kind === "narration" ? item.title : `${item.tool.name}:${item.lifecycle}`),
+      ["Narration A", "bash:completed", "Narration B", "bash:updated"]);
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
 test("phase steps contain work history only and keep a planning question in planning", () => {
   const steps = derivePhaseSteps({
     job: { status: "NEEDS_ATTENTION" },

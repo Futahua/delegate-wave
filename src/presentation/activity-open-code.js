@@ -4,6 +4,8 @@ import { DatabaseSync } from "node:sqlite";
 
 export const DEFAULT_TAIL_BYTES = 256 * 1024;
 export const DEFAULT_ACTIVITY_LIMIT = 200;
+export const MAX_PUBLIC_TEXT_CHARS = 16_000;
+export const MAX_TOOL_OUTPUT_CHARS = 32_000;
 
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -64,6 +66,53 @@ function titleForTool(tool, input) {
   return target ? `${label} ${target}` : label;
 }
 
+function bounded(value, maximum) {
+  const content = typeof value === "string" ? value : "";
+  return { content: content.slice(0, maximum), truncated: content.length > maximum };
+}
+
+function normalizedToolInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const normalized = {};
+  for (const key of ["filePath", "file_path", "path", "command", "pattern", "query", "description", "offset", "limit"]) {
+    const value = input[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") normalized[key] = value;
+  }
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function terminalOrderedItems(events, attempt) {
+  const positions = new Map();
+  const ordered = [];
+  for (const { event, ordinal } of events) {
+    const item = normalizeEvent(event, attempt, ordinal);
+    if (!item) continue;
+    const existing = positions.get(item.id);
+    if (existing === undefined) {
+      positions.set(item.id, ordered.length);
+      ordered.push(item);
+    } else ordered[existing] = item;
+  }
+  return ordered;
+}
+
+function insertRuntimeOnlyActive(terminal, runtimeEvents, attempt, ordinalBase = 0) {
+  const terminalIds = new Set(terminal.map((item) => item.id));
+  const active = runtimeEvents.map((event, ordinal) => normalizeEvent(event, attempt, ordinalBase + ordinal))
+    .filter((item) => item && !terminalIds.has(item.id) && ["started", "updated"].includes(item.lifecycle));
+  const merged = [...terminal];
+  for (const item of active) {
+    const timestamp = Date.parse(item.occurred_at);
+    const insertion = Number.isFinite(timestamp)
+      ? merged.findIndex((candidate) => {
+        const candidateTime = Date.parse(candidate.occurred_at);
+        return Number.isFinite(candidateTime) && candidateTime > timestamp;
+      }) : -1;
+    if (insertion < 0) merged.push(item); else merged.splice(insertion, 0, item);
+  }
+  return merged;
+}
+
 export function normalizeEvent(event, attempt, ordinal) {
   if (!event || typeof event !== "object") return null;
   const part = event.part ?? event.data ?? {};
@@ -73,10 +122,14 @@ export function normalizeEvent(event, attempt, ordinal) {
   const timestamp = occurredAt(event.timestamp, event.occurred_at, part.timestamp, part.state?.time?.start, attempt.started_at);
 
   if (tool || type.includes("tool")) {
-    const detail = firstText(
-      part.state?.output, part.output, part.error, event.error,
-      typeof input === "string" ? input : "",
-    );
+    const output = firstText(part.state?.output, part.output);
+    const error = firstText(part.state?.error, part.error, event.error);
+    const detail = firstText(output, error, typeof input === "string" ? input : "");
+    const boundedOutput = bounded(output, MAX_TOOL_OUTPUT_CHARS);
+    const boundedError = bounded(error, MAX_TOOL_OUTPUT_CHARS);
+    const metadata = part.metadata ?? part.state?.metadata ?? {};
+    const diff = firstText(metadata?.diff, part.diff, part.state?.diff);
+    const changedFiles = Array.isArray(metadata?.changed_files) ? metadata.changed_files.filter((value) => typeof value === "string").slice(0, 100) : undefined;
     return {
       id: stableEventId(attempt.id, event, ordinal),
       occurred_at: timestamp,
@@ -86,6 +139,18 @@ export function normalizeEvent(event, attempt, ordinal) {
       lifecycle: lifecycle(event),
       title: titleForTool(tool, input),
       ...(detail ? { detail: detail.slice(0, 2_000) } : {}),
+      tool: {
+        name: tool || "tool",
+        ...(normalizedToolInput(input) ? { input: normalizedToolInput(input) } : {}),
+        ...(output ? { output: boundedOutput.content } : {}),
+        ...(error ? { error: boundedError.content } : {}),
+        ...((boundedOutput.truncated || boundedError.truncated) ? { truncated: true } : {}),
+        ...((metadata?.exit_code !== undefined || changedFiles || diff) ? { metadata: {
+          ...(metadata?.exit_code !== undefined ? { exit_code: metadata.exit_code } : {}),
+          ...(changedFiles ? { changed_files: changedFiles } : {}),
+          ...(diff ? { diff: bounded(diff, MAX_TOOL_OUTPUT_CHARS).content } : {}),
+        } } : {}),
+      },
       authority: "activity",
     };
   }
@@ -95,6 +160,7 @@ export function normalizeEvent(event, attempt, ordinal) {
   if (type === "text" || type === "assistant/message" || type === "message") {
     const narration = firstText(part.text, event.text);
     if (!narration) return null;
+    const publicText = bounded(narration, MAX_PUBLIC_TEXT_CHARS);
     return {
       id: stableEventId(attempt.id, event, ordinal),
       occurred_at: timestamp,
@@ -102,7 +168,9 @@ export function normalizeEvent(event, attempt, ordinal) {
       actor_role: attempt.actor_role ?? "worker",
       kind: "narration",
       lifecycle: "completed",
-      title: narration.slice(0, 240),
+      title: publicText.content,
+      text: publicText.content,
+      ...(publicText.truncated ? { truncated: true } : {}),
       authority: "activity",
     };
   }
@@ -177,12 +245,8 @@ export function readJsonlTail(filePath, { maxBytes = DEFAULT_TAIL_BYTES } = {}) 
 export function normalizeOpenCodeActivity({ attempt, filePath, runtimeDatabasePath, limit = DEFAULT_ACTIVITY_LIMIT, maxBytes } = {}) {
   const tail = readJsonlTail(filePath, { maxBytes });
   const runtime = readOpenCodeRuntimeParts(runtimeDatabasePath, { limit });
-  const byId = new Map();
-  [...runtime.events, ...tail.events].forEach((event, ordinal) => {
-    const item = normalizeEvent(event, attempt, ordinal);
-    if (item) byId.set(item.id, item);
-  });
-  const activities = [...byId.values()].slice(-limit);
+  const terminal = terminalOrderedItems(tail.events.map((event, ordinal) => ({ event, ordinal })), attempt);
+  const activities = insertRuntimeOnlyActive(terminal, runtime.events, attempt, tail.events.length).slice(-limit);
   if (tail.malformed) {
     activities.push({
       id: `${attempt.id}:opencode:malformed-tail`,
@@ -226,18 +290,10 @@ export function normalizeOpenCodeActivityPage({
   }
   const runtime = before === null || before === undefined || before === ""
     ? readOpenCodeRuntimeParts(runtimeDatabasePath, { limit: boundedLimit }) : { events: [] };
-  const byId = new Map();
-  runtime.events.forEach((event, ordinal) => {
-    const item = normalizeEvent(event, attempt, lines.length + ordinal);
-    if (item) byId.set(item.id, item);
-  });
-  // Runtime supplies pre-completion truth, but the terminal JSONL receipt is durable authority for
-  // the same provider call. Insert it last so completion/error can never regress to running.
-  for (const { event, ordinal } of events) {
-    const item = normalizeEvent(event, attempt, ordinal);
-    if (item) byId.set(item.id, item);
-  }
-  const activities = [...byId.values()];
+  // Terminal JSONL owns both lifecycle truth and transcript position. Runtime contributes only
+  // active calls that have no terminal representation yet; it can never reorder settled history.
+  const terminal = terminalOrderedItems(events, attempt);
+  const activities = insertRuntimeOnlyActive(terminal, runtime.events, attempt, lines.length);
   if (malformed) activities.push({
     id: `${attempt.id}:opencode:malformed:${start}:${end}`,
     occurred_at: attempt.started_at,
