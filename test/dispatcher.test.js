@@ -72,11 +72,61 @@ test("overview is SQL-bounded, compact, and excludes detailed execution state", 
     projects: 25, jobs_needing_attention: 12, jobs_ready_for_integration: 13, proposals_awaiting_decision: 0,
   });
   assert.ok(overview.projects.length <= 20);
+  assert.ok(overview.work.length <= 40);
   assert.ok(overview.attention.length <= 20);
   assert.equal(overview.truncated, true);
   assert.ok(overview.attention.every((item) => item.summary.length <= 160));
-  assert.ok(Buffer.byteLength(serialized, "utf8") <= 3 * 1024);
+  assert.ok(Buffer.byteLength(serialized, "utf8") <= 16 * 1024);
   assert.doesNotMatch(serialized, /repo_path|worktree|validation|failure_signature|artifact/);
+});
+
+test("overview indexes manager planning as active without changing the pending root job", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-overview-planning-"));
+  const root = path.join(temp, "data");
+  initializeDataRoot(root);
+  const service = new Dispatcher({ root, backend: new FakeBackend() });
+  t.after(() => { service.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  const created = "2026-08-30T01:00:00.000Z";
+  service.db.prepare(`INSERT INTO projects(
+    id, name, repo_path, integration_branch, validation_json, protected_json, created_at
+  ) VALUES ('project-live', 'Live project', ?, 'main', '[]', '[]', ?)`).run(path.join(temp, "repo"), created);
+  service.db.prepare(`INSERT INTO jobs(
+    id, project_id, goal, mode, status, base_sha, max_attempts, strategy, created_at, updated_at
+  ) VALUES ('job-live', 'project-live', 'Watch from planning', 'write', 'PENDING', ?, 2, 'managed', ?, ?)`)
+    .run("a".repeat(40), created, created);
+  service.db.prepare(`INSERT INTO autonomous_sessions(
+    id, project_id, job_id, intent, mode, state, created_at, updated_at
+  ) VALUES ('asess-live', 'project-live', 'job-live', 'Watch from planning', 'AUTO', 'WORKING', ?, ?)`)
+    .run(created, created);
+  service.db.prepare(`INSERT INTO manager_runs(
+    id, job_id, status, max_exploration_rounds, max_revision_rounds, max_turns, created_at, updated_at
+  ) VALUES ('mrun-live', 'job-live', 'PLANNING', 1, 1, 12, ?, ?)`)
+    .run(created, created);
+
+  const row = service.overview().work.find((item) => item.id === "job-live");
+  assert.ok(row);
+  assert.equal(row.job_status, "PENDING");
+  assert.equal(row.presence, "active");
+  assert.equal(row.activity_state, "WORKING");
+  assert.equal(row.manager_status, "PLANNING");
+  assert.equal(row.session_state, "WORKING");
+
+  for (const managerStatus of ["IMPLEMENTING", "REVIEWING"]) {
+    service.db.prepare("UPDATE manager_runs SET status = ?, updated_at = ? WHERE id = 'mrun-live'")
+      .run(managerStatus, new Date(Date.parse(created) + 1_000).toISOString());
+    const active = service.overview().work.find((item) => item.id === "job-live");
+    assert.equal(active.id, "job-live");
+    assert.equal(active.presence, "active");
+    assert.equal(active.manager_status, managerStatus);
+  }
+
+  service.db.prepare("UPDATE manager_runs SET status = 'ACCEPTED' WHERE id = 'mrun-live'").run();
+  service.db.prepare("UPDATE jobs SET status = 'READY_FOR_INTEGRATION' WHERE id = 'job-live'").run();
+  service.db.prepare("UPDATE autonomous_sessions SET state = 'SEMANTICALLY_ACCEPTED' WHERE id = 'asess-live'").run();
+  const ready = service.overview().work.find((item) => item.id === "job-live");
+  assert.equal(ready.id, "job-live");
+  assert.equal(ready.presence, "ready");
+  assert.equal(ready.job_status, "READY_FOR_INTEGRATION");
 });
 
 test("overview health cannot be greener than doctor when a repository is missing", async (t) => {

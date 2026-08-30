@@ -49,8 +49,12 @@ export const REVIEW_MODEL = "opencode-go/gpt-5.6-luna";
 export const ESCALATION_MODEL = "opencode-go/deepseek-v4-pro";
 const OVERVIEW_PROJECT_LIMIT = 20;
 const OVERVIEW_ATTENTION_LIMIT = 20;
+const OVERVIEW_WORK_LIMIT = 40;
 const OVERVIEW_SUMMARY_LIMIT = 160;
-const OVERVIEW_BYTE_LIMIT = 3 * 1024;
+// The typed work index is the everyday discovery surface, not detailed execution state. Sixteen
+// KiB keeps 25-40 compact roots selectable on a lived-in personal machine while remaining strictly
+// bounded and far below the size of one job's evidence projection.
+const OVERVIEW_BYTE_LIMIT = 16 * 1024;
 
 // The one job shape that may run alongside its siblings. All three conditions are required: an
 // internal exploration that was somehow write-mode could produce a candidate, and two candidates
@@ -566,6 +570,58 @@ export class Dispatcher {
     const pendingProposalTotal = this.db.prepare(`SELECT COUNT(*) AS count FROM work_proposals w
       LEFT JOIN work_proposal_decisions d ON d.proposal_id = w.id
       WHERE d.proposal_id IS NULL AND w.expires_at > ?`).get(now()).count;
+    // `jobs.status` answers what the execution state machine may do next. It deliberately remains
+    // PENDING while a manager is planning. `presence` answers a different, presentation-facing
+    // question: is this root delegation currently alive, asking for attention, ready, or settled?
+    // Keeping that classification here prevents every client from incorrectly treating the job
+    // status as the only evidence that work exists.
+    const work = this.db.prepare(`WITH root_work AS (
+      SELECT
+        j.id,
+        j.project_id,
+        p.name AS project_name,
+        substr(j.goal, 1, ?) AS objective,
+        j.status AS job_status,
+        mr.status AS manager_status,
+        s.state AS session_state,
+        j.created_at,
+        MAX(j.updated_at, COALESCE(mr.updated_at, ''), COALESCE(s.updated_at, '')) AS updated_at,
+        CASE
+          WHEN j.status IN ('NEEDS_ATTENTION', 'FAILED')
+            OR mr.status IN ('AWAITING_HUMAN', 'FAILED')
+            OR s.state IN ('WAITING_FOR_HERMES', 'FAILED') THEN 'attention'
+          WHEN j.status = 'RUNNING'
+            OR mr.status IN ('PLANNING', 'SYNTHESIZING', 'EXPLORING', 'IMPLEMENTING', 'REVIEWING')
+            OR s.state = 'WORKING' THEN 'active'
+          WHEN j.status = 'READY_FOR_INTEGRATION'
+            OR mr.status = 'ACCEPTED'
+            OR s.state = 'SEMANTICALLY_ACCEPTED' THEN 'ready'
+          WHEN j.status IN ('SUCCEEDED', 'CANCELLED')
+            OR mr.status = 'CANCELLED'
+            OR s.state = 'COMPLETED' THEN 'settled'
+          ELSE NULL
+        END AS presence
+      FROM jobs j
+      JOIN projects p ON p.id = j.project_id
+      LEFT JOIN manager_runs mr ON mr.job_id = j.id
+      LEFT JOIN autonomous_sessions s ON s.id = (
+        SELECT latest.id FROM autonomous_sessions latest
+        WHERE latest.job_id = j.id
+        ORDER BY latest.updated_at DESC, latest.id DESC LIMIT 1
+      )
+      WHERE j.${ROOTS_ONLY}
+    )
+    SELECT * FROM root_work WHERE presence IS NOT NULL
+    ORDER BY CASE presence
+      WHEN 'attention' THEN 0 WHEN 'active' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
+      updated_at DESC, id DESC
+    LIMIT ?`).all(OVERVIEW_SUMMARY_LIMIT, OVERVIEW_WORK_LIMIT).map((item) => ({
+      ...item,
+      objective: compactOverviewText(item.objective),
+      activity_state: item.presence === 'active' ? 'WORKING'
+        : item.presence === 'attention' ? 'NEEDS_ATTENTION'
+          : item.presence === 'ready' ? 'READY' : item.job_status,
+    }));
     const projects = this.db.prepare(`SELECT
         p.id,
         p.name,
@@ -661,18 +717,23 @@ export class Dispatcher {
         jobs_ready_for_integration: jobTotals.ready_for_integration,
         proposals_awaiting_decision: pendingProposalTotal,
       },
+      work,
       projects,
       attention,
       truncated: projectTotal > projects.length || totalAttention > attention.length,
     };
     while (Buffer.byteLength(JSON.stringify(overview), "utf8") > OVERVIEW_BYTE_LIMIT) {
       overview.truncated = true;
+      // `work` is the selectable everyday index. The old project summary and attention projection
+      // duplicate facts it now carries, so compact those first. Only then trim the work tail, whose
+      // semantic-priority ordering preserves new active planning ahead of old settled history.
       const nonActionable = overview.projects.findLastIndex(
         (project) => project.needs_attention === 0 && project.ready_for_integration === 0,
       );
       if (nonActionable >= 0) overview.projects.splice(nonActionable, 1);
       else if (overview.attention.length) overview.attention.pop();
       else if (overview.projects.length) overview.projects.pop();
+      else if (overview.work.length) overview.work.pop();
       else throw new Error("Overview metadata exceeds its serialized size limit");
     }
     return overview;

@@ -160,6 +160,7 @@ test("overview totals, counts and latest-job ignore children", async (t) => {
   assert.equal(entry.needs_attention, 0);
   assert.equal(entry.latest_job.id, root.id, "a child must not become the project's latest job");
   for (const item of overview.attention) assert.notEqual(item.id, children[0].id);
+  for (const item of overview.work) assert.notEqual(item.id, children[0].id);
 });
 
 test("attention() surfaces the root, never the child", async (t) => {
