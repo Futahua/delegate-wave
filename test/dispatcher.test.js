@@ -77,6 +77,7 @@ test("overview is SQL-bounded, compact, and excludes detailed execution state", 
   assert.equal(overview.truncated, true);
   assert.ok(overview.attention.every((item) => item.summary.length <= 160));
   assert.ok(Buffer.byteLength(serialized, "utf8") <= 16 * 1024);
+  assert.equal(Object.hasOwn(overview, "sessions"), false, "session history has its own pagination budget");
   assert.doesNotMatch(serialized, /repo_path|worktree|validation|failure_signature|artifact/);
 });
 

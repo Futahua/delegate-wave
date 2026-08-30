@@ -97,6 +97,22 @@ test("duplicate and concurrent request IDs produce one durable side effect", asy
   assert.equal(f.dispatcher.db.prepare("SELECT COUNT(*) AS count FROM control_request_results").get().count, 1);
 });
 
+test("dedicated session reads are independently routed and require only read scope", async (t) => {
+  const f = await fixture(t);
+  f.dispatcher.db.prepare(`INSERT INTO projects(id, name, repo_path, integration_branch, created_at)
+    VALUES ('p-session', 'Session project', ?, 'main', '2026-01-01T00:00:00Z')`).run(path.join(f.root, "repo"));
+  f.dispatcher.db.prepare(`INSERT INTO autonomous_sessions(id, project_id, intent, mode, state, created_at, updated_at)
+    VALUES ('s-route', 'p-session', 'Observe work', 'PLAN', 'SEMANTICALLY_ACCEPTED',
+      '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')`).run();
+  const observer = new ControlClient({ baseUrl: f.url, token: f.observerToken });
+  const listed = await observer.get("/v1/sessions?limit=1");
+  assert.equal(listed.sessions[0].id, "s-route");
+  assert.equal(listed.sessions[0].state, "settled");
+  const timeline = await observer.get("/v1/sessions/s-route/timeline?limit=20");
+  assert.equal(timeline.session.id, "s-route");
+  assert.deepEqual(timeline.spans, []);
+});
+
 test("concurrent CLI processes with one request ID receive one job identity", async (t) => {
   let calls = 0;
   const f = await fixture(t, {

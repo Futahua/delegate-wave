@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { transaction } from "../db.js";
 import { ControlError, asControlError } from "./errors.js";
+import { buildSessionTimeline, listSessionPresentations } from "../presentation/session-timeline.js";
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -78,12 +79,11 @@ export class ControlService {
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       "session.poll": () => this.sessions.poll(args.sessionId),
-      "session.list": () => this.dispatcher.overview().sessions,
-      "session.timeline": () => {
-        const session = this.dispatcher.db.prepare("SELECT job_id FROM autonomous_sessions WHERE id = ?").get(args.sessionId);
-        if (!session?.job_id) throw new ControlError("SESSION_TIMELINE_UNAVAILABLE", `Session ${args.sessionId} has no root job`, 409);
-        return this.dispatcher.status(session.job_id).session_timeline;
-      },
+      "session.list": () => listSessionPresentations(this.db, { limit: args.limit, cursor: args.cursor }),
+      "session.timeline": () => buildSessionTimeline({
+        db: this.db, paths: this.dispatcher.paths, sessionId: args.sessionId,
+        streamSpanId: args.streamSpanId || null, before: args.before || null, streamLimit: args.limit,
+      }),
       attention: () => this.dispatcher.attention(),
       briefing: () => this.dispatcher.briefing(),
     };

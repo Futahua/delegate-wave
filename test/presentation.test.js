@@ -175,8 +175,7 @@ test("job status remains backward compatible and appends deterministic presentat
 
   const first = dispatcher.status(job.id);
   const second = dispatcher.status(job.id);
-  assert.deepEqual(Object.keys(first).sort(), ["attempts", "family", "job", "presentation", "session_timeline", "validations"]);
-  assert.equal(first.session_timeline, null, "direct jobs do not fabricate an autonomous session");
+  assert.deepEqual(Object.keys(first).sort(), ["attempts", "family", "job", "presentation", "validations"]);
   assert.equal(first.presentation.schema, 1);
   assert.equal(first.presentation.phase.id, "ready");
   assert.equal(first.presentation.live_activity.length, 0, "settled attempts do not retain rich tool chatter");

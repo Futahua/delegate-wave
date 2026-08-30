@@ -64,7 +64,7 @@ function titleForTool(tool, input) {
   return target ? `${label} ${target}` : label;
 }
 
-function normalizeEvent(event, attempt, ordinal) {
+export function normalizeEvent(event, attempt, ordinal) {
   if (!event || typeof event !== "object") return null;
   const part = event.part ?? event.data ?? {};
   const type = String(event.type ?? "").toLowerCase();
@@ -197,4 +197,62 @@ export function normalizeOpenCodeActivity({ attempt, filePath, runtimeDatabasePa
     });
   }
   return { activities: activities.slice(-limit), malformed: tail.malformed, truncated: tail.truncated };
+}
+
+// Durable history page. Unlike the live tail above, this contract makes its bound explicit and
+// recoverable: `before` is an exclusive JSONL line cursor and every earlier page can be requested.
+// Reading is intentionally separate from the runtime overlay -- runtime state is current truth and
+// belongs only on the newest page; historical pages come solely from the immutable terminal log.
+export function normalizeOpenCodeActivityPage({
+  attempt, filePath, runtimeDatabasePath, limit = DEFAULT_ACTIVITY_LIMIT, before = null,
+} = {}) {
+  const boundedLimit = Math.max(1, Math.min(500, Number(limit) || DEFAULT_ACTIVITY_LIMIT));
+  let lines = [];
+  if (filePath && fs.existsSync(filePath)) {
+    const raw = fs.readFileSync(filePath, "utf8");
+    lines = raw.split(/\r?\n/);
+    if (lines.at(-1) === "") lines.pop();
+  }
+  const parsedBefore = before === null || before === undefined || before === ""
+    ? lines.length : Number(before);
+  const end = Number.isSafeInteger(parsedBefore) && parsedBefore >= 0
+    ? Math.min(parsedBefore, lines.length) : lines.length;
+  const start = Math.max(0, end - boundedLimit);
+  const events = [];
+  let malformed = 0;
+  for (let index = start; index < end; index += 1) {
+    try { events.push({ event: JSON.parse(lines[index]), ordinal: index }); }
+    catch { malformed += 1; }
+  }
+  const runtime = before === null || before === undefined || before === ""
+    ? readOpenCodeRuntimeParts(runtimeDatabasePath, { limit: boundedLimit }) : { events: [] };
+  const byId = new Map();
+  for (const { event, ordinal } of events) {
+    const item = normalizeEvent(event, attempt, ordinal);
+    if (item) byId.set(item.id, item);
+  }
+  runtime.events.forEach((event, ordinal) => {
+    const item = normalizeEvent(event, attempt, lines.length + ordinal);
+    if (item) byId.set(item.id, item);
+  });
+  const activities = [...byId.values()];
+  if (malformed) activities.push({
+    id: `${attempt.id}:opencode:malformed:${start}:${end}`,
+    occurred_at: attempt.started_at,
+    actor_id: `worker:${attempt.id}`,
+    actor_role: attempt.actor_role ?? "worker",
+    kind: "other",
+    lifecycle: "failed",
+    title: "Some recorded activity could not be decoded",
+    detail: `${malformed} malformed JSONL record${malformed === 1 ? "" : "s"} ignored on this page`,
+    authority: "activity",
+  });
+  return {
+    activities,
+    cursor: start > 0 ? String(start) : null,
+    hasEarlier: start > 0,
+    complete: start === 0,
+    page: { start, end, lineCount: lines.length },
+    malformed,
+  };
 }

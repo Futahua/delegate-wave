@@ -250,7 +250,7 @@ test("a session started from a conversation is watched from birth, and its quest
   assert.equal(started.watched, true);
   const watch = sessions.db.prepare("SELECT * FROM session_watches WHERE session_id = ?").get(started.session_id);
   assert.equal(watch.hermes_session_id, "20260824_233004_5d8271");
-  const indexed = listSessionPresentations(sessions.db).find((item) => item.id === started.session_id);
+  const indexed = listSessionPresentations(sessions.db).sessions.find((item) => item.id === started.session_id);
   assert.equal(indexed.origin_hermes_session_id, "20260824_233004_5d8271");
   assert.equal(indexed.intent, "Add a --json flag");
   // Nothing to say yet: the session is working, which is the ordinary case and costs nothing.
