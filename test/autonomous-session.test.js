@@ -1226,3 +1226,36 @@ test("a clarification cannot rebase a session onto another world", async (t) => 
   assert.equal(clarifications.length, 1);
   assert.match(clarifications[0].answer, /export\/layer/);
 });
+
+test("a session binds to a branch name, not to anything that merely resolves to a commit", async (t) => {
+  const { boot, projectId, repo } = await world(t);
+  const { dispatcher, sessions } = boot([]);
+  const head = (await runProcess("git", ["-C", repo, "rev-parse", "HEAD"])).stdout.trim();
+  await runProcess("git", ["-C", repo, "branch", "codex/live/work-ui"]);
+  await runProcess("git", ["-C", repo, "tag", "v1"]);
+
+  // A nested branch name is ordinary and must work: the check is "is this a local branch", not
+  // "does it look simple".
+  const bound = await sessions.start({
+    projectId, intent: "work on the nested branch", mode: "MANUAL", branch: "codex/live/work-ui",
+  });
+  assert.equal(bound.target_branch, "codex/live/work-ui");
+  assert.equal(bound.base_sha, head);
+
+  // Everything below resolves to a real commit under `git rev-parse`, which is exactly why the
+  // creation-time check has to be stricter than that. Each would later be republished as
+  // refs/heads/<value>, naming a branch that does not exist at the moment a ref actually moves.
+  const before = dispatcher.db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count;
+  for (const rejected of [head, "v1", "refs/heads/codex/live/work-ui"]) {
+    await assert.rejects(
+      sessions.start({ projectId, intent: `bind to ${rejected}`, branch: rejected }),
+      /is not a local branch/,
+      `${rejected} must not bind`,
+    );
+  }
+  // Refused before anything durable: no extra job, and no session left behind for any of them.
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count, before);
+  assert.equal(
+    dispatcher.db.prepare("SELECT COUNT(*) AS count FROM autonomous_sessions").get().count, 1,
+  );
+});

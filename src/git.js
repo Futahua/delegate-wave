@@ -19,6 +19,28 @@ export async function resolveRevision(repoPath, revision) {
   return git(repoPath, ["rev-parse", "--verify", `${revision}^{commit}`]);
 }
 
+// A LOCAL BRANCH, resolved as one. Not a revision that happens to name a commit.
+//
+// resolveRevision() accepts anything rev-parse accepts: a tag, a bare SHA, an explicit ref. That is
+// correct for "which commit is this", and wrong for "which branch is this job bound to", because
+// publication later builds `refs/heads/${target_branch}` and compare-and-swaps it. A job bound to a
+// tag or a SHA resolves cleanly at creation and then names a branch that never existed at the only
+// moment that matters -- the one where a real ref moves.
+//
+// Anchoring the lookup at refs/heads/ is what makes the check exact: a SHA, a tag, and an already
+// qualified `refs/heads/...` all fail to exist under it, so each is refused at creation rather than
+// discovered at publication.
+export async function resolveBranchHead(repoPath, branch) {
+  try {
+    return await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+  } catch {
+    throw new Error(
+      `${branch} is not a local branch in ${repoPath}; a job binds to a branch name `
+      + `(a tag, a commit sha, or a refs/heads/ prefixed ref cannot be published to)`,
+    );
+  }
+}
+
 export async function createDetachedWorktree(repoPath, targetPath, baseSha) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   if (fs.existsSync(targetPath)) throw new Error(`Worktree path already exists: ${targetPath}`);

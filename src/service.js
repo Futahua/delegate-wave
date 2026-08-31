@@ -15,6 +15,7 @@ import {
   listWorktrees,
   lockWorktree,
   removeWorktree,
+  resolveBranchHead,
   resolveRevision,
   updateRefCas,
 } from "./git.js";
@@ -262,9 +263,12 @@ export class Dispatcher {
     // The project default applies at ROOT CREATION ONLY. A child inherits whatever its root was
     // bound to; a root given no branch adopts the default once, and permanently.
     const boundBranch = parent ? parent.target_branch : (targetBranch || project.integration_branch);
+    // Resolved as a BRANCH, not as a revision. What is recorded here is republished later as
+    // `refs/heads/${target_branch}`, so anything that is not a local branch name -- a tag, a bare
+    // sha, an already qualified ref -- must be refused now rather than at the compare-and-swap.
     const baseSha = parent
       ? parent.base_sha
-      : await resolveRevision(project.repo_path, boundBranch);
+      : await resolveBranchHead(project.repo_path, boundBranch);
     if (!parent && expectedBaseSha !== null && expectedBaseSha !== baseSha) {
       throw new Error(
         `Branch ${boundBranch} is at ${baseSha} but expected_base_sha requires ${expectedBaseSha}`,
