@@ -2,6 +2,9 @@
 
 Updated: 2026-08-15
 
+> Current checkpointed work is tracked in `docs/DEVELOPMENT-PLAN.md`. That plan
+> supersedes the older statement below that future work is intentionally unplanned.
+
 ## What this is now
 
 A working personal daily driver, not a bootstrap. The V1 acceptance sentence holds end to end on the
