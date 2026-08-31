@@ -191,3 +191,104 @@ but has not yet moved a real ref under a real session.
 - **`npm ci` warns that esbuild's postinstall is not covered by allowScripts.** The build
   succeeds regardless in this environment. If a future worktree fails for a missing
   esbuild binary, that is the cause.
+
+## Post-recovery publication and deployment
+
+Everything above describes what was known at `85e4b0d`, where publication was still
+listed as unproven. It is left unchanged. This section records what happened after.
+
+The accepted MANUAL candidate was published through the proposal/approval integration
+path -- the only path available to a MANUAL session, since `SafeIntegrator` runs solely
+under `modePolicy(session.mode).mayPublish`.
+
+    proposal_83a61344-7750-4f39-a280-b1a4e4045ef1
+      integration_branch         codex/live-work-ui
+      expected_integration_head  3cf40bafeca8...
+      candidate_commit           c667a4eb5f5a...
+      validation plan            npm ci | npm run build
+                                 git diff --exit-code -- public | npm test
+
+The branch named on that proposal is the job's bound branch, not the project's
+registered `integration_branch`, which is still `main`.
+
+### The first attempt was refused, and the refusal is evidence
+
+    integration run -> COMMAND_FAILED
+      Integration branch codex/live-work-ui is checked out in another worktree
+    ref unchanged | approval consumed
+
+This is worth recording rather than treating as friction. The guard reads
+`proposal.integration_branch`, so it examined `codex/live-work-ui` -- the branch the work
+was actually based on -- found it checked out in the Papers-bound tree, and stopped.
+
+Before the binding fix the proposal would have named `main`. `main` is not checked out,
+so the same guard would have passed and the candidate would have been published there.
+The old code does not fail at this point; it succeeds at the wrong thing. A refusal here
+is the binding being load-bearing in a place nobody designed as a branch check.
+
+### Integration
+
+The Papers-bound checkout was temporarily detached at the same commit (no file changes,
+tree clean), a fresh approval granted, and the integration re-run.
+
+    WORKTREE_CREATED           integration/.../proposal_83a61344...
+    CANDIDATE_CHERRY_PICKED    06e1c94fbcd2...
+    VALIDATION_RUN             npm ci                          => 0
+    VALIDATION_RUN             npm run build                   => 0
+    VALIDATION_RUN             git diff --exit-code -- public  => 0
+    VALIDATION_RUN             npm test                        => 0
+    VALIDATION_PASSED          4
+    BRANCH_ADVANCE_INTENDED    refs/heads/codex/live-work-ui
+                               3cf40bafeca8... -> 06e1c94fbcd2...
+    BRANCH_ADVANCED            06e1c94fbcd2...
+    INTEGRATION_SUCCEEDED / PROPOSAL_INTEGRATED
+
+    refs/heads/codex/live-work-ui   3cf40bafeca8... -> 06e1c94fbcd2...
+    refs/heads/main                 f48b8346fa29... unchanged
+    rollbacks for this proposal     0
+
+Those four commands ran against the *integrated* tree, not merely the candidate. The
+checkout was then reattached to the branch at the new head, clean.
+
+`integration_proposals.state` still reads `OPEN` on the row. That is by design, not a
+stale write: state is derived from the immutable records ledger, and the stored column is
+only a fallback. Note also that an integration run consumes its approval even when it is
+refused, so the retry needed a second grant.
+
+### Deployment
+
+    d9a1d41234e057dd3ef24aad734f745c2a71f8b1
+      generated public/ only, from `npm run build:public` at 06e1c94
+      R public/assets/index-BwYLEx6P.js -> index-Byh2zyrj.js
+      R public/assets/index-Do3Y5_NX.css -> index-D_czpyF7.css
+      M public/index.html
+      nothing outside public/
+
+    remote codex/live-work-ui = d9a1d41234e0...
+
+Only the two entry chunks moved; the roughly 300 content-hashed grammar chunks kept their
+hashes. The shipped stylesheet contains the `validator-receipt` rules, so the change is in
+the surface Papers serves rather than merely committed. An already-open Backpack frame
+still holds the previous bundle until it is re-entered.
+
+### What this does and does not add
+
+Proven live: the MANUAL proposal/approval publication path honours the job's immutable
+branch through a real compare-and-swap ref mutation. The selected branch survived from
+`session_start` through exploration, implementation, validation, review and publication
+without the project default reasserting itself anywhere.
+
+Still not proven live: `SafeIntegrator.prepare()`. It is used by `mayPublish`/AUTO
+sessions and remains test-covered only. The remaining exercise is an AUTO session in a
+disposable repository with a trivial deterministic change, asserting that
+`SafeIntegrator` stages against the bound branch at the bound head, that the CAS moves
+`refs/heads/<bound branch>`, and that `project.integration_branch` does not move. That is
+separate hardening, not a gap in this incident: the failure actually experienced --
+requested `codex/live-work-ui`, rooted and published against `main` -- is demonstrated
+fixed through a real publication path.
+
+Three follow-ups on the shipped UI change, recorded here and deliberately not mixed into
+this incident: the faded receipt needs a real visual contrast check; a multi-command
+validation span is represented by only its last command, which is truthful but
+incomplete; and the header renders `Validation` beside a role chip already reading
+`validator`.
