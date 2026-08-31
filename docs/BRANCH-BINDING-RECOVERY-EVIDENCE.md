@@ -1,0 +1,193 @@
+# Branch binding and validator contract — recovery run evidence — 2026-08-31
+
+Evidence for two correctness fixes and the real task that exercised them end to end.
+Every number below was read back from the operational database or from Git after the
+fact, not from a tool's own report of itself.
+
+## What was wrong
+
+Two independent defects, found by one failed session.
+
+**1. Autonomous sessions could not say which branch they were for.** `session_start`
+carried no ref. `AutonomousSessionService.start()` called `createJob()`, and a root
+`createJob()` always resolved `project.integration_branch`. A session asked for
+`codex/live-work-ui` was rooted on `main`, and `session_answer` could only record
+clarification prose — it could not move `jobs.base_sha`. The session then spent money
+and produced apparently valid evidence against a world nobody had selected.
+
+The original session is preserved as a witness, and it states the defect in one row:
+
+    job_288d515c-0dfa-4abb-9a5c-184796c6b881
+      goal text  "... branch codex/live-work-ui, starting head f0839192847..."
+      base_sha   f48b8346fa290fb27e526de1d02e08a2ef5f2001   (main)
+      state      NEEDS_ATTENTION / session WAITING_FOR_HERMES
+
+**2. The Backpack's validation contract contradicted itself.** The registered plan ran
+`npm run build`, which was `tsc --noEmit && vite build` with `outDir: 'public'` and
+`emptyOutDir: true`, and then asserted `git diff --exit-code -- public`. The build
+regenerated the tracked runtime assets and the next command condemned it for doing
+exactly what it is configured to do. Any UI source change failed validation on
+principle. That is what the original session failed on, three times.
+
+## What changed
+
+    delegate-wave           d0239b6  bind autonomous sessions to an immutable branch and base
+    delegate-wave           ea5bbff  bind a root job to a local branch, not any resolvable revision
+    delegate-wave-backpack  3cf40ba  separate bundle verification from public/ deployment
+
+`d0239b6` adds structured `branch` / `expected_base_sha` to `session_start`, records
+`jobs.target_branch`, makes children inherit branch and base, and routes every
+branch-sensitive read through the job's binding rather than the project default —
+including `SafeIntegrator.prepare()`, which still resolved `project.integration_branch`
+and would have published a correctly bound session's work onto the wrong branch. The
+column is backfilled explicitly by `migrate()` (schema 37); no read site has a fallback.
+
+`ea5bbff` closes a narrower hole: `resolveRevision()` accepts anything `rev-parse`
+accepts, so a tag or bare sha could bind and later be republished as
+`refs/heads/<sha>`. Root binding now resolves under `refs/heads/` specifically.
+
+`3cf40ba` redefines what `npm run build` means rather than adding a new script name,
+so the already-registered validation plan becomes coherent without a control-plane
+change — there is no supported `project.update` for a stored command list.
+
+    build         typecheck + production bundle into an ignored .verify-dist/
+    build:public  regenerate the Papers-served public/
+
+`public/` is generated build output that is also the live runtime surface: Papers serves
+that subtree directly and rereads it on entry. So verification and deployment cannot be
+the same command.
+
+## Deployment evidence
+
+    supervisor      stopped and started via the supported commands
+                    old PID 51892 (17:53:11, pre-fix code)
+                    new PID 33564 (21:11:50, ea5bbff)
+    doctor          healthy, integrity ok, no running attempts,
+                    no missing repositories, no unresolved integrations
+    schema_version  36 -> 37
+    backup          backups/2026-08-31T14-11-39-219Z-pre-schema-37-branch-binding
+                    taken at schema 36 before the migration
+
+Migration backfilled 257 historical jobs with zero NULLs remaining, using each job's own
+project's registered branch rather than a blanket value:
+
+    main 154 | integration 61 | workspace 34 | agent/fencing-canary 5
+    ab/deepseek 2 | ab/luna 1
+
+The witness job took `target_branch = main` and kept `base_sha = f48b8346...`
+unchanged. The migration recorded history rather than rewriting it.
+
+Both Hermes stacks were restarted so the MCP children would reload. The desktop app was
+closed through its main window, not killed. Four stale MCP children (18672, 15948,
+23948, 41840, all spawned before the fix) were replaced by 24284 and 32244 at 21:30.
+The live `session_start` schema exposes `branch` and `expected_base_sha`.
+
+The Papers-bound Backpack checkout was fast-forwarded `f083919 -> 3cf40ba`. Its
+`public` tree object hash was `d1edf39aa1a6d33f91148bfad7742cc9aa769617` before and
+after, so the served surface is byte-identical and `build:public` was not run.
+
+## The recovery run
+
+The same task that failed before, on a correctly bound session.
+
+    session   asess_cf49f553-2fd1-48f4-982e-ee25abb5cfa4   MANUAL
+    root      job_a39196f0-231f-46a0-8abe-bf530a182f8d
+    project   delegate-wave-backpack-b2f046
+    bound to  codex/live-work-ui @ 3cf40bafeca8035875ce6bf7a22441633faab137
+    manager   gpt-5.6-luna | workers opencode-go/deepseek-v4-flash
+    window    14:59:58Z -> 15:13:17Z
+    cost      0.073213 reference USD across 5 usage receipts
+
+Manager turns:
+
+    1  PLAN       COMPLETED  EXPLORE
+    2  SYNTHESIS  COMPLETED  IMPLEMENT
+    3  REVIEW     COMPLETED  REVISE   subject .1
+    4  REVIEW     COMPLETED  ACCEPT   subject .2
+
+    ACCEPTED | explore 1/3 | revision 1/2 | no escalation | no stop code
+
+Exploration children, all inheriting branch and base, all read-only:
+
+    job_1f0dcd6c...  attempt ...70ceaefc83cd.1  SUCCEEDED  PASSED  0 files
+    job_f4f2260a...  attempt ...8ebaef621128.1  SUCCEEDED  PASSED  0 files
+    job_e87a5060...  attempt ...eeec88a69763.1  SUCCEEDED  PASSED  0 files
+
+Implementation attempts, both exactly in scope:
+
+    .1  2193545949abfc954f9af148dc4eb501baed84fa  start 3cf40baf...
+    .2  c667a4eb5f5a64255c5ac8554c3a3efbb5da7dfa  start 2193545949ab...  ACCEPTED
+
+    src/timeline/SessionTimeline.tsx
+    src/ui/styles.css
+    test/session-timeline.behavior.test.tsx
+
+Validation, both attempts, every command:
+
+    npm ci                            exit=0  PASSED
+    npm run build                     exit=0  PASSED   -> .verify-dist/
+    git diff --exit-code -- public    exit=0  PASSED
+    npm test                          exit=0  PASSED
+
+The third line is the point. It is the exact command that failed the original session
+three times, and it now passes twice on the same real task.
+
+Final state and publication:
+
+    session                SEMANTICALLY_ACCEPTED
+    root                   READY_FOR_INTEGRATION
+    integration_proposals  0
+    staged_integrations    0
+    branch head            3cf40baf...  unmoved
+    candidate vs base      3 files, +49 -6, public/ diff empty
+    wake_e9c7cf6d...       reason=READY  state=DELIVERED  attempts=1  no error
+
+The wake delivered on the first attempt while the dashboard reported
+`Gateway Status: Stopped`, confirming that routed delivery uses the durable
+external-turn inbox rather than that gateway.
+
+## What this does and does not prove
+
+Proven: a session binds to a requested branch, children inherit it, worker worktrees are
+cut from it, and the corrected validator contract lets a real UI source change pass.
+The three exploration children are the first meaningful runtime boundary the old code
+would have crossed wrongly, and they crossed it correctly.
+
+Not proven: publication. No integration proposal or staged integration exists, the
+branch head has not moved, and `SafeIntegrator`'s bound-branch fix is covered by tests
+but has not yet moved a real ref under a real session.
+
+## Not done, deliberately
+
+- The candidate `c667a4eb...` is unpushed. It exists as a commit object; the branch head
+  is unchanged. Integration is a separate decision.
+- `npm run build:public` has not been run. It belongs after an accepted integration, as
+  its own deployment commit, because the bundle is content-hashed and a rebuild rewrites
+  hundreds of asset filenames.
+- The original session is untouched: still `WAITING_FOR_HERMES`, still `main @ f48b8346`.
+  It was not answered, failed, resumed or cancelled at any point.
+
+## Honest limitations
+
+- **No CI.** Neither repository has status checks. Every test result here is local
+  evidence produced on this machine, not independently reproduced.
+- **Two pre-existing test failures** in delegate-wave, unrelated to this work and
+  reproducible at `f78808a` with the changes stashed: `hermes-external-turns` "fails
+  closed for an incompatible Hermes interpreter" and `wake` "an ENQUEUED wake fences a
+  later pending wake". The suite is otherwise 719 passing.
+- **`JOBS_COLUMNS` still declares `target_branch TEXT`, not `TEXT NOT NULL`.** The
+  invariant is enforced at `insertJobRow()` and the migration proves no NULL remains.
+  Aligning storage with it needs a table rebuild, deferred deliberately.
+- **The clarification guard is heuristic and partial by design.** It catches a 40-hex sha
+  that is not the bound base, and path-shaped branch names the repository does not
+  contain. A bare one-word name like `main` is not detected. The real safety is the
+  immutable binding, and the fact that `session_start` and `session_answer` both return
+  it.
+- **The intent file handed to Hermes was initially corrupted by me** — extracted through
+  a cp1252 stdin, which mangled em-dashes and middle dots. Hermes detected it and
+  refused to proceed. The run was interrupted before `session_start`, the file was
+  regenerated from the database as pure ASCII, and nothing reached Delegate Wave in a
+  corrupted state. No cost was incurred by that error.
+- **`npm ci` warns that esbuild's postinstall is not covered by allowScripts.** The build
+  succeeds regardless in this environment. If a future worktree fails for a missing
+  esbuild binary, that is the cause.
