@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { ControlClient } from "./control/client.js";
+import { parseProjectAddArgs } from "./cli/project-add.js";
 
 function parseArgs(argv) {
   const positional = [];
@@ -70,6 +71,7 @@ Commands:
   mcp                         read-only Hermes MCP server over stdio
   init
   project add --name NAME --path REPO [--branch BRANCH] [--validate CMD]... [--protect PATH]...
+              quote each whole command: --validate "npm test" --validate "npm run build"
   project list
   job create --project ID --goal TEXT [--mode read|write] [--max-attempts 2]
                               [--capability-profile restricted] narrow the worker for this job
@@ -106,8 +108,11 @@ async function serve() {
 }
 
 async function main() {
-  const { positional, options } = parseArgs(process.argv.slice(2));
+  let { positional, options } = parseArgs(process.argv.slice(2));
   if (!positional[0] || options.help) { help(); return; }
+  if (positional[0] === "project" && positional[1] === "add") {
+    options = parseProjectAddArgs(process.argv.slice(2));
+  }
   if (positional[0] === "serve") { await serve(); return; }
 
   // Drives a managed job with the real Codex manager.

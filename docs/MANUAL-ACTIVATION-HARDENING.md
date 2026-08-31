@@ -138,7 +138,11 @@ Hermes-interpreter compatibility and ENQUEUED-wake fencing tests. Syntax and
 whitespace checks passed. These are local results, not CI checks. No installation,
 runtime reload, incident cleanup, or demonstration was performed.
 
-## Deliberately unchanged
+## Deliberately unchanged during session-control hardening
+
+The later authorized CLI parsing pass is documented in
+[CLI-VALIDATION-PARSING.md](CLI-VALIDATION-PARSING.md); it supersedes the CLI
+deferral below, without changing session-control behavior.
 
 - The pre-existing local `src/cli.js` modification is not part of this commit.
   Its SHA-256 before and after is
