@@ -74,6 +74,19 @@ async function fixture(t, overrides = {}, root = null) {
   };
 }
 
+test("wave organization is operator-only and request-idempotent over HTTP", async (t) => {
+  const f = await fixture(t);
+  for (const token of [f.observerToken, f.proposerToken]) {
+    const denied = new ControlClient({ baseUrl:f.url, token });
+    await assert.rejects(denied.post('/v1/wave-organization',{action:'group.create',name:'Work'},requestId()), /scope|forbidden/i);
+  }
+  const id=requestId(), body={action:'group.create',name:'Work'};
+  const result=await f.client.post('/v1/wave-organization',body,id);
+  assert.deepEqual(await f.client.post('/v1/wave-organization',body,id),result);
+  assert.equal(f.dispatcher.db.prepare('SELECT COUNT(*) n FROM wave_groups').get().n,1);
+  assert.equal(f.dispatcher.db.prepare('SELECT COUNT(*) n FROM control_request_results WHERE request_id=?').get(id).n,1);
+});
+
 test("operator session.fail is identity-bound and request-idempotent over HTTP", async (t) => {
   const f = await fixture(t);
   const calls = [];

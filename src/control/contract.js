@@ -27,6 +27,8 @@ export const PRINCIPAL_SCOPES = Object.freeze({
 });
 
 export const ROUTES = Object.freeze([
+  { method: "GET", pattern: /^\/v1\/wave-organization$/, command: "organization.get", scope: SCOPES.READ },
+  { method: "POST", pattern: /^\/v1\/wave-organization$/, command: "organization.change", mutation: true, scope: SCOPES.OPERATE },
   { method: "GET", pattern: /^\/v1\/health$/, command: "health", scope: SCOPES.READ },
   // One capability, three operations -- not three permission checkpoints. Starting is where the
   // authority is exercised; polling and answering continue a session that was already permitted.

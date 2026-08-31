@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { readOrganization, changeOrganization } from '../session/organization.js';
 import { transaction } from "../db.js";
 import { ControlError, asControlError } from "./errors.js";
 import { SCOPES } from "./contract.js";
@@ -7,6 +8,7 @@ import { buildSessionTimeline, listSessionPresentations } from "../presentation/
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const MUTATION_COMMANDS = new Set([
+  "organization.change",
   "project.create", "job.create", "job.run", "integration.propose",
   "approval.grant", "integration.run", "reconcile",
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
@@ -69,6 +71,7 @@ export class ControlService {
 
   async query(command, args = {}) {
     const handlers = {
+      "organization.get": () => readOrganization(this.db),
       health: () => ({ ok: true, doctor: this.dispatcher.doctor() }),
       overview: () => this.dispatcher.overview(),
       "project.list": () => this.dispatcher.listProjects(),
@@ -233,6 +236,7 @@ export class ControlService {
 
   async executeMutation(command, args, context) {
     const handlers = {
+      "organization.change": () => changeOrganization(this.db, args),
       "project.create": () => this.dispatcher.addProject(args),
       "job.create": () => this.dispatcher.createJob(args),
       "job.run": () => this.dispatcher.runJob(args.jobId, { model: args.model || null }),

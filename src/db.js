@@ -30,7 +30,8 @@ import { managedPaths } from "./paths.js";
 //     remain explicit recovery history rather than being reinterpreted as inbox events.
 // 36: receiver_protocol distinguishes pre-metadata routed wakes from newly created typed wakes, so
 //     an in-flight schema-35 handoff remains adoptable across upgrade without weakening new events.
-export const SCHEMA_VERSION = "37";
+// 38: local wave names, grouping, reversible archive and organizer deletion tombstones.
+export const SCHEMA_VERSION = "38";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -311,6 +312,13 @@ const WORK_PROPOSALS_COLUMNS = `
 `;
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS wave_groups (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wave_organization (
+  session_id TEXT PRIMARY KEY REFERENCES autonomous_sessions(id),
+  name TEXT, group_id TEXT, archived_at TEXT, deleted_at TEXT
+);
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
