@@ -91,3 +91,29 @@ window does not establish that this dashboard interpreter restarted.
 No further close/kill was attempted following the earlier desktop safety
 refusal. A safe dashboard restart remains necessary; unsent input and any
 active conversation should be saved/settled first. No demo launched.
+
+### Dashboard restart safety check
+
+After explicit approval to restart only the Papers-owned dashboard, subject
+to no active Hermes turn, inspection found the visible composer empty (no
+unsent input to save). The UI still showed the old demo as working. The HTTP
+history list's `is_active: false` was not used as proof of runtime idleness.
+
+A read-only authenticated WebSocket `session.active_list` call to the actual
+dashboard at port 9119 returned:
+
+- runtime session `05b6318c`, durable `20260830_160645_168615`: idle;
+- runtime session `5db80d40`, durable `20260831_105217_d7f17f`, title
+  `Create and run Delegate Wave demo`: working.
+
+The live-list implementation derives working from the session's in-memory
+`running` flag. This does not prove provider activity, but it prevents claiming
+the requested idle precondition is satisfied. No interrupt, process kill,
+restart, or wake resubmission was performed. Graceful interruption of that
+specific old turn needs authorization before verifying idle and restarting.
+
+Dashboard tree remains 29944 -> 45720 -> 44660, with obsolete MCP children
+40304 and 8352. Delegate Wave supervisor PID 9872 and its bridge were left
+untouched. Doctor remained healthy. Historical wake
+`wake_931c6517-422f-496e-b036-dac9df4236b2` was still ENQUEUED / receiver PENDING,
+one attempt, no error. No demonstration was launched.
