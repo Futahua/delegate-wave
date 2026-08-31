@@ -306,6 +306,31 @@ export class AutonomousSessionService {
       return this.poll(sessionId);
     }
 
+    // Cancellation can settle the root/manager before a process dies, leaving the session's
+    // cached lifecycle WORKING. Rediscovery must reconcile it, not buy another manager turn.
+    // The session vocabulary has no CANCELLED state: retain that cause in the outcome and a
+    // distinct receipt (never the receipt authorizing a typed session_fail replay).
+    if (session.state === "WORKING") {
+      const root = this.dispatcher.getJob(session.job_id);
+      const run = this.manager.getRun(session.job_id);
+      if (root?.status === "CANCELLED" || run?.status === "CANCELLED") {
+        const busy = this.dispatcher.familyJobIds(session.job_id).some((jobId) =>
+          this.dispatcher.liveAttemptFor(jobId) || this.dispatcher.openCommission(jobId));
+        // Do not advertise a terminal session while cancellation is still tearing down work.
+        if (busy) return this.poll(sessionId);
+        transaction(this.db, () => {
+          this.setState(sessionId, {
+            state: "FAILED", outcome: "CANCELLED: authoritative root job or manager run was cancelled",
+          });
+          recordEvent(this.db, {
+            kind: "AUTONOMOUS_SESSION_CANCELLED_RECONCILED", entityType: "job", entityId: session.job_id,
+            payload: { sessionId, rootStatus: root?.status ?? null, managerStatus: run?.status ?? null },
+          });
+        });
+        return this.poll(sessionId);
+      }
+    }
+
     // SEMANTICALLY_ACCEPTED is terminal for a session that may not publish, and unfinished for one
     // that may.
     //

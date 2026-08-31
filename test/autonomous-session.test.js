@@ -101,6 +101,75 @@ async function world(t) {
   return { boot, projectId: project.id, repo, root };
 }
 
+test("restart driver reconciles WORKING sessions over cancelled work without buying another turn", async (t) => {
+  const { boot, projectId } = await world(t);
+  const first = boot([]);
+  const started = await first.sessions.start({ projectId, intent: "cancel before execution", mode: "AUTO" });
+  await first.dispatcher.cancelJob({ jobId: started.job_id, principal: "operator", origin: "test" });
+  await first.manager.advance(started.job_id);
+  assert.equal(first.dispatcher.getJob(started.job_id).status, "CANCELLED");
+  assert.equal(first.manager.getRun(started.job_id).status, "CANCELLED");
+  assert.equal(first.sessions.get(started.session_id).state, "WORKING");
+  const historical = (db) => ["jobs", "attempts", "manager_runs", "manager_turns", "cancellation_intents", "cancellation_results"]
+    .map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+  const before = historical(first.dispatcher.db);
+  first.dispatcher.close();
+
+  const restarted = boot([]);
+  let advances = 0;
+  const advance = restarted.manager.advance.bind(restarted.manager);
+  restarted.manager.advance = async (...args) => { advances++; return advance(...args); };
+  const driver = new SessionDriver({ sessions: restarted.sessions });
+  t.after(() => driver.stop());
+  assert.deepEqual(driver.pending().map((s) => s.id), [started.session_id]);
+  assert.equal(await driver.drain({ maxPasses: 3 }), true);
+  assert.equal(restarted.sessions.get(started.session_id).state, "FAILED");
+  assert.match(restarted.sessions.get(started.session_id).outcome, /CANCELLED/);
+  assert.deepEqual(driver.pending(), []);
+  assert.equal(advances, 0, "cancelled work must not reach the manager");
+  assert.deepEqual(historical(restarted.dispatcher.db), before, "preserve authoritative job and attempt history");
+  const events = () => restarted.dispatcher.db.prepare("SELECT * FROM events ORDER BY rowid").all();
+  const after = events();
+  assert.equal(after.filter((e) => e.kind === "AUTONOMOUS_SESSION_CANCELLED_RECONCILED").length, 1);
+  await restarted.sessions.tick(started.session_id);
+  await driver.drain({ maxPasses: 3 });
+  assert.deepEqual(events(), after, "repeated ticks do not emit duplicate receipts");
+  await assert.rejects(restarted.sessions.fail(started.session_id, "not a typed-fail replay",
+    { principal: "operator", origin: "test" }), /WAITING_FOR_HERMES/);
+});
+
+test("cancelled root or manager alone blocks advancement and waits for family teardown", async (t) => {
+  const { boot, projectId } = await world(t);
+  for (const cancelled of ["root", "manager"]) {
+    const w = boot([]);
+    const started = await w.sessions.start({ projectId, intent: `cancel ${cancelled}`, mode: "AUTO" });
+    if (cancelled === "root") {
+      await w.dispatcher.cancelJob({ jobId: started.job_id, principal: "operator", origin: "test" });
+    } else {
+      w.manager.setRun(w.manager.getRun(started.job_id).id, { status: "CANCELLED" });
+    }
+    let advanced = false;
+    w.manager.advance = async () => { advanced = true; };
+    const child = await w.dispatcher.createJob({ projectId, goal: "child teardown", mode: "read",
+      parentJobId: started.job_id, internalKind: "MANAGER_EXPLORATION" });
+    const originalLive = w.dispatcher.liveAttemptFor.bind(w.dispatcher);
+    const originalCommission = w.dispatcher.openCommission.bind(w.dispatcher);
+    for (const blocker of ["attempt", "commission"]) {
+      w.dispatcher.liveAttemptFor = (id) => id === child.id && blocker === "attempt" ? { id: "teardown" } : originalLive(id);
+      w.dispatcher.openCommission = (id) => id === child.id && blocker === "commission" ? { id: "teardown" } : originalCommission(id);
+      await w.sessions.tick(started.session_id);
+      assert.equal(w.sessions.get(started.session_id).state, "WORKING", "teardown is not yet terminal");
+      assert.equal(advanced, false);
+    }
+    w.dispatcher.liveAttemptFor = originalLive;
+    w.dispatcher.openCommission = originalCommission;
+    await w.dispatcher.cancelJob({ jobId: child.id, principal: "operator", origin: "test" });
+    await w.sessions.tick(started.session_id);
+    assert.equal(w.sessions.get(started.session_id).state, "FAILED");
+    assert.equal(advanced, false);
+  }
+});
+
 test("real MCP control path binds answer/fail to owner and retries lost fail results safely", async (t) => {
   const { boot, projectId } = await world(t);
   const { dispatcher, sessions } = boot(Array.from({ length: 3 }, () => ({
