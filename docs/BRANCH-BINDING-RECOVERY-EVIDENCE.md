@@ -292,3 +292,80 @@ this incident: the faded receipt needs a real visual contrast check; a multi-com
 validation span is represented by only its last command, which is truthful but
 incomplete; and the header renders `Validation` beside a role chip already reading
 `validator`.
+
+## Final hardening: SafeIntegrator under AUTO
+
+The section above closed the incident while recording one remaining gap:
+`SafeIntegrator.prepare()` was test-covered but had never moved a real ref, because it
+runs only under `mayPublish` -- AUTO, ACCEPT_EDITS, BYPASS -- and the recovery run was
+MANUAL. That gap is now closed, in a disposable repository rather than the live Backpack.
+
+### The fixture, built so a wrong answer would be visible
+
+    D:/Programs/evTEMP/dw-auto-safeintegrator-test
+
+    refs/heads/main                4804b743b713...   registered integration_branch
+    refs/heads/release/auto-proof  9eff452984365...  the branch the session binds to
+    checked out                    main   (so the target branch is free to move)
+    validation                     node --check app.js
+
+`release/auto-proof` was cut first and `main` was then advanced by one commit adding
+`drift.txt`. The two branches genuinely diverge, so anything resolving the project
+default instead of the binding would root at `4804b743` and carry `drift.txt` into the
+result. That is the discriminator; without it a wrong branch and a right branch would
+look identical.
+
+### The run
+
+    session   asess_5ee6ce1a-1b1e-4fd1-8b6c-7b5d7aa51782   AUTO
+    root      job_f712e35f-ca5e-449e-99d3-9211f4a08ab3
+    bound to  release/auto-proof @ 9eff4529843650339698f8a983836b429f93b022
+
+    1  PLAN       COMPLETED  EXPLORE
+    2  SYNTHESIS  COMPLETED  IMPLEMENT
+    3  REVIEW     COMPLETED  ACCEPT
+
+    exploration child   inherited release/auto-proof @ 9eff4529, 0 files
+    implementation      fae3e6afd882..., changed app.js only
+    validation          node --check app.js => exit 0  PASSED
+
+### The publication
+
+    staged_integrations
+      target_ref            release/auto-proof     <- bound branch, not the default
+      observed_target_sha   9eff4529...            <- equals the bound base
+      candidate_commit      fae3e6afd882...
+      published_from_sha    9eff4529...            <- CAS moved from the head it observed
+      publish_state         PUBLISHED, attempt 1, no retry
+
+    refs/heads/release/auto-proof   9eff4529... -> fae3e6afd882...
+    refs/heads/main                 4804b743... unchanged
+    project.integration_branch      main          unchanged
+
+    integration_proposals for this job: 0
+
+That last line matters: zero proposals means this went through `SafeIntegrator`, not the
+proposal/approval path proven earlier. Two different publication routes, both now
+exercised against real refs.
+
+The discriminator held. `drift.txt` is not reachable from the integrated commit, and the
+landed content is exactly the requested one-line change on top of the bound base:
+
+    export const NAME = "auto-proof";
+    export const VERSION = "2";
+
+### Status
+
+Every publication site named in this document is now runtime-proven rather than partly
+test-proven:
+
+    session binding                  proven live
+    child inheritance                proven live
+    proposal/approval publication    proven live   06e1c94 on codex/live-work-ui
+    SafeIntegrator AUTO publication  proven live   fae3e6a on release/auto-proof
+
+Two limits on this particular run, recorded rather than glossed: the session was started
+through the control API as operator, so it carried no `hermes_session_id` and was
+unwatched -- no wake path was exercised here, that having been proven separately -- and
+the fixture is a disposable repository, so nothing about it exercises Papers or the live
+Backpack.
