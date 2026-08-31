@@ -24,6 +24,10 @@ import { SessionDriver } from "../src/session/driver.js";
 import { SessionWatcher } from "../src/session/watcher.js";
 import { runProcess } from "../src/process.js";
 import { buildSessionTimeline, listSessionPresentations } from "../src/presentation/session-timeline.js";
+import { HermesMcpAdapter } from "../src/mcp/server.js";
+import { ControlClient } from "../src/control/client.js";
+import { ControlService } from "../src/control/service.js";
+import { createControlServer } from "../src/control/server.js";
 
 const BRIEF = (extra = {}) => ({
   diagnosis: "the export layer is missing a flag",
@@ -96,6 +100,91 @@ async function world(t) {
   open.delete(first.dispatcher);
   return { boot, projectId: project.id, repo, root };
 }
+
+test("real MCP control path binds answer/fail to owner and retries lost fail results safely", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, sessions } = boot(Array.from({ length: 3 }, () => ({
+    action: "ESCALATE", reason: "blocked", question: "Proceed?",
+  })));
+  const server = createControlServer({ service: new ControlService({ dispatcher, sessions }),
+    token: "test-operator", principalId: "operator", proposerToken: "test-hermes" });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    const closed = new Promise((resolve) => server.close(resolve));
+    server.closeAllConnections(); await closed;
+  });
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const client = new ControlClient({ baseUrl, token: "test-hermes" });
+  const operator = new ControlClient({ baseUrl, token: "test-operator" });
+  const requests = [];
+  let loseResponse = false;
+  const adapter = new HermesMcpAdapter({ client: {
+    get: (...args) => client.get(...args),
+    post: async (...args) => {
+      requests.push(args);
+      const result = await client.post(...args);
+      if (loseResponse) { loseResponse = false; throw new Error("MCP result lost"); }
+      return result;
+    },
+  } });
+  const a = { "io.delegate-wave/hermes-session-id": "Hermes-A" };
+  const b = { "io.delegate-wave/hermes-session-id": "Hermes-B" };
+  const started = await adapter.callTool("session_start", { project_id: projectId, intent: "inspect" }, a);
+  await sessions.tick(started.session_id);
+  const args = { session_id: started.session_id, answer: "clarified", reason: "impossible" };
+  const messagesBefore = sessions.messages(started.session_id).length;
+  for (const name of ["session_answer", "session_fail"]) {
+    await assert.rejects(adapter.callTool(name, args, b), /does not own/);
+  }
+  assert.equal(sessions.messages(started.session_id).length, messagesBefore);
+  assert.equal(sessions.get(started.session_id).state, "WAITING_FOR_HERMES");
+  await assert.rejects(client.post(`/v1/sessions/${started.session_id}/fail`,
+    { reason: "spoof", scopes: ["operate"] }, "missing-owner"), /does not own/);
+  assert.equal((await adapter.callTool("session_answer", args, a)).state, "WORKING");
+  await sessions.tick(started.session_id);
+  loseResponse = true;
+  await assert.rejects(adapter.callTool("session_fail", args, a), /MCP result lost/);
+  const firstRequest = requests.at(-1)[2];
+  const evidence = () => ["events", "cancellation_intents", "cancellation_results"]
+    .map((table) => dispatcher.db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n);
+  const beforeRetry = evidence();
+  const retry = await adapter.callTool("session_fail", { ...args, reason: "retry wording" }, a);
+  assert.notEqual(requests.at(-1)[2], firstRequest);
+  assert.deepEqual(retry, { session_id: started.session_id, state: "FAILED", outcome: "impossible" });
+  assert.deepEqual(evidence(), beforeRetry, "retry adds no domain events or cancellation receipts");
+  await assert.rejects(adapter.callTool("session_fail", args, b), /does not own/);
+  assert.deepEqual(evidence(), beforeRetry);
+  const another = await adapter.callTool("session_start", { project_id: projectId, intent: "inspect again" }, a);
+  await sessions.tick(another.session_id);
+  assert.equal((await operator.post(`/v1/sessions/${another.session_id}/fail`,
+    { reason: "operator stop" }, "operator-stop")).state, "FAILED");
+});
+
+test("session_fail preserves terminal child outcomes without historical cancellation receipts", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, sessions } = boot([{ action: "ESCALATE", reason: "blocked", question: "Proceed?" }]);
+  const started = await sessions.start({ projectId, intent: "inspect" });
+  await sessions.tick(started.session_id);
+  const children = [];
+  for (const status of ["SUCCEEDED", "FAILED", "CANCELLED", "PENDING", "NEEDS_ATTENTION"]) {
+    const child = await dispatcher.createJob({ projectId, goal: status, mode: "read",
+      parentJobId: started.job_id, internalKind: "MANAGER_EXPLORATION" });
+    if (status === "SUCCEEDED" || status === "FAILED") {
+      dispatcher.backend = new FakeBackend(async () => ({ exitCode: status === "FAILED" ? 1 : 0, stdout: "", stderr: "" }));
+      await dispatcher.runJob(child.id);
+    }
+    dispatcher.db.prepare("UPDATE jobs SET status = ? WHERE id = ?").run(status, child.id);
+    children.push({ ...child, expected: ["PENDING", "NEEDS_ATTENTION"].includes(status) ? "CANCELLED" : status, queued: ["PENDING", "NEEDS_ATTENTION"].includes(status) });
+  }
+  const attempts = dispatcher.db.prepare("SELECT * FROM attempts ORDER BY id").all();
+  await sessions.fail(started.session_id, "stop", { principal: "hermes", origin: "test" });
+  assert.deepEqual(dispatcher.db.prepare("SELECT * FROM attempts ORDER BY id").all(), attempts);
+  for (const child of children) {
+    assert.equal(dispatcher.getJob(child.id).status, child.expected);
+    assert.equal(dispatcher.db.prepare("SELECT COUNT(*) n FROM cancellation_intents WHERE job_id = ?").get(child.id).n,
+      child.queued ? 1 : 0);
+  }
+});
 
 test("manager bootstrap failure atomically closes session and root with evidence", async (t) => {
   const { boot, projectId } = await world(t);

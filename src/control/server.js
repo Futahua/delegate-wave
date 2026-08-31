@@ -110,6 +110,7 @@ export function createControlServer({
         requestId: req.headers["x-request-id"],
         principalId: identity.principalId,
         originChannel: identity.originChannel,
+        scopes: identity.scopes,
       });
       send(res, 200, { ok: true, result });
     } catch (error) {

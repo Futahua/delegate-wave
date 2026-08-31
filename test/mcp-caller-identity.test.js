@@ -15,6 +15,20 @@ import { HermesMcpAdapter, runMcpStdio } from "../src/mcp/server.js";
 
 const META_KEY = "io.delegate-wave/hermes-session-id";
 
+test("answer/fail require per-call metadata and ignore model-supplied ownership", async () => {
+  const { adapter, posts } = recordingAdapter();
+  for (const name of ["session_answer", "session_fail"]) {
+    const args = { session_id: "s", answer: "yes", reason: "stop", hermesSessionId: "victim", hermes_session_id: "victim" };
+    for (const meta of [{}, { [META_KEY]: " " }]) {
+      await assert.rejects(adapter.callTool(name, args, meta), /no calling conversation/);
+    }
+    assert.equal(posts.length, name === "session_answer" ? 0 : 1);
+    await adapter.callTool(name, args, { [META_KEY]: "caller" });
+    assert.equal(posts.at(-1).body.hermesSessionId, "caller");
+    assert.equal(adapter.listTools().find((tool) => tool.name === name).inputSchema.properties.hermesSessionId, undefined);
+  }
+});
+
 // A control client that records what would have been posted, so these tests are
 // about the boundary rather than about HTTP.
 function recordingAdapter() {

@@ -226,11 +226,14 @@ export class AutonomousSessionService {
   async fail(sessionId, reason, { principal, origin } = {}) {
     const session = this.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
-    if (session.state !== "WAITING_FOR_HERMES") throw new Error("session_fail requires WAITING_FOR_HERMES");
     if (typeof reason !== "string" || !reason.trim() || reason.length > 2000) {
       throw new Error("reason must be a non-empty string of at most 2000 characters");
     }
     if (!principal || !origin) throw new Error("Failing a session requires an authorizing identity");
+    // MCP retries carry fresh request IDs. Return the first durable outcome
+    // without another cancellation or event, even if the retry changes its reason.
+    if (session.state === "FAILED") return { session_id: sessionId, state: "FAILED", outcome: session.outcome };
+    if (session.state !== "WAITING_FOR_HERMES") throw new Error("session_fail requires WAITING_FOR_HERMES");
     const run = this.manager.getRun(session.job_id);
     transaction(this.db, () => {
       if (run) this.manager.setRun(run.id, { status: "CANCELLED" });
@@ -239,10 +242,16 @@ export class AutonomousSessionService {
         payload: { sessionId, reason, principal, origin },
       });
     });
-    // cancelJob fences/kills all live family attempts. Also close queued children,
-    // which have no attempt for the family cancellation code to discover.
+    // The root owns live family teardown. Only never-started, queued children
+    // need separate closure; historical terminal outcomes must not be rewritten.
+    await this.dispatcher.cancelJob({ jobId: session.job_id, principal, origin, reason });
     for (const jobId of this.dispatcher.familyJobIds(session.job_id)) {
-      await this.dispatcher.cancelJob({ jobId, principal, origin, reason });
+      if (jobId === session.job_id) continue;
+      const child = this.dispatcher.getJob(jobId);
+      const attempted = this.db.prepare("SELECT 1 FROM attempts WHERE job_id = ? LIMIT 1").get(jobId);
+      if (["PENDING", "NEEDS_ATTENTION"].includes(child.status) && !attempted) {
+        await this.dispatcher.cancelJob({ jobId, principal, origin, reason });
+      }
     }
     if (this.dispatcher.familyHasLiveAttempt(session.job_id)) throw new Error("Session family is still settling");
     transaction(this.db, () => {

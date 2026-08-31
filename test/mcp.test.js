@@ -23,9 +23,10 @@ test("Hermes contracts reject control-plane work and route terminal intent throu
   const fail = tools.find((tool) => tool.name === "session_fail");
   assert.equal(fail.inputSchema.properties.reason.maxLength, 2000);
   assert.equal(fail.inputSchema.additionalProperties, false);
-  assert.deepEqual(await adapter.callTool("session_fail", { session_id: "s/1", reason: "prerequisites impossible" }), { state: "FAILED" });
+  assert.deepEqual(await adapter.callTool("session_fail", { session_id: "s/1", reason: "prerequisites impossible" },
+    { [CALLER_META_KEY]: "owner" }), { state: "FAILED" });
   assert.equal(calls[0][0], "/v1/sessions/s%2F1/fail");
-  assert.deepEqual(calls[0][1], { reason: "prerequisites impossible" });
+  assert.deepEqual(calls[0][1], { reason: "prerequisites impossible", hermesSessionId: "owner" });
 });
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

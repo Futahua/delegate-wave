@@ -129,17 +129,20 @@ const TOOLS = Object.freeze([
     name: "session_answer",
     description: "Answer the question a waiting session is asking, from the original conversation "
       + "with the user. The answer becomes durable evidence and the work continues. Clarification only: "
-      + "do not encode cancellation or terminal state in prose; use session_fail for terminal intent.",
+      + "do not encode cancellation or terminal state in prose; use session_fail for terminal intent. "
+      + "Only the originating Hermes conversation may answer this session.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, answer: { type: "string" } },
-      required: ["session_id", "answer"],
+      required: ["session_id", "answer"], additionalProperties: false,
     },
   },
   {
     name: "session_fail",
     description: "Terminally fail a session only while it is WAITING_FOR_HERMES. Cancels/fences its "
-      + "job family and stops its manager; does not dispatch work or grant operational authority.",
+      + "job family and stops its manager; does not dispatch work or grant operational authority. "
+      + "Only the originating Hermes conversation may call it. Retrying an already FAILED session "
+      + "returns its original outcome without another cancellation.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, reason: { type: "string", minLength: 1, maxLength: 2000 } },
@@ -177,13 +180,14 @@ function requiredString(args, name) {
   return args[name];
 }
 
-function callerSessionId(meta) {
+function callerSessionId(meta, operation = "session_start") {
   const value = meta?.[CALLER_SESSION_META_KEY];
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(
-      "session_start has no calling conversation to report back to: the MCP client did not supply "
+      `${operation} has no calling conversation to report back to: the MCP client did not supply `
       + CALLER_SESSION_META_KEY
-      + " as a non-empty string. Refusing to start work nobody is watching.",
+      + " as a non-empty string. "
+      + (operation === "session_start" ? "Refusing to start work nobody is watching." : "Refusing to mutate a session without caller identity."),
     );
   }
   return value.trim();
@@ -247,16 +251,18 @@ export class HermesMcpAdapter {
       return this.client.get(`/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}`);
     }
     if (name === "session_answer") {
+      const hermesSessionId = callerSessionId(meta, name);
       return this.client.post(
         `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/answer`,
-        { answer: requiredString(args, "answer") },
+        { answer: requiredString(args, "answer"), hermesSessionId },
         `req_${randomUUID()}`,
       );
     }
     if (name === "session_fail") {
+      const hermesSessionId = callerSessionId(meta, name);
       return this.client.post(
         `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/fail`,
-        { reason: requiredString(args, "reason") }, `req_${randomUUID()}`,
+        { reason: requiredString(args, "reason"), hermesSessionId }, `req_${randomUUID()}`,
       );
     }
     if (name === "propose_work") {

@@ -36,7 +36,7 @@ preserved incident data, restart services, or rerun the demonstration.
    `session_answer` remains clarification only and points terminal intent to
    `session_fail`. These instructions are not represented as an OS sandbox.
 
-## Verification
+## Original hardening verification (638c761)
 
 Windows, Node `v24.14.1`, npm `11.17.0`, 2026-08-31. All execution tests use
 disposable repositories and test backends, not the incident database or paid agents.
@@ -71,6 +71,45 @@ failures reproduced before and after this patch:
   conversation" — expected `[]`, received a `PARTIAL` wake result.
 
 No expectation was relaxed or test skipped to conceal these failures.
+
+## Session-control review corrections
+
+Follow-up to review of `638c761e6c0d825caea848956449357da554c2bc`:
+
+- Both `session_answer` and `session_fail` now take the calling conversation from
+  transport `_meta`, never model arguments. The Control API checks the durable
+  `(session_id, hermes_session_id)` watch before mutation or cached-response
+  lookup. Only server-authenticated operator scope bypasses that ownership check;
+  an argument claiming operator scope does not. This uses the existing trusted
+  Hermes metadata transport, not separate cryptographic credentials per chat.
+- A valid `session_fail` retry against an already failed session returns its
+  stored outcome, without new domain events or cancellation receipts. This is
+  semantic retry safety across fresh MCP-generated request IDs, not just HTTP
+  request-ID deduplication. Other nonwaiting states still refuse the transition.
+- The root cancellation handles live family attempts once. Additional closure
+  applies only to PENDING/NEEDS_ATTENTION children with no attempts. Completed
+  child outcomes and attempt rows are retained, including genuine failures.
+
+The new end-to-end regression uses `HermesMcpAdapter`, a real `ControlClient` and
+HTTP server, durable watches, and the real session service with a fake manager.
+It checks A/B ownership, operator authority, a lost successful MCP response, a
+retry with a distinct generated request ID, and unchanged domain evidence on
+retry. Separate tests cover missing/spoofed model-supplied identity and preservation
+of terminal child history. The older HTTP-only idempotency test is now explicitly
+named as an operator/request-ID test rather than evidence of MCP retry safety.
+
+Focused command (75 passed, 0 failed):
+
+```text
+node --test test/autonomous-session.test.js test/mcp.test.js test/mcp-caller-identity.test.js test/mcp-live.test.js test/control.test.js
+```
+
+Full `npm test`: 691 tests, 688 passed, 2 failed, 1 skipped. The two failures are
+the same Hermes-interpreter compatibility and ENQUEUED-wake fencing failures
+listed above. The original asynchronous driver failures did not reproduce.
+
+`npm run syntax` and `git diff --check` passed. These are local Windows test results, not independently
+published CI checks. No workflow or CI configuration was added in this narrow pass.
 
 ## Deliberately unchanged
 

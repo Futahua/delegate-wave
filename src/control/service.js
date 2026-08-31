@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { transaction } from "../db.js";
 import { ControlError, asControlError } from "./errors.js";
+import { SCOPES } from "./contract.js";
 import { buildSessionTimeline, listSessionPresentations } from "../presentation/session-timeline.js";
 
 const now = () => new Date().toISOString();
@@ -99,6 +100,17 @@ export class ControlService {
     if (!requestId || typeof requestId !== "string") throw new ControlError("REQUEST_ID_REQUIRED", "Mutations require a request_id", 400);
     if (!principalId || !originChannel) throw new ControlError("IDENTITY_REQUIRED", "Server-authenticated identity is required", 401);
     rejectIdentity(args);
+
+    // Check even on a cached request: a shared Hermes credential is not session
+    // ownership. Only server-authenticated operator scope bypasses the watch.
+    if (["session.answer", "session.fail"].includes(command) && !context.scopes?.includes(SCOPES.OPERATE)) {
+      const caller = args.hermesSessionId;
+      if (typeof caller !== "string" || !caller.trim()
+        || !this.db.prepare("SELECT 1 FROM session_watches WHERE session_id = ? AND hermes_session_id = ?")
+          .get(args.sessionId, caller.trim())) {
+        throw new ControlError("SESSION_CALLER_MISMATCH", "Calling Hermes conversation does not own this session", 403);
+      }
+    }
 
     const argsDigest = digest(command, args);
     const claim = transaction(this.db, () => {
