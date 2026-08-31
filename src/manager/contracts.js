@@ -287,7 +287,9 @@ function worktreeRelativeText(value, repositoryPath) {
     segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   ));
   const flags = /^[A-Za-z]:/.test(root) || root.startsWith("\\\\") ? "gi" : "g";
-  const registeredCheckout = new RegExp(`${escapedSegments.join("[\\\\/]")}([\\\\/])?`, flags);
+  const registeredCheckout = new RegExp(
+    `${escapedSegments.join("[\\\\/]")}(?:([\\\\/])|$)`, flags,
+  );
   const rewritten = source.replace(registeredCheckout, (_match, separator) => (separator ? "" : "."));
   if (registeredCheckout.test(rewritten)) {
     throw new ContractError("worker instruction still references the registered repository checkout");

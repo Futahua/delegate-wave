@@ -22,6 +22,37 @@ test("exploration instructions replace only the registered checkout with worktre
   assert.match(instruction, /current directory is the assigned read-only repository worktree/);
 });
 
+test("registered checkout rewriting requires a path boundary", () => {
+  const checkoutFile = renderExploration({
+    repositoryPath,
+    objective: "context",
+    exploration: { question: "Read D:/Programs/evTEMP/dw-visual-demo/router.js", deliver: [] },
+  });
+  const checkoutRoot = renderExploration({
+    repositoryPath,
+    objective: "context",
+    exploration: { question: "Inspect D:/Programs/evTEMP/dw-visual-demo", deliver: [] },
+  });
+  const sibling = renderExploration({
+    repositoryPath,
+    objective: "context",
+    exploration: {
+      question: "Compare D:/Programs/evTEMP/dw-visual-demo-backup/reference.txt",
+      deliver: [],
+    },
+  });
+  const external = renderExploration({
+    repositoryPath,
+    objective: "context",
+    exploration: { question: "Compare D:/Shared/reference.txt", deliver: [] },
+  });
+
+  assert.match(checkoutFile, /Question: Read router\.js/);
+  assert.match(checkoutRoot, /Question: Inspect \./);
+  assert.match(sibling, /D:\/Programs\/evTEMP\/dw-visual-demo-backup\/reference\.txt/);
+  assert.match(external, /D:\/Shared\/reference\.txt/);
+});
+
 test("implementation instructions make the objective context and existing brief fields actionable", () => {
   const instruction = renderBrief({
     repositoryPath,
