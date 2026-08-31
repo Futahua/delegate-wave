@@ -2,7 +2,10 @@
 
 Updated: 2026-08-31
 
-Planning baseline: `de0f38791dd7b49b79de3ed0d662912b90d30772`
+Approved CP1 starting SHA: `4317705cc5e70cd03d028eab5e88bc2fe454fd9e`
+
+The source implementation did not change in the evidence/planning commits leading
+to this SHA. Record it as `Starting SHA` in the first CP1 implementation handoff.
 
 Branch: `codex/backpack-presentation-v1`
 
@@ -86,10 +89,13 @@ Finish in `SEMANTICALLY_ACCEPTED` MANUAL state with an unintegrated candidate.
 - [ ] Briefs state that the current directory is the assigned attempt worktree.
 - [ ] Manager-generated references use `router.js`, `test.js`, etc.; never the
       registered/original checkout's absolute path.
-- [ ] Reject Windows/POSIX absolute paths, UNC/file URLs and traversal in generated
-      repository-task path fields.
+- [ ] Deterministically reject references to this job's registered/original checkout
+      path when rendering a repository-worker brief.
+- [ ] Do not introduce a generic path language or blanket ban on absolute/external
+      paths. A future personal task may intentionally grant access to an external file.
 - [ ] Keep explorer confinement. Do not loosen it to hide a bad brief.
-- [ ] Test Windows/POSIX absolute variants, traversal and valid relative paths.
+- [ ] Test the exact failure: the registered checkout path is rejected/re-rendered as
+      `router.js`, while legitimate repository-relative references still work.
 
 ## CP1.2 — Implementation worker role boundary
 
@@ -98,21 +104,41 @@ Finish in `SEMANTICALLY_ACCEPTED` MANUAL state with an unintegrated candidate.
       session IDs and final reporting are not implementation-worker responsibilities.
 - [ ] Prohibit dispatching, emulating or inventing workers, turns, sessions,
       candidate IDs, validation records or integration records.
-- [ ] Limit the actionable contract to `What to do`, acceptance, known facts and unknowns.
-- [ ] Prefer a small structured worker-task representation over one large prose prompt.
+- [ ] Keep the existing structured brief contract: `diagnosis`, `instructions`,
+      `acceptance`, `relevant_evidence`, `uncertainties` and `worker_tier`.
+- [ ] Fix `renderBrief()` so the full human objective is explicitly context and only
+      those existing brief fields are actionable.
+- [ ] Do not create a second `WorkerTask` abstraction unless implementation evidence
+      proves the existing contract cannot express the boundary.
 - [ ] Test an objective containing PLAN/EXPLORE/SYNTHESIS/REVIEW and prove the
       implementation brief treats those as context, not worker actions.
 
 ## CP1.3 — Authoritative REVIEW facts
 
-- [ ] Include manager run ID and prior turn ID/phase/action/state.
-- [ ] Include exploration child job IDs, attempt IDs and terminal states.
-- [ ] Include implementation subject attempt, candidate commit/tree, changed files
-      and deterministic validation receipt/state.
+- [ ] Always include a compact machine-generated summary: workflow shape/counts,
+      subject attempt, candidate commit/tree, changed files and validation result.
+- [ ] Include concrete manager-turn, child-job and attempt IDs only when the objective
+      explicitly depends on workflow provenance—as the visual regression does—or
+      when diagnostic/debug context requests them.
 - [ ] Build those fields from SQLite, Git and validators, never worker prose.
 - [ ] Render privileged DW facts before worker testimony.
 - [ ] Filter or clearly subordinate worker orchestration claims so they cannot decide
       whether work or a candidate exists.
+
+Everyday form:
+
+```yaml
+Authoritative DW facts
+workflow: PLAN -> EXPLORE 2/2 succeeded -> SYNTHESIS -> IMPLEMENT
+candidate: 2799378...
+changed: router.js, test.js
+validation: npm test / PASSED
+```
+
+The manager must not decide whether PLAN occurred, explorers were real, a candidate
+exists or validation passed. Its implementation criterion is only:
+
+> reviewer decides whether the real diff satisfies intent
 
 Core adversarial regression:
 
@@ -126,7 +152,7 @@ worker testimony:
   "no candidate exists"
 
 required:
-  REVIEW receives real IDs and candidate
+  REVIEW receives real IDs when provenance is required and always receives candidate truth
   testimony cannot erase those facts
   reviewer decides only whether the real diff satisfies intent
 ```
