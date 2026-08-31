@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { initializeDataRoot, openDatabase } from "../src/db.js";
 import { listSessionPresentations } from "../src/presentation/session-timeline.js";
@@ -46,6 +47,22 @@ test("origin is the first Hermes watch and a later watcher cannot move it", (t) 
   db.prepare(`INSERT INTO session_watches(id, session_id, hermes_session_id, state, created_at, updated_at)
     VALUES ('w2', ?, 'hermes-later', 'ACTIVE', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`).run(id);
   assert.equal(listSessionPresentations(db).sessions[0].origin_hermes_session_id, "hermes-origin");
+});
+
+test("session presentation reuses the authoritative Hermes session title when available", (t) => {
+  const { db } = ledger(t);
+  const { id } = addSession(db, 1);
+  db.prepare(`INSERT INTO session_watches(id, session_id, hermes_session_id, state, created_at, updated_at)
+    VALUES ('w-title', ?, 'hermes-titled', 'ACTIVE', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run(id);
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), "delegate-wave-hermes-title-"));
+  const hermes = new DatabaseSync(path.join(hermesHome, "state.db"));
+  hermes.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT)");
+  hermes.prepare("INSERT INTO sessions(id, title) VALUES (?, ?)").run("hermes-titled", "Routing investigation");
+  hermes.close();
+  const before = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = hermesHome;
+  t.after(() => { if (before === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = before; fs.rmSync(hermesHome, { recursive: true, force: true }); });
+  assert.equal(listSessionPresentations(db).sessions[0].origin_hermes_session_title, "Routing investigation");
 });
 
 test("semantic acceptance is settled only for modes whose work ends there", (t) => {

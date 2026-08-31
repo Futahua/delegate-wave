@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { normalizeOpenCodeActivityPage } from "./activity-open-code.js";
 
 export const DEFAULT_SESSION_PAGE = 40;
@@ -34,7 +35,28 @@ function presentationState(session) {
   return "live";
 }
 
-function sessionRecord(session) {
+export function readHermesSessionTitles(sessionIds, hermesHome = process.env.HERMES_HOME) {
+  const ids = [...new Set(sessionIds.filter((id) => typeof id === "string" && id.trim()))];
+  if (!hermesHome || !ids.length) return new Map();
+  const databasePath = path.join(hermesHome, "state.db");
+  if (!fs.existsSync(databasePath)) return new Map();
+  let db;
+  try {
+    db = new DatabaseSync(databasePath, { readOnly: true });
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = db.prepare(`SELECT id, title FROM sessions WHERE id IN (${placeholders})`).all(...ids);
+    return new Map(rows.flatMap((row) => {
+      const title = typeof row.title === "string" ? row.title.trim().slice(0, 240) : "";
+      return title ? [[row.id, title]] : [];
+    }));
+  } catch {
+    return new Map();
+  } finally {
+    try { db?.close(); } catch { /* Read-only presentation lookup; absence remains a neutral label. */ }
+  }
+}
+
+function sessionRecord(session, hermesTitles = new Map()) {
   const state = presentationState(session);
   return {
     id: session.id,
@@ -43,6 +65,7 @@ function sessionRecord(session) {
     mode: session.mode,
     state,
     origin_hermes_session_id: session.origin_hermes_session_id ?? undefined,
+    origin_hermes_session_title: hermesTitles.get(session.origin_hermes_session_id) ?? undefined,
     started_at: session.created_at,
     ...(state === "settled" ? { settled_at: session.updated_at } : {}),
     updated_at: session.updated_at,
@@ -64,8 +87,9 @@ export function listSessionPresentations(db, { limit, cursor } = {}) {
   const hasMore = rows.length > pageLimit;
   const visible = rows.slice(0, pageLimit);
   const last = visible.at(-1);
+  const hermesTitles = readHermesSessionTitles(visible.map((row) => row.origin_hermes_session_id));
   return {
-    sessions: visible.map(sessionRecord),
+    sessions: visible.map((row) => sessionRecord(row, hermesTitles)),
     has_more: hasMore,
     next_cursor: hasMore && last ? encodeCursor({ createdAt: last.created_at, id: last.id }) : null,
   };
@@ -118,7 +142,8 @@ export function buildSessionTimeline({ db, paths, sessionId, streamSpanId = null
        ORDER BY w.created_at ASC, w.id ASC LIMIT 1) AS origin_hermes_session_id
     FROM autonomous_sessions s WHERE s.id = ?`).get(sessionId);
   if (!row) throw new Error(`Unknown session: ${sessionId}`);
-  const session = sessionRecord(row);
+  const hermesTitles = readHermesSessionTitles([row.origin_hermes_session_id]);
+  const session = sessionRecord(row, hermesTitles);
   const spans = [];
   if (session.root_job_id) {
     const jobs = db.prepare("SELECT * FROM jobs WHERE id = ? OR parent_job_id = ? ORDER BY created_at, id")
