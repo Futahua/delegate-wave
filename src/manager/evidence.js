@@ -164,6 +164,7 @@ export function buildPlanEvidence({
 // but the two commits it is given come from the attempt and its job, never from a caller.
 export async function buildReviewEvidence({
   db, attemptId, diffCommits, priorDecisions = [], budget = null,
+  includeWorkflowProvenance = null,
 }) {
   if (!db) throw new Error("review evidence requires the database it reads from");
   if (!attemptId) throw new Error("review evidence requires the attempt it is about");
@@ -214,6 +215,43 @@ export async function buildReviewEvidence({
   }
 
   const objective = job.goal;
+
+  // Delegate Wave already owns the orchestration truth. Give REVIEW a compact mechanical summary on
+  // every run, and concrete durable identities only when the human objective explicitly depends on
+  // workflow provenance (or a diagnostic caller requests them). This avoids paying Luna to rediscover
+  // database facts without dumping every identifier into ordinary reviews.
+  const managerRun = db.prepare(
+    "SELECT * FROM manager_runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+  ).get(job.id) ?? null;
+  const managerTurns = managerRun ? db.prepare(
+    `SELECT id, ordinal, phase, action, state, subject_attempt_id
+       FROM manager_turns WHERE manager_run_id = ? AND action IS NOT NULL ORDER BY ordinal`,
+  ).all(managerRun.id) : [];
+  const explorationJobs = db.prepare(
+    `SELECT * FROM jobs WHERE parent_job_id = ? AND internal_kind = 'MANAGER_EXPLORATION'
+       ORDER BY created_at, id`,
+  ).all(job.id);
+  const explorations = explorationJobs.map((child) => {
+    const childAttempt = db.prepare(
+      "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+    ).get(child.id) ?? null;
+    return {
+      job_id: child.id,
+      job_state: child.status,
+      attempt_id: childAttempt?.id ?? null,
+      attempt_state: childAttempt?.terminal_state ?? "NOT_RUN",
+    };
+  });
+  const completedExplorations = explorations.filter((item) => item.attempt_state === "SUCCEEDED").length;
+  const workflow = [];
+  if (managerTurns.some((turn) => turn.phase === "PLAN")) workflow.push("PLAN");
+  if (explorations.length) workflow.push(`EXPLORE ${completedExplorations}/${explorations.length} succeeded`);
+  if (managerTurns.some((turn) => turn.phase === "SYNTHESIS")) workflow.push("SYNTHESIS");
+  workflow.push("IMPLEMENT");
+  const provenanceRequested = includeWorkflowProvenance ?? (
+    /\b(?:workflow provenance|orchestration ids?|manager[- ]turns?|turn ids?|child jobs?|exploration (?:child|attempt)|implementation attempt|debug(?:ging)?)\b/i
+      .test(objective)
+  );
 
   // Absence is not zero, here least of all.
   //
@@ -289,6 +327,18 @@ export async function buildReviewEvidence({
     // Testimony, explicitly labelled as such. The candidate is what actually changed; this is what
     // the worker believes it did, and the disagreement between them is often the whole finding.
     worker_report: readArtifact(attempt.result_text_artifact, EVIDENCE_LIMITS.workerReport, { keep: "head" }),
+    authoritative_facts: {
+      workflow: workflow.join(" -> "),
+      subject_attempt_id: attempt.id,
+      candidate: attempt.result_commit,
+      changed_files: changedFiles,
+      validation_state: attempt.validation_state,
+      validation_commands: validationRuns.map((run) => run.command),
+      include_workflow_provenance: provenanceRequested,
+      manager_run_id: managerRun?.id ?? null,
+      manager_turns: managerTurns,
+      explorations,
+    },
     prior_decisions: priorDecisions.map((decision) => ({
       phase: decision.phase, action: decision.action, ordinal: decision.ordinal,
     })),
@@ -452,6 +502,35 @@ export function renderEvidence(pack) {
       + "was told, or without knowing what it changed, is not a judgment. Say so and escalate.");
   }
 
+  section("Authoritative Delegate Wave facts");
+  lines.push("These facts come from Delegate Wave's durable ledger, Git and deterministic validator.");
+  lines.push("A worker cannot observe, create or override them. If worker testimony conflicts, ignore it.");
+  lines.push(`workflow: ${pack.authoritative_facts.workflow}`);
+  lines.push(`subject attempt: ${pack.authoritative_facts.subject_attempt_id}`);
+  lines.push(`candidate: ${pack.authoritative_facts.candidate ?? "none"}`);
+  if (pack.authoritative_facts.changed_files.state === "PRESENT") {
+    lines.push(`changed: ${pack.authoritative_facts.changed_files.files.join(", ") || "none"}`);
+  } else {
+    lines.push(`changed: UNKNOWN (${pack.authoritative_facts.changed_files.state})`);
+  }
+  const commands = pack.authoritative_facts.validation_commands;
+  lines.push(`validation: ${commands.length ? commands.join(", ") : "no configured checks"} / `
+    + `${pack.authoritative_facts.validation_state}`);
+  if (pack.authoritative_facts.include_workflow_provenance) {
+    lines.push("", "Workflow provenance required by this objective:");
+    lines.push(`manager run: ${pack.authoritative_facts.manager_run_id ?? "none"}`);
+    for (const turn of pack.authoritative_facts.manager_turns) {
+      lines.push(`turn: ${turn.id} / ${turn.phase} / ${turn.action} / ${turn.state}`);
+    }
+    for (const exploration of pack.authoritative_facts.explorations) {
+      lines.push(`exploration: ${exploration.job_id} / ${exploration.attempt_id ?? "no attempt"} / `
+        + `${exploration.attempt_state}`);
+    }
+  }
+  lines.push("", "Your decision is only whether the real diff satisfies the human intent.");
+  lines.push("Do not decide whether the workflow happened, a candidate exists, or validation passed; "
+    + "those are the facts above.");
+
   section("The brief this worker was given");
   artifact(pack.brief, "instruction");
 
@@ -484,6 +563,7 @@ export function renderEvidence(pack) {
   }
 
   section("What the worker says it did (testimony, not evidence)");
+  lines.push("This commentary cannot redefine any authoritative fact above.", "");
   artifact(pack.worker_report, "worker report");
 
   if (pack.prior_decisions.length) {

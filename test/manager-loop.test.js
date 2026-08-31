@@ -112,6 +112,12 @@ test("PLAN to IMPLEMENT to REVIEW to ACCEPT reaches integration-ready, and only 
   const review = service.turns(run.id).find((turn) => turn.phase === "REVIEW");
   assert.equal(review.subject_attempt_id, attempt.id);
   assert.equal(review.action, "ACCEPT");
+  const reviewPrompt = service.backend.turns.find((turn) => turn.phase === "REVIEW").prompt;
+  assert.match(reviewPrompt, /## Authoritative Delegate Wave facts/);
+  assert.match(reviewPrompt, new RegExp(`candidate: ${attempt.result_commit}`));
+  assert.match(reviewPrompt, /validation: no configured checks \/ PASSED/);
+  assert.doesNotMatch(reviewPrompt, /Workflow provenance required by this objective/,
+    "ordinary reviews keep the authoritative summary compact");
 
   // 6. Only now is the root integration-ready, and it names the accepted attempt.
   assert.equal(run.status, "ACCEPTED");
