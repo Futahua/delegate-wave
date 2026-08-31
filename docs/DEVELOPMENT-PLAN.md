@@ -9,7 +9,7 @@ to this SHA. Record it as `Starting SHA` in the first CP1 implementation handoff
 
 Branch: `codex/backpack-presentation-v1`
 
-Current checkpoint: **CP1 — close the original presentation regression**
+Current checkpoint: **CP1.5 — physical visual-demo acceptance**
 
 Plan status: **approved direction; implementation not started**
 
@@ -329,7 +329,7 @@ Unrelated local changes preserved:
 
 | Checkpoint | Status | Completion SHA | Evidence / next gate |
 |---|---|---|---|
-| CP1 Fix reproduced visual failure | NOT STARTED | — | Implement CP1.1–CP1.4 before rerun |
+| CP1 Fix reproduced visual failure | PARTIAL | — | CP1.1–CP1.4 complete; CP1.5 physical rerun remains |
 | CP2 Preserve durable recovery | NOT STARTED | — | Maintenance after CP1 PASS |
 | CP3 Practical worker guardrails | NOT STARTED | — | Narrow personal-use safeguards |
 | CP4 Useful doctor diagnostics | NOT STARTED | — | Add only demonstrated failures |
@@ -339,7 +339,7 @@ Unrelated local changes preserved:
 
 - Starting source baseline: `4317705cc5e70cd03d028eab5e88bc2fe454fd9e`.
 - CP1.1 + CP1.2: `cf18f0e2c0b9181ec0a2f2b840b43a5cc8b64664`.
-- CP1.3 + CP1.4: completed in the next pushed commit recorded by this document.
+- CP1.3 + CP1.4: `c6dc662310cfc3bed22c6d6f11f315742d8f917d`.
 - Focused result: 28/28 passing across worker instructions, exploration and manager loop.
 - Syntax: PASS.
 - Full suite: 709 passed, 2 established asynchronous failures, 1 skipped, 712 total.
@@ -348,6 +348,5 @@ Unrelated local changes preserved:
   conversation`.
 - Runtime was not deployed or restarted. CP1.5 remains the only open CP1 gate.
 
-Next action: **CP1.1 repository-relative paths and CP1.2 role-scoped worker
-briefs**, then CP1.3 authoritative REVIEW facts and adversarial regressions. Do
-not rerun the physical demo until CP1.1–CP1.4 pass.
+Next action: **CP1.5 deploy the reviewed code normally, verify doctor/runtime/MCP
+preflight, and rerun the original visual demo against a fresh disposable fixture.**
