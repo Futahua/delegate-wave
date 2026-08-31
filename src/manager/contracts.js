@@ -274,57 +274,102 @@ export function instructionDigest(instruction) {
   return crypto.createHash("sha256").update(String(instruction)).digest("hex");
 }
 
+// A repository worker runs in an isolated worktree, not in the registered checkout. The manager may
+// know the registered path from the human objective and repeat it in a question or brief; passing
+// that physical path through makes a correctly confined worker attempt the wrong filesystem. Rewrite
+// only this project's registered checkout prefix. External paths are left alone because a personal
+// task may deliberately grant one; this is not a generic path language or sandbox policy.
+function worktreeRelativeText(value, repositoryPath) {
+  const source = String(value);
+  const root = String(repositoryPath ?? "").replace(/[\\/]+$/, "");
+  if (!root) return source;
+  const escapedSegments = root.split(/[\\/]+/).map((segment) => (
+    segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  ));
+  const flags = /^[A-Za-z]:/.test(root) || root.startsWith("\\\\") ? "gi" : "g";
+  const registeredCheckout = new RegExp(`${escapedSegments.join("[\\\\/]")}([\\\\/])?`, flags);
+  const rewritten = source.replace(registeredCheckout, (_match, separator) => (separator ? "" : "."));
+  if (registeredCheckout.test(rewritten)) {
+    throw new ContractError("worker instruction still references the registered repository checkout");
+  }
+  return rewritten;
+}
+
 // Renders a brief into the single instruction string a worker actually receives.
 //
 // Kept here rather than in the backend because the rendering is part of the contract: the worker
 // must see the acceptance criteria the reviewer will judge it by. A backend that rendered its own
 // subset could produce a worker that satisfies its prompt and fails review for reasons it was never
 // told about.
-export function renderBrief({ objective, brief, attemptOrdinal = 1, priorFailure = null }) {
+export function renderBrief({
+  objective, brief, repositoryPath = null, attemptOrdinal = 1, priorFailure = null,
+}) {
   const lines = [];
-  lines.push(`Objective (the human's intent, unchanged): ${objective}`);
+  lines.push("Wider human objective (context only; not your role):");
+  lines.push(worktreeRelativeText(objective, repositoryPath));
   lines.push("");
-  lines.push(`Diagnosis: ${brief.diagnosis}`);
+  lines.push("Role boundary:");
+  lines.push("You are the implementation worker in an assigned repository worktree.");
+  lines.push("Only Diagnosis, What to do, Established facts, Known unknowns, the previous-attempt "
+    + "correction (when present), and Acceptance criteria below are actionable.");
+  lines.push("The wider objective may mention manager decisions, exploration workers, validation, "
+    + "review, integration, UI presentation, session IDs or final reporting. Those are not your work.");
+  lines.push("Never dispatch, emulate, fabricate or report Delegate Wave workers, turns, sessions, "
+    + "candidate IDs, validation records or integration records.");
+  lines.push("Use repository-relative paths. Do not access the registered/original checkout; your "
+    + "current directory is the assigned worktree.");
+  lines.push("");
+  lines.push(`Diagnosis: ${worktreeRelativeText(brief.diagnosis, repositoryPath)}`);
   lines.push("");
   lines.push("What to do:");
-  lines.push(brief.instructions);
+  lines.push(worktreeRelativeText(brief.instructions, repositoryPath));
   if (brief.relevant_evidence.length) {
     lines.push("");
     lines.push("Established facts (from earlier investigation; trust these):");
-    for (const item of brief.relevant_evidence) lines.push(`- ${item}`);
+    for (const item of brief.relevant_evidence) {
+      lines.push(`- ${worktreeRelativeText(item, repositoryPath)}`);
+    }
   }
   if (brief.uncertainties.length) {
     lines.push("");
     lines.push("Known unknowns (verify rather than assume):");
-    for (const item of brief.uncertainties) lines.push(`- ${item}`);
+    for (const item of brief.uncertainties) {
+      lines.push(`- ${worktreeRelativeText(item, repositoryPath)}`);
+    }
   }
   if (priorFailure) {
     lines.push("");
     lines.push(`This is attempt ${attemptOrdinal}. The previous attempt was rejected:`);
-    lines.push(priorFailure);
+    lines.push(worktreeRelativeText(priorFailure, repositoryPath));
   }
   lines.push("");
   lines.push("This work is accepted only if all of the following hold:");
-  for (const item of brief.acceptance) lines.push(`- ${item}`);
+  for (const item of brief.acceptance) {
+    lines.push(`- ${worktreeRelativeText(item, repositoryPath)}`);
+  }
   return lines.join("\n");
 }
 
 // Renders an exploration into a read-worker instruction.
-export function renderExploration({ objective, exploration }) {
+export function renderExploration({ objective, exploration, repositoryPath = null }) {
   const lines = [];
   lines.push(`Investigate one question in this repository. Do not modify anything.`);
+  lines.push("Your current directory is the assigned read-only repository worktree. Use repository-relative "
+    + "paths and do not access the registered/original checkout.");
   lines.push("");
-  lines.push(`Question: ${exploration.question}`);
+  lines.push(`Question: ${worktreeRelativeText(exploration.question, repositoryPath)}`);
   if (exploration.deliver.length) {
     lines.push("");
     lines.push("Report back, concretely:");
-    for (const item of exploration.deliver) lines.push(`- ${item}`);
+    for (const item of exploration.deliver) {
+      lines.push(`- ${worktreeRelativeText(item, repositoryPath)}`);
+    }
   }
   lines.push("");
   lines.push("Cite exact file paths and line numbers for every claim. If you cannot establish "
     + "something, say so explicitly rather than inferring it.");
   lines.push("");
-  lines.push(`For context only, the wider objective is: ${objective}`);
+  lines.push(`For context only, the wider objective is: ${worktreeRelativeText(objective, repositoryPath)}`);
   return lines.join("\n");
 }
 

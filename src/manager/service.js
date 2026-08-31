@@ -542,6 +542,7 @@ export class ManagerService {
   // a second authority mechanism.
   async explore(run) {
     const job = this.dispatcher.getJob(run.job_id);
+    const project = this.dispatcher.getProject(job.project_id);
     const round = run.exploration_round;
     const plan = this.readRoundPlan(run, round);
 
@@ -596,7 +597,9 @@ export class ManagerService {
       // one rejected, discarding work already paid for.
       await Promise.allSettled(pending.map(({ exploration, child }) => this.dispatcher.runJob(child.id, {
         model: this.workerModel,
-        instruction: renderExploration({ objective: job.goal, exploration }),
+        instruction: renderExploration({
+          objective: job.goal, exploration, repositoryPath: project.repo_path,
+        }),
         reservationRequest: share,
       }).catch((error) => {
         if (error?.code === "SCHEDULER_BUSY" && error.retryable) {
@@ -778,6 +781,7 @@ export class ManagerService {
 
   async implement(run) {
     const job = this.dispatcher.getJob(run.job_id);
+    const project = this.dispatcher.getProject(job.project_id);
     const brief = this.currentBrief(run);
     const attempts = this.db.prepare("SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal").all(run.job_id);
     const previous = attempts.at(-1) ?? null;
@@ -789,6 +793,7 @@ export class ManagerService {
     const instruction = renderBrief({
       objective: job.goal,
       brief,
+      repositoryPath: project.repo_path,
       attemptOrdinal: attempts.length + 1,
       priorFailure: run.revision_round > 0 ? brief.diagnosis : null,
     });

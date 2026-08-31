@@ -71,7 +71,7 @@ At most one checkpoint is `IN PROGRESS`.
 
 # CP1 — Fix the reproduced visual-demo failure
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 Priority: **immediate release/dogfood gate**
 
@@ -86,31 +86,31 @@ Finish in `SEMANTICALLY_ACCEPTED` MANUAL state with an unintegrated candidate.
 
 ## CP1.1 — Repository-relative worker paths
 
-- [ ] Briefs state that the current directory is the assigned attempt worktree.
-- [ ] Manager-generated references use `router.js`, `test.js`, etc.; never the
+- [x] Briefs state that the current directory is the assigned attempt worktree.
+- [x] Manager-generated references use `router.js`, `test.js`, etc.; never the
       registered/original checkout's absolute path.
-- [ ] Deterministically reject references to this job's registered/original checkout
+- [x] Deterministically reject references to this job's registered/original checkout
       path when rendering a repository-worker brief.
-- [ ] Do not introduce a generic path language or blanket ban on absolute/external
+- [x] Do not introduce a generic path language or blanket ban on absolute/external
       paths. A future personal task may intentionally grant access to an external file.
-- [ ] Keep explorer confinement. Do not loosen it to hide a bad brief.
-- [ ] Test the exact failure: the registered checkout path is rejected/re-rendered as
+- [x] Keep explorer confinement. Do not loosen it to hide a bad brief.
+- [x] Test the exact failure: the registered checkout path is rejected/re-rendered as
       `router.js`, while legitimate repository-relative references still work.
 
 ## CP1.2 — Implementation worker role boundary
 
-- [ ] Separate full human intent as context from the worker's executable task.
-- [ ] State that manager decisions, explorers, validation, review, presentation,
+- [x] Separate full human intent as context from the worker's executable task.
+- [x] State that manager decisions, explorers, validation, review, presentation,
       session IDs and final reporting are not implementation-worker responsibilities.
-- [ ] Prohibit dispatching, emulating or inventing workers, turns, sessions,
+- [x] Prohibit dispatching, emulating or inventing workers, turns, sessions,
       candidate IDs, validation records or integration records.
-- [ ] Keep the existing structured brief contract: `diagnosis`, `instructions`,
+- [x] Keep the existing structured brief contract: `diagnosis`, `instructions`,
       `acceptance`, `relevant_evidence`, `uncertainties` and `worker_tier`.
-- [ ] Fix `renderBrief()` so the full human objective is explicitly context and only
+- [x] Fix `renderBrief()` so the full human objective is explicitly context and only
       those existing brief fields are actionable.
-- [ ] Do not create a second `WorkerTask` abstraction unless implementation evidence
+- [x] Do not create a second `WorkerTask` abstraction unless implementation evidence
       proves the existing contract cannot express the boundary.
-- [ ] Test an objective containing PLAN/EXPLORE/SYNTHESIS/REVIEW and prove the
+- [x] Test an objective containing PLAN/EXPLORE/SYNTHESIS/REVIEW and prove the
       implementation brief treats those as context, not worker actions.
 
 ## CP1.3 — Authoritative REVIEW facts
