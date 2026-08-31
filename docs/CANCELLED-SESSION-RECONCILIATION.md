@@ -61,3 +61,33 @@ this check. The separate runtime wake bridge uses the corrected Current path.
 Hermes still needs a safe restart and process-path verification. No demo was
 launched, no product candidates were integrated, and no incident data was
 deleted.
+
+## Physical deployment verification — 2026-08-31, Asia/Saigon
+
+After user approval of `3911c27d9641565c99ec13f0ebecf412c1cc3333`, the supported
+supervisor stop/start commands both succeeded. PID 9872 started at 14:37:20
+from `Products/DelegateWave/Current/src/cli.js`. Doctor before and after restart
+reported healthy, integrity `ok`, no running attempts, no missing repositories,
+and no unresolved integrations.
+
+Read-only inspection after startup found the actual historical session
+`asess_23a7ce73-5792-414b-9eaa-c91a4bda740c` changed by the normal driver to
+FAILED at `2026-08-31T07:37:25.169Z`, with outcome
+`CANCELLED: authoritative root job or manager run was cancelled`.
+Exactly one `AUTONOMOUS_SESSION_CANCELLED_RECONCILED` receipt exists on root
+`job_24c03f69-c073-4a41-94d9-a5ba98d0a258`, identifying both root and manager
+as CANCELLED. No manual tick or database mutation was used.
+
+The watch became CLOSED with notified_state FAILED. Historical failure wake
+`wake_931c6517-422f-496e-b036-dac9df4236b2` targets the original Hermes session
+`20260830_033752_70e11c`. At inspection it was ENQUEUED, protocol 2, one attempt,
+receiver PENDING, and no recorded error. This is not proof of delivery or
+automatic continuation, and it must not be counted as demo traffic.
+
+Obsolete MCP PIDs 40304 and 8352 remain under dashboard interpreter PID 44660.
+This is the Papers-owned Hermes dashboard, distinct from the runtime wake
+bridge and the Hermes desktop window. Closing/reopening only the desktop
+window does not establish that this dashboard interpreter restarted.
+No further close/kill was attempted following the earlier desktop safety
+refusal. A safe dashboard restart remains necessary; unsent input and any
+active conversation should be saved/settled first. No demo launched.
