@@ -9,9 +9,9 @@ to this SHA. Record it as `Starting SHA` in the first CP1 implementation handoff
 
 Branch: `codex/backpack-presentation-v1`
 
-Current checkpoint: **CP1.5 — physical visual-demo acceptance**
+Current checkpoint: **CP2 — preserve durable personal-use recovery**
 
-Plan status: **approved direction; implementation not started**
+Plan status: **CP1 complete; physical regression passed**
 
 This is the persistent execution and handoff document for Delegate Wave. It is
 deliberately scoped to one person, trusted agents, personal repositories and one
@@ -170,17 +170,17 @@ required:
 Prerequisites: CP1.1–CP1.4 complete, suite acceptable, normal deployment, healthy
 doctor and fresh Hermes MCP path.
 
-- [ ] Operator registers a fresh disposable router fixture.
-- [ ] New Hermes conversation starts exactly one MANUAL session.
-- [ ] Exactly two genuine concurrent explorations run in one round.
-- [ ] Neither explorer attempts the registered/original checkout path.
-- [ ] Genuine SYNTHESIS starts exactly one implementation attempt.
-- [ ] Implementation narration does not impersonate manager phases.
-- [ ] Candidate capture and `npm test` PASS.
-- [ ] REVIEW uses ledger facts and ACCEPTS a semantically correct diff.
-- [ ] Session reaches `SEMANTICALLY_ACCEPTED`; candidate stays unintegrated.
-- [ ] Exact originating Hermes conversation receives a truthful completion wake.
-- [ ] Capture concurrent, expanded, implementation/validation and final UI evidence.
+- [x] Operator registers a fresh disposable router fixture.
+- [x] New Hermes conversation starts exactly one MANUAL session.
+- [x] Exactly two genuine concurrent explorations run in one round.
+- [x] Neither explorer attempts the registered/original checkout path.
+- [x] Genuine SYNTHESIS starts exactly one implementation attempt.
+- [x] Implementation narration does not impersonate manager phases.
+- [x] Candidate capture and `npm test` PASS.
+- [x] REVIEW uses ledger facts and ACCEPTS a semantically correct diff.
+- [x] Session reaches `SEMANTICALLY_ACCEPTED`; candidate stays unintegrated.
+- [x] Exact originating Hermes conversation receives a truthful completion wake.
+- [x] Capture concurrent, expanded, implementation/validation and final UI evidence.
 
 CP1 exit: every item passes. A correct diff plus REVIEW escalation remains PARTIAL.
 Do not begin another architecture initiative before closing this.
@@ -329,7 +329,7 @@ Unrelated local changes preserved:
 
 | Checkpoint | Status | Completion SHA | Evidence / next gate |
 |---|---|---|---|
-| CP1 Fix reproduced visual failure | PARTIAL | — | CP1.1–CP1.4 complete; CP1.5 physical rerun remains |
+| CP1 Fix reproduced visual failure | PASS | `2373ce874b8b334e2a35d741e0aee6a437bba3c5` | Physical evidence: `docs/CP1-VISUAL-DEMO-ACCEPTANCE.md` |
 | CP2 Preserve durable recovery | NOT STARTED | — | Maintenance after CP1 PASS |
 | CP3 Practical worker guardrails | NOT STARTED | — | Narrow personal-use safeguards |
 | CP4 Useful doctor diagnostics | NOT STARTED | — | Add only demonstrated failures |
@@ -340,13 +340,17 @@ Unrelated local changes preserved:
 - Starting source baseline: `4317705cc5e70cd03d028eab5e88bc2fe454fd9e`.
 - CP1.1 + CP1.2: `cf18f0e2c0b9181ec0a2f2b840b43a5cc8b64664`.
 - CP1.3 + CP1.4: `c6dc662310cfc3bed22c6d6f11f315742d8f917d`.
-- Focused result: 28/28 passing across worker instructions, exploration and manager loop.
+- Checkout-root boundary completion: `2373ce874b8b334e2a35d741e0aee6a437bba3c5`.
+- Focused result after boundary completion: 29/29 passing across worker instructions,
+  exploration and manager loop.
 - Syntax: PASS.
 - Full suite: 709 passed, 2 established asynchronous failures, 1 skipped, 712 total.
   The unchanged failures are `external-turn bridge fails closed for an incompatible
   Hermes interpreter` and `an ENQUEUED wake fences a later pending wake for the same
   conversation`.
-- Runtime was not deployed or restarted. CP1.5 remains the only open CP1 gate.
+- Runtime deployed through the supported supervisor stop/start path as PID 51892;
+  post-run `doctor` remained healthy.
+- CP1.5 physical rerun: PASS. See `docs/CP1-VISUAL-DEMO-ACCEPTANCE.md`.
 
-Next action: **CP1.5 deploy the reviewed code normally, verify doctor/runtime/MCP
-preflight, and rerun the original visual demo against a fresh disposable fixture.**
+Next action: **begin CP2 only when a concrete recovery case requires work; otherwise
+use Delegate Wave and collect CP5 task economics.**
