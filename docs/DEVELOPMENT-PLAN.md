@@ -1,9 +1,13 @@
 # Delegate Wave development plan
 
-Updated: 2026-08-31  
-Planning baseline: `7056340374ed2204d7f6f6e2976041f621f412bf`  
-Branch: `codex/backpack-presentation-v1`  
-Current checkpoint: **CP1 — close the original presentation regression**  
+Updated: 2026-08-31
+
+Planning baseline: `7056340374ed2204d7f6f6e2976041f621f412bf`
+
+Branch: `codex/backpack-presentation-v1`
+
+Current checkpoint: **CP1 — close the original presentation regression**
+
 Plan status: **approved direction; implementation not started**
 
 This is the persistent execution and handoff document for the next Delegate Wave
@@ -87,8 +91,10 @@ Use these statuses in handoffs: `NOT STARTED`, `IN PROGRESS`, `BLOCKED`, `PASS`,
 
 # CP1 — Close the original presentation regression
 
-Status: **NOT STARTED**  
-Priority: **release/dogfood gate**  
+Status: **NOT STARTED**
+
+Priority: **release/dogfood gate**
+
 Scope: manager evidence, worker-task rendering, path contract, worker result boundary
 
 ## Goal
@@ -201,7 +207,8 @@ CP1 exit gate: all items pass. A correct diff with REVIEW escalation remains
 
 # CP2 — Harden the durable workflow kernel
 
-Status: **NOT STARTED**  
+Status: **NOT STARTED**
+
 Entry gate: CP1 PASS
 
 ## Goal
@@ -253,7 +260,8 @@ reports no unexplained contradictions, and the full deterministic suite remains 
 
 # CP3 — Provenance, epistemic types and ledger-driven presentation
 
-Status: **NOT STARTED**  
+Status: **NOT STARTED**
+
 Entry gate: CP2 PASS
 
 ## CP3.1 — Epistemic authority types
@@ -293,7 +301,8 @@ Papers cannot be tricked into inventing orchestration from worker prose.
 
 # CP4 — Mechanical containment and capability contracts
 
-Status: **NOT STARTED**  
+Status: **NOT STARTED**
+
 Entry gate: CP1 path protocol PASS; may proceed incrementally after CP2
 
 - [ ] Make role capabilities explicit for MANAGER, EXPLORER, IMPLEMENTER, VALIDATOR,
@@ -314,7 +323,8 @@ declared path/network capabilities even when their prompt asks them to.
 
 # CP5 — Operational readiness and CI
 
-Status: **NOT STARTED**  
+Status: **NOT STARTED**
+
 Entry gate: CP2 invariant auditor available
 
 - [ ] Add Windows Node 24 CI alongside Ubuntu Node 24.
@@ -333,7 +343,8 @@ readiness/doctor can establish the active runtime and control-path health unaide
 
 # CP6 — Economics, adaptive routing and device expansion
 
-Status: **DEFERRED**  
+Status: **DEFERRED**
+
 Entry gate: CP1–CP5 adequate for unattended measurement
 
 ## CP6.1 — Outcome economics
