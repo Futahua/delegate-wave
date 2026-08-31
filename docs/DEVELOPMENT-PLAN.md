@@ -2,7 +2,7 @@
 
 Updated: 2026-08-31
 
-Planning baseline: `7056340374ed2204d7f6f6e2976041f621f412bf`
+Planning baseline: `de0f38791dd7b49b79de3ed0d662912b90d30772`
 
 Branch: `codex/backpack-presentation-v1`
 
@@ -10,386 +10,277 @@ Current checkpoint: **CP1 — close the original presentation regression**
 
 Plan status: **approved direction; implementation not started**
 
-This is the persistent execution and handoff document for the next Delegate Wave
-development phases. Update it in the same commit as checkpoint work. It turns the
-visual-demo review and the broader architecture review into an ordered program;
-it is not a commitment to implement every long-term idea before gathering evidence.
+This is the persistent execution and handoff document for Delegate Wave. It is
+deliberately scoped to one person, trusted agents, personal repositories and one
+trusted machine ecosystem. External workflow systems are design references only;
+they are not a target architecture or dependency plan.
 
-## Product thesis
+## Personal-use target
 
-Delegate Wave is a **durable, evidence-authoritative control plane in which LLMs
-are replaceable reasoning components**.
+> I tell Hermes to change one of my repositories from my laptop or phone.
+> Delegate Wave cheaply gets it done, checks it, wakes the same conversation,
+> and almost never requires me to understand or repair the machinery underneath.
 
-```text
-Hermes owns intent and conversational origin.
-Delegate Wave owns durable state, identities and legal transitions.
-Models supply semantic judgment.
-Workers supply bounded computation.
-Git and validators supply deterministic evidence.
-Papers/Apers project the ledger to people.
-```
-
-The architectural invariant is:
+If work does not materially improve that sentence, it does not belong in the
+near-term plan.
 
 ```text
-worker testimony may inform semantic judgment
-but it can never redefine a mechanical fact
+Delegate Wave owns facts it can establish mechanically.
+Models make judgments only where judgment is actually needed.
+Worker prose cannot override the ledger, Git or validators.
 ```
 
-Use code for state legality, work existence, candidate identity, validation,
-path authority, budgets, retry identity, publication authority and wake ownership.
-Use models for investigation strategy, implementation approach, semantic review,
-revision/rethink decisions and genuinely human ambiguities.
+## Existing foundations to keep, not generalize
 
-## Preserved foundations
+- SQLite ledger and restart reconciliation.
+- Single-flight workers and durable commissions.
+- Isolated Git worktrees, candidate capture and deterministic validation.
+- PREPARE -> VALIDATE -> compare-and-swap integration.
+- Cancellation, failure and stale-state reconciliation.
+- Durable Hermes watch/wake delivery to the originating conversation.
+- Requested/applied/observed model and usage receipts.
 
-Do not replace these working foundations without a separately reviewed reason:
+These solve real personal-use needs. Maintain them and fix demonstrated defects;
+do not turn them into a generic workflow framework.
 
-- SQLite remains the operational write model and Git remains code truth.
-- `manager_turns.subject_attempt_id` mechanically binds REVIEW to a candidate.
-- One-open-commission and one-open-wake uniqueness remain enforced.
-- Integration remains PREPARE -> VALIDATE -> compare-and-swap PUBLISH.
-- Attempts retain immutable identities, instruction digests and isolated worktrees.
-- Worker reports remain testimony; usage/provenance receipts retain their distinct bases.
-- Hermes ownership, durable wake delivery and restart recovery remain intact.
-- The manager has no repository or shell access.
-- Workers remain hierarchical tools of the manager, not a peer mesh.
-- No Temporal/LangGraph/framework rewrite is planned. Borrow their durability and
-  replay invariants without adding another control plane.
+## Source incidents and preserved evidence
 
-## Source incidents and evidence
-
-- Rich visual regression evidence: `docs/visual-demo-20260831/`.
+- Rich visual regression: `docs/visual-demo-20260831/`.
 - Successful minimal wake-back spine: `docs/dogfood-20260831-result/`.
 - Preserved failed rich session: `asess_568b38a2-9fa0-4b87-ad5d-9dfb6741a273`.
-- Its candidate: `2799378846726b8adfcefad818ff4a67fe9d9f18`.
-- Its REVIEW escalated because worker testimony contradicted durable candidate and
-  orchestration facts, and REVIEW lacked a complete privileged orchestration record.
+- Preserved candidate: `2799378846726b8adfcefad818ff4a67fe9d9f18`.
 
-Do not answer, mutate or manually settle that preserved `WAITING_FOR_HERMES`
-session. It is the failure witness. Fix the architecture and use a new session and
-fresh disposable fixture for the acceptance rerun.
+Do not answer, mutate or manually settle that `WAITING_FOR_HERMES` session. It is
+the failure witness. Fix the code and use a new session plus a fresh disposable
+fixture for acceptance.
 
-## Checkpoint protocol
+## Checkpoint discipline
 
-Every checkpoint must have all of the following before it is marked complete:
+Every implementation checkpoint requires focused regressions, the full local
+suite with established failures separated, relevant build/lint checks, no unrelated
+changes, a normal commit/push, and an update here with exact SHA and evidence.
+Deploy/restart only when a physical checkpoint requires it.
 
-1. Focused regressions proving the stated invariants.
-2. Full local test result, with pre-existing failures separated from regressions.
-3. Production/lint/build checks relevant to changed surfaces.
-4. No unrelated working-tree changes included.
-5. A normal commit and push; no rebase, squash or force-push.
-6. This document updated with completion date, exact SHA, tests and residual risks.
-7. Runtime deployment only when the checkpoint explicitly requires dogfood.
-8. Evidence distinguishes durable facts, deterministic evidence, model judgment
-   and worker narration; never report narration as an operational fact.
-
-Use these statuses in handoffs: `NOT STARTED`, `IN PROGRESS`, `BLOCKED`, `PASS`,
-`PARTIAL`, `DEFERRED`. At most one checkpoint should be `IN PROGRESS`.
+Statuses: `NOT STARTED`, `IN PROGRESS`, `BLOCKED`, `PASS`, `PARTIAL`, `DEFERRED`.
+At most one checkpoint is `IN PROGRESS`.
 
 ---
 
-# CP1 — Close the original presentation regression
+# CP1 — Fix the reproduced visual-demo failure
 
 Status: **NOT STARTED**
 
-Priority: **release/dogfood gate**
-
-Scope: manager evidence, worker-task rendering, path contract, worker result boundary
+Priority: **immediate release/dogfood gate**
 
 ## Goal
-
-Repeat the rich visual workload through the genuine:
 
 ```text
 PLAN -> concurrent EXPLORE x2 -> SYNTHESIS -> IMPLEMENT
      -> deterministic validation -> REVIEW -> ACCEPT
 ```
 
-and finish in `SEMANTICALLY_ACCEPTED` MANUAL state with an unintegrated candidate.
+Finish in `SEMANTICALLY_ACCEPTED` MANUAL state with an unintegrated candidate.
 
-## CP1.1 — Authoritative REVIEW manifest
+## CP1.1 — Repository-relative worker paths
 
-- [ ] Extend `buildReviewEvidence()` with a machine-produced orchestration record.
-- [ ] Include manager run ID.
-- [ ] Include prior manager turn ID, phase, action and terminal state.
-- [ ] Include each exploration child job ID, attempt ID and terminal state.
-- [ ] Include the implementation subject attempt, candidate commit/tree, changed
-      files and deterministic validation receipt/state.
-- [ ] Derive every field from SQLite/Git/validator records, never worker prose.
-- [ ] Render this section before worker testimony under an unmistakable heading such
-      as `AUTHORITATIVE DELEGATE WAVE FACTS`.
-- [ ] State mechanically that a worker cannot observe or override these fields.
-- [ ] Either remove orchestration claims from the worker report presented to REVIEW
-      or label/filter them so they cannot participate as candidate-existence evidence.
+- [ ] Briefs state that the current directory is the assigned attempt worktree.
+- [ ] Manager-generated references use `router.js`, `test.js`, etc.; never the
+      registered/original checkout's absolute path.
+- [ ] Reject Windows/POSIX absolute paths, UNC/file URLs and traversal in generated
+      repository-task path fields.
+- [ ] Keep explorer confinement. Do not loosen it to hide a bad brief.
+- [ ] Test Windows/POSIX absolute variants, traversal and valid relative paths.
 
-Checkpoint test:
+## CP1.2 — Implementation worker role boundary
+
+- [ ] Separate full human intent as context from the worker's executable task.
+- [ ] State that manager decisions, explorers, validation, review, presentation,
+      session IDs and final reporting are not implementation-worker responsibilities.
+- [ ] Prohibit dispatching, emulating or inventing workers, turns, sessions,
+      candidate IDs, validation records or integration records.
+- [ ] Limit the actionable contract to `What to do`, acceptance, known facts and unknowns.
+- [ ] Prefer a small structured worker-task representation over one large prose prompt.
+- [ ] Test an objective containing PLAN/EXPLORE/SYNTHESIS/REVIEW and prove the
+      implementation brief treats those as context, not worker actions.
+
+## CP1.3 — Authoritative REVIEW facts
+
+- [ ] Include manager run ID and prior turn ID/phase/action/state.
+- [ ] Include exploration child job IDs, attempt IDs and terminal states.
+- [ ] Include implementation subject attempt, candidate commit/tree, changed files
+      and deterministic validation receipt/state.
+- [ ] Build those fields from SQLite, Git and validators, never worker prose.
+- [ ] Render privileged DW facts before worker testimony.
+- [ ] Filter or clearly subordinate worker orchestration claims so they cannot decide
+      whether work or a candidate exists.
+
+Core adversarial regression:
 
 ```text
-ledger: candidate exists, validation PASSED, real PLAN/explorers/SYNTHESIS
-worker testimony: "IDs were emulated; no candidate exists"
-result: REVIEW input exposes ledger truth; testimony cannot erase those facts
+ledger:
+  real PLAN, two real explorers, real SYNTHESIS
+  candidate exists, validation PASSED
+
+worker testimony:
+  "IDs were emulated"
+  "no candidate exists"
+
+required:
+  REVIEW receives real IDs and candidate
+  testimony cannot erase those facts
+  reviewer decides only whether the real diff satisfies intent
 ```
 
-## CP1.2 — Role-scoped worker task contract
+## CP1.4 — Verification
 
-- [ ] Stop presenting the unchanged whole human objective as worker responsibility.
-- [ ] Preserve semantic context separately from the executable worker task.
-- [ ] Add an explicit implementation-role boundary: manager decisions, other workers,
-      validation, integration, UI presentation, session IDs and reporting are not
-      the implementation worker's responsibilities.
-- [ ] Explicitly prohibit dispatching, emulating, fabricating or reporting DW
-      orchestration identities.
-- [ ] Keep `What to do`, acceptance criteria, known facts and unknowns as the only
-      actionable implementation contract.
-- [ ] Introduce a structured `WorkerTask` shape, or an equivalent typed internal
-      representation, so future renderers do not reconstruct roles from prose.
+- [ ] Build the adversarial fixture with real durable child/attempt records.
+- [ ] Assert prior durable outcomes/history remain unchanged.
+- [ ] Run focused manager/session/review/path-rendering suites.
+- [ ] Run complete `npm test` and relevant build/lint checks.
+- [ ] Record exact counts and distinguish established failures.
 
-Checkpoint tests:
+## CP1.5 — Physical visual-demo acceptance
 
-- [ ] An objective containing PLAN/EXPLORE/SYNTHESIS/REVIEW instructions produces an
-      implementation brief that clearly treats them as context, not worker work.
-- [ ] A worker completion cannot populate candidate SHA, validation state, job IDs,
-      manager IDs, integration state or other mechanically owned fields.
-- [ ] Public narration remains available for Papers without becoming phase evidence.
+Prerequisites: CP1.1–CP1.4 complete, suite acceptable, normal deployment, healthy
+doctor and fresh Hermes MCP path.
 
-## CP1.3 — Repository-relative path protocol
+- [ ] Operator registers a fresh disposable router fixture.
+- [ ] New Hermes conversation starts exactly one MANUAL session.
+- [ ] Exactly two genuine concurrent explorations run in one round.
+- [ ] Neither explorer attempts the registered/original checkout path.
+- [ ] Genuine SYNTHESIS starts exactly one implementation attempt.
+- [ ] Implementation narration does not impersonate manager phases.
+- [ ] Candidate capture and `npm test` PASS.
+- [ ] REVIEW uses ledger facts and ACCEPTS a semantically correct diff.
+- [ ] Session reaches `SEMANTICALLY_ACCEPTED`; candidate stays unintegrated.
+- [ ] Exact originating Hermes conversation receives a truthful completion wake.
+- [ ] Capture concurrent, expanded, implementation/validation and final UI evidence.
 
-- [ ] Exploration and implementation briefs say the current directory is the
-      assigned attempt worktree.
-- [ ] Repository files are rendered as relative paths (`router.js`) or a logical
-      namespace (`repo://router.js`), never as the registered checkout path.
-- [ ] Reject Windows drive paths, UNC paths, POSIX absolute paths, `file://` and
-      traversal (`../`) in repository-task path fields unless an explicit external
-      capability contract permits them.
-- [ ] Resolve logical repository paths only at worker launch inside the worktree.
-- [ ] Do not weaken explorer confinement to make malformed absolute paths succeed.
-
-Checkpoint tests:
-
-- [ ] The visual-demo explorer questions render only worktree-relative paths.
-- [ ] Cross-platform path variants and traversal are refused deterministically.
-- [ ] Legitimate relative paths work on Windows and Linux.
-
-## CP1.4 — Adversarial review regressions
-
-- [ ] Recreate two real exploration children and one real implementation attempt in
-      the deterministic test fixture.
-- [ ] Inject a worker report claiming that the IDs were emulated.
-- [ ] Inject a worker report claiming no candidate commit exists.
-- [ ] Assert the authoritative manifest contains the actual IDs and candidate.
-- [ ] Assert REVIEW is asked only the semantic question: whether the real diff
-      satisfies intent—not whether mechanically known work exists.
-- [ ] Assert terminal worker outcomes and prior durable history remain unchanged.
-
-## CP1.5 — Physical acceptance rerun
-
-Prerequisites: CP1.1–CP1.4 merged, full suite acceptable, runtime deployed normally,
-doctor healthy, fresh Hermes MCP path verified.
-
-- [ ] Create/register a fresh disposable router fixture as operator work.
-- [ ] Start a new originating Hermes conversation and exactly one MANUAL session.
-- [ ] Obtain exactly two genuine concurrent explorations in one round.
-- [ ] Confirm no explorer attempts the registered/original checkout path.
-- [ ] Confirm one SYNTHESIS and exactly one implementation attempt.
-- [ ] Confirm implementation narration does not impersonate manager phases.
-- [ ] Confirm candidate capture and `npm test` PASS.
-- [ ] Confirm REVIEW uses ledger facts and chooses ACCEPT on a semantically correct diff.
-- [ ] Confirm session becomes `SEMANTICALLY_ACCEPTED`, candidate remains unintegrated,
-      and the exact originating Hermes conversation receives the truthful wake.
-- [ ] Capture Papers screenshots for collapsed parallel workers, one full-width
-      expanded transcript, implementation/validation and final accepted state.
-
-CP1 exit gate: all items pass. A correct diff with REVIEW escalation remains
-`PARTIAL`, not PASS. Only this gate closes the original demo incident.
+CP1 exit: every item passes. A correct diff plus REVIEW escalation remains PARTIAL.
+Do not begin another architecture initiative before closing this.
 
 ---
 
-# CP2 — Harden the durable workflow kernel
+# CP2 — Preserve durable personal-use recovery
 
 Status: **NOT STARTED**
 
 Entry gate: CP1 PASS
 
-## Goal
+Maintain what is already built; do not create a generic reconciliation framework.
 
-Make reconciliation and semantic idempotency explicit without replacing SQLite or
-the current state tables.
+- [ ] Keep restart recovery for session/manager/attempt/wake state.
+- [ ] Keep existing semantic retry safety and single-flight constraints.
+- [ ] Keep successful work durable across ordinary process failure.
+- [ ] Keep cancellation/failure closure consistent and evidence-preserving.
+- [ ] Add regressions when a real incident or nearby plausible edge requires one.
+- [ ] Periodically run a bounded restart/wake dogfood; no broad chaos platform.
 
-- [ ] Define a unified `reconcileSession(sessionId) -> Command[]` vocabulary.
-- [ ] Cover manager turns, exploration rounds, commissions, attempts, validation,
-      review, integration, wake creation and cancellation reconciliation.
-- [ ] Give every side effect a semantic identity derived from session + operation +
-      round + subject, rather than relying on fresh request UUIDs.
-- [ ] Preserve successful parallel work across sibling failure/retry.
-- [ ] Ensure human interruption is a durable resting state and process lifetime is irrelevant.
-- [ ] Make command execution retry-safe before/after crash and lost response.
-
-## CP2.1 — Typed domain-event boundary
-
-- [ ] Add event ID, schema version, subject, caused-by, trace ID and span ID concepts.
-- [ ] Maintain an event schema registry and validate payloads at write/read boundaries.
-- [ ] Write state mutation and typed domain event in the same SQLite transaction.
-- [ ] Keep current state tables as the write model; do not attempt a wholesale
-      event-sourcing/CQRS rewrite.
-
-## CP2.2 — Invariant-auditing doctor
-
-- [ ] Add severity levels `HEALTHY`, `WARN`, `BLOCKED`, `CORRUPT`.
-- [ ] Detect contradictory session/root/manager states.
-- [ ] Detect REVIEW/ACCEPT states without a subject/candidate.
-- [ ] Verify Git objects and validation receipts for successful attempts.
-- [ ] Detect open commissions on terminal jobs and dead RUNNING owners.
-- [ ] Detect wake mismatches, single-flight violations and phase/run inconsistencies.
-- [ ] Report expected vs loaded runtime SHA and stale MCP executable paths.
-- [ ] Report unpriceable active models distinctly from historical pricing gaps.
-
-## CP2.3 — Crash/model-based regression corpus
-
-- [ ] Inject crash-before, crash-after, duplicate invocation, lost response and restart
-      around each durable side-effect boundary.
-- [ ] Assert convergence without rebuying completed manager/worker work.
-- [ ] Convert every known incident into a permanent fixture: scheduler busy, manager
-      bootstrap, typed fail retry, stale WORKING, CLI quoting, partial wake, stale MCP,
-      absolute-path brief, fabricated orchestration and denied real candidate.
-
-CP2 exit gate: repeated randomized/restart runs converge to legal states, doctor
-reports no unexplained contradictions, and the full deterministic suite remains green.
+CP2 exit: observed restart/lost-response cases recover without manual SQLite or Git repair.
 
 ---
 
-# CP3 — Provenance, epistemic types and ledger-driven presentation
+# CP3 — Practical mistake prevention for trusted workers
 
 Status: **NOT STARTED**
 
-Entry gate: CP2 PASS
+Entry gate: CP1 path/role boundaries PASS
 
-## CP3.1 — Epistemic authority types
+The goal is preventing accidental damage, not hostile multi-tenant isolation.
 
-- [ ] Introduce first-class classifications: `SYSTEM_FACT`,
-      `DETERMINISTIC_EVIDENCE`, `SEMANTIC_JUDGMENT`, `WORKER_TESTIMONY`, `NARRATION`.
-- [ ] Assign ownership for every field crossing manager, worker, validator, integration,
-      Hermes and Papers boundaries.
-- [ ] Reject or ignore claims outside an actor's epistemic authority.
+```text
+explorer       reads its assigned worktree
+implementer    modifies its assigned worktree
+validator      runs declared deterministic checks
+Delegate Wave owns candidate capture and integration
+```
 
-## CP3.2 — Candidate provenance manifest
+- [ ] Keep worktree boundaries explicit in every task contract.
+- [ ] Keep control-plane work outside repository-worker responsibilities.
+- [ ] Prevent unrelated DW/Hermes/Papers/Backpack paths entering candidate scope.
+- [ ] Keep control credentials out of worker instructions/artifacts.
+- [ ] Use trusted/restricted profiles honestly; do not claim an OS sandbox.
+- [ ] Add narrow checks for actual dogfood mistakes, not enterprise RBAC.
 
-- [ ] Produce and hash a manifest containing base/candidate/tree, intent digest,
-      manager run/turns, worker attempts/instruction digests/models/capabilities,
-      validation plan/receipts, changed files and review action.
-- [ ] Link manifest digest to candidate, REVIEW and any integration record.
-- [ ] Preserve requested/applied/observed model and cost identities separately.
-
-## CP3.3 — Trace-compatible ancestry
-
-- [ ] Use autonomous session as trace ID.
-- [ ] Use manager turns, attempts, validators and wakes as spans.
-- [ ] Record causal parentage without requiring an OpenTelemetry runtime initially.
-
-## CP3.4 — Papers projection
-
-- [ ] Build orchestration structure only from ledger-derived events/relationships.
-- [ ] Keep worker narration inside its true attempt span; narration never creates a phase.
-- [ ] Visibly mark narration that conflicts with authoritative records without changing
-      the ledger-derived timeline.
-- [ ] Preserve the accepted full-width/bounded-scroll presentation behavior.
-
-CP3 exit gate: one query explains why a candidate exists and how it was produced;
-Papers cannot be tricked into inventing orchestration from worker prose.
+CP3 exit: malformed briefs/confused workers cannot turn an ordinary repository job
+into an accidental product/control-plane edit.
 
 ---
 
-# CP4 — Mechanical containment and capability contracts
+# CP4 — Diagnostics that prevent repeated manual debugging
 
 Status: **NOT STARTED**
 
-Entry gate: CP1 path protocol PASS; may proceed incrementally after CP2
+Entry gate: CP1 PASS; implement incrementally from real incidents
 
-- [ ] Make role capabilities explicit for MANAGER, EXPLORER, IMPLEMENTER, VALIDATOR,
-      INTEGRATOR and HERMES.
-- [ ] Explorer: read-only attempt worktree, search, network off by default.
-- [ ] Implementer: read/write attempt worktree, local shell/Git/build; network opt-in.
-- [ ] Validator: no LLM, fresh validation worktree, declared commands only.
-- [ ] Integrator: no LLM, DW-owned Git/CAS authority only.
-- [ ] Keep control-plane credentials out of worker environments and proxy any
-      credential-bearing operation through the owning control-plane component.
-- [ ] Make external filesystem/network access capability-based rather than prompted.
-- [ ] Document honestly where containment remains an in-process fence rather than an OS boundary.
+Extend `doctor` only for states that have caused real operator pain:
 
-CP4 exit gate: repository workers cannot perform control-plane operations or escape
-declared path/network capabilities even when their prompt asks them to.
+- [ ] stale `WORKING` session against terminal root/manager;
+- [ ] RUNNING attempt with dead owner, or live owner against terminal state;
+- [ ] stale Hermes dashboard/MCP executable path;
+- [ ] unresolved/stuck integration;
+- [ ] stuck or contradictory wake/outbox/receiver state;
+- [ ] impossible manager/job/session combinations;
+- [ ] candidate/passed attempt missing required Git or validation evidence;
+- [ ] expected repository head versus loaded runtime SHA when available.
 
----
+Output the exact entity, violated invariant and safe next action. Simple severity
+levels are fine; a tracing deployment or enterprise dashboard is not.
 
-# CP5 — Operational readiness and CI
-
-Status: **NOT STARTED**
-
-Entry gate: CP2 invariant auditor available
-
-- [ ] Add Windows Node 24 CI alongside Ubuntu Node 24.
-- [ ] Separate unit, recovery/state-machine, Windows integration and fixture-regression jobs.
-- [ ] Investigate why recent pushed commits have no GitHub checks/workflow runs.
-- [ ] Make deployment/runtime SHA and MCP executable path machine-readable.
-- [ ] Add a preflight/readiness output suitable for automated dogfood capture.
-- [ ] Surface stale wakes and operator-attention states without manual SQLite inspection.
-- [ ] Stop relying on hand-written evidence documents for ordinary health checks;
-      keep them for milestone dogfoods and incident analysis.
-
-CP5 exit gate: a pushed candidate receives published Linux and Windows evidence, and
-readiness/doctor can establish the active runtime and control-path health unaided.
+CP4 exit: one supported command diagnoses these failures without ad hoc SQL or
+manual process archaeology.
 
 ---
 
-# CP6 — Economics, adaptive routing and device expansion
+# CP5 — Use it and measure whether it saves scarce Codex usage
 
-Status: **DEFERRED**
+Status: **DEFERRED until CP1 PASS**
 
-Entry gate: CP1–CP5 adequate for unattended measurement
+After CP1, stop speculative architecture work and run 10–20 representative personal jobs.
 
-## CP6.1 — Outcome economics
+Record per accepted task:
 
-- [ ] Record accepted result, premium consumption, cheap-provider cost, manager turns,
-      attempts, wall time, interventions, recovery minutes, retries and false escalations.
-- [ ] Keep historical reference, current estimate, actual provider cost and subscription
-      consumption as visibly separate accounting bases.
-- [ ] Evaluate premium resource plus human recovery time per accepted change.
+- [ ] accepted/rejected outcome;
+- [ ] manager turns and worker attempts;
+- [ ] premium Codex/subscription consumption;
+- [ ] cheap-provider spend with its accounting basis;
+- [ ] wall time;
+- [ ] human interventions and approximate recovery minutes;
+- [ ] validation/revision count and false escalations.
 
-## CP6.2 — Adaptive orchestration
+Compare with using Luna directly. Optimize scarce-model usage plus human recovery
+cost per accepted change, not raw cheap tokens.
 
-- [ ] Define deterministic, simple, managed, investigative and hard routing classes.
-- [ ] Models select difficulty/uncertainty; policy selects commercial model/tier.
-- [ ] Require evaluation evidence before adding agentic complexity.
-
-## CP6.3 — Frozen A/B/C benchmark and device path
-
-- [ ] Run a frozen representative corpus: direct Sol, direct/native Luna, and
-      Hermes -> DW -> Luna manager + cheap worker.
-- [ ] Compare accepted-result rate, resource cost, wall time and human recovery.
-- [ ] Then run phone -> Hermes -> DW -> exact-conversation wake dogfood.
-
-CP6 exit gate: decide with measured evidence whether Delegate Wave beats direct Luna
-for the user's real workload and which task classes justify orchestration.
+CP5 exit: decide whether DW is worth maintaining, which task shapes benefit and
+which complexity should be removed. Phone initiation may join this corpus after
+the desktop path is reliable; no distributed scheduler or adaptive-routing system is required.
 
 ---
 
-# Explicit non-goals
+# Explicitly dropped or deferred
 
-- Do not buy correctness by merely upgrading the manager model.
-- Do not loosen worker filesystem restrictions to hide malformed briefs.
-- Do not turn workers into long-lived peers or add worker-to-worker authority.
-- Do not replace SQLite, Git validation or the existing wake protocol during CP1.
-- Do not introduce Temporal, LangGraph, OpenTelemetry runtime or full event sourcing
-  unless later scale/evaluation produces a concrete requirement.
-- Do not repair preserved incident sessions by editing operational data or coaching
-  them through a known architectural failure.
-- Do not begin A/B/C benchmarking until the rich workflow can end truthfully and
-  operational readiness makes results reproducible.
+```text
+Temporal migration
+Kubernetes-style generic controller framework
+full event-sourcing rewrite
+OpenTelemetry deployment
+formal SLSA implementation
+multi-user RBAC or tenant isolation
+cloud/horizontal scaling
+distributed scheduling
+hostile-worker security model
+generic plugin architecture
+large provenance framework
+enterprise dashboards
+complex adaptive routing system
+```
+
+Borrow small principles only when they fix a demonstrated problem: reconcile
+durable state instead of trusting process lifetime, make retries safe, preserve
+candidate evidence, and treat workers as bounded tools. Keep the principle, not
+the infrastructure.
 
 # Handoff template
-
-Copy this block into the top of a continuation note and update this document before
-ending a development turn:
 
 ```text
 Checkpoint:
@@ -397,13 +288,13 @@ Status: NOT STARTED | IN PROGRESS | BLOCKED | PASS | PARTIAL | DEFERRED
 Starting SHA:
 Ending/pushed SHA:
 Files changed:
-Invariant implemented:
+Behavior/invariant implemented:
 Focused tests:
 Full suite/build:
 Runtime deployed/restarted: no | yes (why, PID/SHA)
 Dogfood/session IDs:
 Evidence paths:
-Known failures or deviations:
+Known failures/deviations:
 Next exact action:
 Unrelated local changes preserved:
 ```
@@ -412,14 +303,12 @@ Unrelated local changes preserved:
 
 | Checkpoint | Status | Completion SHA | Evidence / next gate |
 |---|---|---|---|
-| CP1 Original presentation regression | NOT STARTED | — | Implement CP1.1–CP1.4 before new dogfood |
-| CP2 Durable workflow kernel | NOT STARTED | — | Requires CP1 PASS |
-| CP3 Provenance and presentation | NOT STARTED | — | Requires CP2 typed/reconciled substrate |
-| CP4 Mechanical containment | NOT STARTED | — | Begin after CP1 path protocol; finish after CP2 |
-| CP5 Operations and CI | NOT STARTED | — | Requires invariant auditor |
-| CP6 Economics and devices | DEFERRED | — | Requires stable unattended operation |
+| CP1 Fix reproduced visual failure | NOT STARTED | — | Implement CP1.1–CP1.4 before rerun |
+| CP2 Preserve durable recovery | NOT STARTED | — | Maintenance after CP1 PASS |
+| CP3 Practical worker guardrails | NOT STARTED | — | Narrow personal-use safeguards |
+| CP4 Useful doctor diagnostics | NOT STARTED | — | Add only demonstrated failures |
+| CP5 Measure 10–20 real jobs | DEFERRED | — | Begin after CP1 PASS |
 
-The next implementation action is **CP1.1: add the authoritative orchestration
-manifest to REVIEW**, followed in the same narrow program by CP1.2–CP1.4. Do not
-launch another physical visual-demo session until those regressions and the full
-suite are acceptable.
+Next action: **CP1.1 repository-relative paths and CP1.2 role-scoped worker
+briefs**, then CP1.3 authoritative REVIEW facts and adversarial regressions. Do
+not rerun the physical demo until CP1.1–CP1.4 pass.
