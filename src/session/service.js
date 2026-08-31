@@ -230,9 +230,16 @@ export class AutonomousSessionService {
       throw new Error("reason must be a non-empty string of at most 2000 characters");
     }
     if (!principal || !origin) throw new Error("Failing a session requires an authorizing identity");
-    // MCP retries carry fresh request IDs. Return the first durable outcome
-    // without another cancellation or event, even if the retry changes its reason.
-    if (session.state === "FAILED") return { session_id: sessionId, state: "FAILED", outcome: session.outcome };
+    // FAILED alone is not replay evidence: bootstrap, manager and integration
+    // failures also use that state. Only this operation's atomic terminal receipt
+    // permits replay across fresh MCP request IDs (not its pre-cancellation intent).
+    if (session.state === "FAILED") {
+      const completedFail = this.db.prepare(`SELECT 1 FROM events
+        WHERE kind = 'AUTONOMOUS_SESSION_FAILED' AND entity_type = 'job' AND entity_id = ?
+          AND json_extract(payload_json, '$.sessionId') = ? LIMIT 1`).get(session.job_id, sessionId);
+      if (!completedFail) throw new Error("session_fail requires WAITING_FOR_HERMES; session failed independently of a typed fail");
+      return { session_id: sessionId, state: "FAILED", outcome: session.outcome };
+    }
     if (session.state !== "WAITING_FOR_HERMES") throw new Error("session_fail requires WAITING_FOR_HERMES");
     const run = this.manager.getRun(session.job_id);
     transaction(this.db, () => {
@@ -242,14 +249,13 @@ export class AutonomousSessionService {
         payload: { sessionId, reason, principal, origin },
       });
     });
-    // The root owns live family teardown. Only never-started, queued children
-    // need separate closure; historical terminal outcomes must not be rewritten.
+    // The root owns live family teardown. Still-open children need separate
+    // closure even when queued for retry; historical attempts are not modified.
     await this.dispatcher.cancelJob({ jobId: session.job_id, principal, origin, reason });
     for (const jobId of this.dispatcher.familyJobIds(session.job_id)) {
       if (jobId === session.job_id) continue;
       const child = this.dispatcher.getJob(jobId);
-      const attempted = this.db.prepare("SELECT 1 FROM attempts WHERE job_id = ? LIMIT 1").get(jobId);
-      if (["PENDING", "NEEDS_ATTENTION"].includes(child.status) && !attempted) {
+      if (["PENDING", "NEEDS_ATTENTION"].includes(child.status)) {
         await this.dispatcher.cancelJob({ jobId, principal, origin, reason });
       }
     }

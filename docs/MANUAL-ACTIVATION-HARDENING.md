@@ -72,7 +72,7 @@ failures reproduced before and after this patch:
 
 No expectation was relaxed or test skipped to conceal these failures.
 
-## Session-control review corrections
+## Session-control review corrections (b1f4967)
 
 Follow-up to review of `638c761e6c0d825caea848956449357da554c2bc`:
 
@@ -110,6 +110,33 @@ listed above. The original asynchronous driver failures did not reproduce.
 
 `npm run syntax` and `git diff --check` passed. These are local Windows test results, not independently
 published CI checks. No workflow or CI configuration was added in this narrow pass.
+
+## Terminal replay and retry-queue follow-up
+
+Follow-up to review of `b1f496756d1dc769fd853ee61ec6d86d4b19a883`:
+
+- `FAILED` is no longer sufficient for semantic replay. An existing
+  `AUTONOMOUS_SESSION_FAILED` terminal event must identify both this root job and
+  this session. That event is written atomically with successful typed fail;
+  a fail-request intent is not enough. Independent bootstrap, manager, or
+  integration failure does not authorize `session_fail` replay.
+- After root family cancellation, every child still PENDING or NEEDS_ATTENTION
+  is closed, including children with historical failed attempts. Already-terminal
+  FAILED/SUCCEEDED/CANCELLED child jobs and all settled attempt rows stay intact.
+
+New regressions exercise actual bootstrap/tick failures and refuse replay without
+changing history, even in the presence of an unfinished fail intent or another
+session's terminal receipt. A dispatcher-backed retry test produces PENDING after
+one failed attempt with a three-attempt allowance and NEEDS_ATTENTION with a
+one-attempt allowance. Typed fail closes both jobs while retaining the failed
+attempt rows byte-for-byte and leaving no open family jobs, attempts or commissions.
+The existing real MCP lost-response/fresh-request-ID replay regression remains.
+
+Local verification: the same focused command above passed 78/78. Full `npm test`
+ran 694 tests: 691 passed, 2 failed, 1 skipped. Failures remain the same baseline
+Hermes-interpreter compatibility and ENQUEUED-wake fencing tests. Syntax and
+whitespace checks passed. These are local results, not CI checks. No installation,
+runtime reload, incident cleanup, or demonstration was performed.
 
 ## Deliberately unchanged
 

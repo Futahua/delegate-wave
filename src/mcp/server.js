@@ -141,8 +141,8 @@ const TOOLS = Object.freeze([
     name: "session_fail",
     description: "Terminally fail a session only while it is WAITING_FOR_HERMES. Cancels/fences its "
       + "job family and stops its manager; does not dispatch work or grant operational authority. "
-      + "Only the originating Hermes conversation may call it. Retrying an already FAILED session "
-      + "returns its original outcome without another cancellation.",
+      + "Only the originating Hermes conversation may call it. A prior successful session_fail "
+      + "returns its original outcome on retry without another cancellation; independently failed sessions are refused.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, reason: { type: "string", minLength: 1, maxLength: 2000 } },

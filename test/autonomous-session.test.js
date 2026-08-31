@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { initializeDataRoot } from "../src/db.js";
+import { initializeDataRoot, recordEvent } from "../src/db.js";
 import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { FakeManagerBackend } from "../src/manager/backend.js";
@@ -183,6 +183,58 @@ test("session_fail preserves terminal child outcomes without historical cancella
     assert.equal(dispatcher.getJob(child.id).status, child.expected);
     assert.equal(dispatcher.db.prepare("SELECT COUNT(*) n FROM cancellation_intents WHERE job_id = ?").get(child.id).n,
       child.queued ? 1 : 0);
+  }
+});
+
+for (const source of ["bootstrap", "manager tick"]) {
+  test(`session_fail refuses an independent ${source} failure, even with a fail intent`, async (t) => {
+    const { boot, projectId } = await world(t);
+    const { dispatcher, manager, sessions } = boot([]);
+    if (source === "bootstrap") manager.backend.startRun = async () => { throw new Error("independent bootstrap failure"); };
+    else manager.advance = async () => { throw new Error("independent manager failure"); };
+    const started = await sessions.start({ projectId, intent: "inspect" });
+    if (source !== "bootstrap") await sessions.tick(started.session_id);
+    assert.equal(sessions.get(started.session_id).state, "FAILED");
+    // Intent alone, or a completed receipt for another session, is not proof.
+    recordEvent(dispatcher.db, { kind: "AUTONOMOUS_SESSION_FAIL_REQUESTED", entityType: "job",
+      entityId: started.job_id, payload: { sessionId: started.session_id, reason: "unfinished intent" } });
+    recordEvent(dispatcher.db, { kind: "AUTONOMOUS_SESSION_FAILED", entityType: "job",
+      entityId: started.job_id, payload: { sessionId: "another-session", reason: "other receipt" } });
+    const snapshot = () => ["events", "cancellation_intents", "cancellation_results", "autonomous_sessions", "jobs"]
+      .map((table) => dispatcher.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+    const before = snapshot();
+    await assert.rejects(sessions.fail(started.session_id, "user says stop", { principal: "hermes", origin: "test" }),
+      /failed independently/);
+    assert.deepEqual(snapshot(), before, "refusal must not rewrite failure history or add cancellation receipts");
+  });
+}
+
+test("session_fail closes PENDING and NEEDS_ATTENTION children with failed attempt history", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, manager, sessions } = boot([{ action: "ESCALATE", reason: "blocked", question: "Proceed?" }]);
+  const started = await sessions.start({ projectId, intent: "inspect" });
+  await sessions.tick(started.session_id);
+  dispatcher.backend = new FakeBackend(async () => ({ exitCode: 1, stdout: "", stderr: "worker failed" }));
+  const children = [];
+  for (const [status, maxAttempts] of [["PENDING", 3], ["NEEDS_ATTENTION", 1]]) {
+    const child = await dispatcher.createJob({ projectId, goal: `failed child ${status}`, mode: "read", maxAttempts,
+      parentJobId: started.job_id, internalKind: "MANAGER_EXPLORATION" });
+    await dispatcher.runJob(child.id);
+    assert.equal(dispatcher.getJob(child.id).status, status, "dispatcher must produce the reachable retry state");
+    assert.equal(dispatcher.db.prepare("SELECT terminal_state FROM attempts WHERE job_id = ?").get(child.id).terminal_state, "FAILED");
+    children.push(child);
+  }
+  const attempts = dispatcher.db.prepare("SELECT * FROM attempts ORDER BY id").all();
+  await sessions.fail(started.session_id, "stop retries", { principal: "hermes", origin: "test" });
+  assert.deepEqual(dispatcher.db.prepare("SELECT * FROM attempts ORDER BY id").all(), attempts);
+  for (const child of children) assert.equal(dispatcher.getJob(child.id).status, "CANCELLED");
+  assert.equal(dispatcher.getJob(started.job_id).status, "FAILED");
+  assert.equal(sessions.get(started.session_id).state, "FAILED");
+  assert.equal(manager.getRun(started.job_id).status, "FAILED");
+  assert.equal(dispatcher.familyHasLiveAttempt(started.job_id), false);
+  for (const jobId of dispatcher.familyJobIds(started.job_id)) {
+    assert.ok(!["PENDING", "NEEDS_ATTENTION", "RUNNING"].includes(dispatcher.getJob(jobId).status));
+    assert.equal(dispatcher.openCommission(jobId), null);
   }
 });
 
