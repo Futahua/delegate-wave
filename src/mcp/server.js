@@ -102,6 +102,14 @@ const TOOLS = Object.freeze([
             + "MANUAL stops with a finished candidate; PLAN never writes.",
         },
         maximum_cost: { type: "number" },
+        branch: {
+          type: "string",
+          description: "Optional named branch to bind immutably for this session. Defaults to the registered integration branch.",
+        },
+        expected_base_sha: {
+          type: "string",
+          description: "Optional exact commit required at the selected branch before the session is created.",
+        },
         // hermes_session_id is deliberately ABSENT from this schema.
         //
         // It was here, optional, described as "omit it and nobody is told when it
@@ -129,6 +137,8 @@ const TOOLS = Object.freeze([
     name: "session_answer",
     description: "Answer the question a waiting session is asking, from the original conversation "
       + "with the user. The answer becomes durable evidence and the work continues. Clarification only: "
+      + "the session's branch and base are immutable; if the answer requires another branch or SHA, "
+      + "fail this session and start a fresh correctly bound one. "
       + "do not encode cancellation or terminal state in prose; use session_fail for terminal intent. "
       + "Only the originating Hermes conversation may answer this session.",
     inputSchema: {
@@ -244,6 +254,8 @@ export class HermesMcpAdapter {
         intent: requiredString(args, "intent"),
         mode: args.mode || "AUTO",
         maximumCost: args.maximum_cost ?? null,
+        branch: args.branch || null,
+        expectedBaseSha: args.expected_base_sha || null,
         hermesSessionId,
       }, `req_${randomUUID()}`);
     }

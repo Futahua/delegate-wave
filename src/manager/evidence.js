@@ -96,13 +96,16 @@ function readArtifact(artifactPath, limit, options) {
 // and pointing the most expensive model at a codebase is the substitution this architecture exists to
 // prevent.
 export function buildPlanEvidence({
-  objective, baseSha, validationCommands, protectedPaths, explorations = [], workerCapabilities = null,
-  priorCandidate = null, clarifications = [],
+  objective, baseSha, targetBranch = null, validationCommands, protectedPaths, explorations = [],
+  workerCapabilities = null, priorCandidate = null, clarifications = [],
 }) {
   return {
     kind: "PLAN",
     objective,
     base_sha: baseSha,
+    // A commit alone does not say which world it came from. The manager reasons about, and
+    // clarifies against, a base it could not otherwise name -- so the branch travels with it.
+    target_branch: targetBranch,
     validation_commands: validationCommands ?? [],
     protected_paths: protectedPaths ?? [],
     // What the worker selected for this job can actually DO.
@@ -432,7 +435,9 @@ export function renderEvidence(pack) {
 
   if (pack.kind === "PLAN") {
     section("Ground rules");
-    lines.push(`Base commit: ${pack.base_sha}`);
+    lines.push(pack.target_branch
+      ? `Base commit: ${pack.base_sha} (branch ${pack.target_branch}, bound for this job and immutable)`
+      : `Base commit: ${pack.base_sha}`);
     // Rendered as a LIST, never joined with "&&".
     //
     // Joining them produced a shell command line that nothing anywhere ever runs, and the manager

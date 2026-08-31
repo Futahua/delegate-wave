@@ -30,7 +30,7 @@ import { managedPaths } from "./paths.js";
 //     remain explicit recovery history rather than being reinterpreted as inbox events.
 // 36: receiver_protocol distinguishes pre-metadata routed wakes from newly created typed wakes, so
 //     an in-flight schema-35 handoff remains adoptable across upgrade without weakening new events.
-export const SCHEMA_VERSION = "36";
+export const SCHEMA_VERSION = "37";
 
 // Column bodies shared by table creation and table REBUILD.
 //
@@ -260,6 +260,10 @@ const JOBS_COLUMNS = `
     'FAILED', 'CANCELLED', 'NEEDS_ATTENTION'
   )),
   base_sha TEXT NOT NULL,
+  -- Schema 37. The immutable branch whose head was captured as base_sha. Every job has one: rows
+  -- created before branch binding are backfilled by migrate() with the branch they were actually
+  -- rooted on, so no read site needs a fallback and none has one.
+  target_branch TEXT,
   max_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 10),
   -- A recorded ceiling in reference dollars, shared by the whole job family. NULL means no ceiling;
   -- a value gates every attempt start and settles after the work is done.
@@ -1169,6 +1173,23 @@ function migrate(db) {
   if (!jobColumns.includes("internal_kind")) {
     db.exec("ALTER TABLE jobs ADD COLUMN internal_kind TEXT");
   }
+  if (!jobColumns.includes("target_branch")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN target_branch TEXT");
+    // Explicitly backfilled, never resolved at read time.
+    //
+    // Every job that predates branch binding was created by a rule with exactly one outcome: the
+    // root resolved projects.integration_branch and children inherited it. So the branch each old
+    // job was really rooted on is knowable, and it is written down here once.
+    //
+    // The alternative -- reading `job.target_branch ?? project.integration_branch` at each use --
+    // would keep the original defect reachable forever: it silently re-points any job whose branch
+    // is unset at the project's CURRENT default, which is precisely how a session ends up spending
+    // money against a world nobody selected. After this statement the column is authoritative, and
+    // the read sites are written to trust it.
+    db.exec(`UPDATE jobs SET target_branch = (
+       SELECT integration_branch FROM projects WHERE projects.id = jobs.project_id
+     ) WHERE target_branch IS NULL`);
+  }
   const attemptColumns = db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name);
   // Readable failure evidence and executor identity. Plain ADD COLUMNs: all five are nullable with
   // no constraint, so a migrated table matches a fresh one exactly and historical attempts simply
@@ -1339,7 +1360,7 @@ function rebuildConstrainedTables(db) {
       // Named explicitly rather than SELECT *: column order after successive ALTER TABLE ADD COLUMN
       // is not the order of the canonical definition, and a positional copy would silently transpose
       // values into the wrong columns.
-      copy: `id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+      copy: `id, project_id, goal, mode, status, base_sha, target_branch, max_attempts, maximum_cost,
              capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at`,
       after: [
         "CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at)",

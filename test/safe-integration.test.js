@@ -404,3 +404,32 @@ test("9c. a checkout that turns dirty after the preflight check never loses the 
     assert.equal(edit, "HUMAN WAS EDITING THIS\n", "the human's bytes survive exactly");
   }
 });
+
+test("automatic integration publishes to the job's bound branch, never the project default", async (t) => {
+  const w = await world(t, { validation: ["git rev-parse HEAD"] });
+  // A second branch at the same commit, and a job explicitly bound to it. The project stays
+  // registered on main, which is the arrangement that produced the original defect: a session was
+  // asked for one branch, rooted on the registered one, and everything downstream agreed with the
+  // wrong answer because it kept re-deriving it from the project.
+  await git(w.repo, "branch", "release", "main");
+  const mainBefore = await git(w.repo, "rev-parse", "main");
+
+  const bound = await w.dispatcher.createJob({
+    projectId: w.project.id, goal: "add the feature on release", strategy: "direct",
+    maxAttempts: 2, targetBranch: "release",
+  });
+  assert.equal(w.dispatcher.getProject(w.project.id).integration_branch, "main");
+  assert.equal(bound.target_branch, "release");
+  await w.dispatcher.runJob(bound.id);
+  const candidate = w.dispatcher.db.prepare(
+    "SELECT * FROM attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+  ).get(bound.id);
+
+  const result = await w.integrator.integrate({ jobId: bound.id, candidateAttemptId: candidate.id });
+  assert.equal(result.published, true);
+  // The staged row is what the compare-and-swap reads back, so the branch has to be right THERE,
+  // not merely in the caller's intent.
+  assert.equal(result.attempt.target_ref, "release");
+  assert.notEqual(await git(w.repo, "rev-parse", "release"), mainBefore);
+  assert.equal(await git(w.repo, "rev-parse", "main"), mainBefore, "the project default must not move");
+});

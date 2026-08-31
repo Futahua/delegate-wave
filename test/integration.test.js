@@ -101,6 +101,20 @@ test("approved integration cherry-picks the candidate and advances the branch", 
   assert.equal(result.approvals[0].granted_scope, "integration");
 });
 
+test("integration proposal targets the immutable job branch, not the project default", async (t) => {
+  const { root, repo, cleanup } = await fixture(t);
+  const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });
+  t.after(async () => { service.close(); await cleanup(); });
+  const project = await service.addProject({ name: "Fixture target", repoPath: repo, branch: "integration", validation: [] });
+  const job = await service.createJob({ projectId: project.id, goal: "target main", targetBranch: "main" });
+  await service.runJob(job.id);
+  const proposal = await service.proposeIntegration({ jobId: job.id });
+  assert.equal(service.getProject(project.id).integration_branch, "integration");
+  assert.equal(service.getJob(job.id).target_branch, "main");
+  assert.equal(proposal.integration_branch, "main");
+  assert.equal(proposal.expected_integration_head, job.base_sha);
+});
+
 test("re-running a successful integration is idempotent and consumes nothing extra", async (t) => {
   const { root, repo, cleanup } = await fixture(t);
   const service = new Dispatcher({ root, backend: writeCandidateBackend("candidate\n") });

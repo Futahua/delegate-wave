@@ -20,10 +20,46 @@
 // approval ceremony this design exists to remove -- so nothing here branches on mode to decide what
 // to do next, only to decide what is permitted at all.
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { recordEvent, transaction } from "../db.js";
 import { ManagerStop } from "../manager/service.js";
 import { ConflictRequiresJudgment } from "../integration/safe.js";
 import { registerWatch } from "./watcher.js";
+
+// Clarification prose that is really a rebase instruction.
+//
+// A session's branch and base are fixed when its root job is created; nothing after that can move
+// them. So an answer that names a DIFFERENT world is not a clarification -- it is a request for a
+// different session, and the honest response is to say so rather than resume and let the prose
+// stand as though the correction took effect.
+//
+// Deliberately narrow, because a false refusal blocks a legitimate answer:
+//
+//   - a 40-hex commit that is not the bound base is unambiguous, and is always a conflict;
+//   - a path-shaped token (`codex/live-work-ui`) counts only when the repository has no such file
+//     or directory, which is what separates a branch name from `src/manager` or `test/fixtures`;
+//   - a bare one-word name like `main` is NOT detected, and is not claimed to be. What covers that
+//     case is mechanical rather than textual: session_start and session_answer both return the
+//     binding, and the manager's own evidence names the branch every planning turn.
+const SHA_PATTERN = /(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/g;
+const REF_SHAPED = /[\w.-]+(?:\/[\w.-]+)+/g;
+
+export function conflictingWorldInAnswer(text, { targetBranch, baseSha, repoPath }) {
+  const prose = text.replace(/\w+:\/\/\S+/g, " ");
+  for (const sha of prose.match(SHA_PATTERN) ?? []) {
+    if (sha !== baseSha) return { kind: "base", named: sha };
+  }
+  for (const raw of prose.match(REF_SHAPED) ?? []) {
+    const token = raw.replace(/^refs\/heads\//, "");
+    if (token === targetBranch) continue;
+    const last = token.slice(token.lastIndexOf("/") + 1);
+    if (!last || last.includes(".")) continue;
+    if (repoPath && fs.existsSync(path.join(repoPath, token))) continue;
+    return { kind: "branch", named: token };
+  }
+  return null;
+}
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
@@ -81,9 +117,19 @@ export class AutonomousSessionService {
   // have no conversation to return to. Registered in the SAME transaction as the session, not a
   // moment later: a session that finishes quickly between the two writes would finish unwatched, and
   // the sessions most worth waking for are not always the slow ones.
-  async start({ projectId, intent, mode = "AUTO", maximumCost = null, maxAttempts = 3, hermesSessionId = null }) {
+  async start({ projectId, intent, mode = "AUTO", maximumCost = null, maxAttempts = 3,
+    hermesSessionId = null, branch = null, expectedBaseSha = null }) {
     if (!SESSION_MODES.includes(mode)) throw new Error(`Unknown autonomy mode: ${mode}`);
     if (typeof intent !== "string" || !intent.trim()) throw new Error("intent must be a non-empty string");
+    // Refused here rather than at the Git boundary: a branch named with stray whitespace or a
+    // half-typed SHA is a caller mistake, and the cheapest place to say so is before a root job,
+    // a session row and a watch registration exist.
+    if (branch !== null && (typeof branch !== "string" || !branch.trim() || /\s/.test(branch))) {
+      throw new Error("branch must be a non-empty branch name with no whitespace");
+    }
+    if (expectedBaseSha !== null && !/^[0-9a-f]{40}$/.test(String(expectedBaseSha))) {
+      throw new Error("expected_base_sha must be a full 40-character commit sha");
+    }
     if (hermesSessionId !== null && (typeof hermesSessionId !== "string" || !hermesSessionId.trim())) {
       throw new Error("hermesSessionId must be null or a non-empty string");
     }
@@ -101,6 +147,8 @@ export class AutonomousSessionService {
       strategy: "managed",
       mode: policy.mayWrite ? "write" : "read",
       maxAttempts,
+      targetBranch: branch,
+      expectedBaseSha,
       ...(maximumCost === null ? {} : { maximumCost }),
     });
 
@@ -114,7 +162,8 @@ export class AutonomousSessionService {
       if (watchedSessionId) registerWatch(this.db, sessionId, watchedSessionId);
       recordEvent(this.db, {
         kind: "AUTONOMOUS_SESSION_STARTED", entityType: "job", entityId: job.id,
-        payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(watchedSessionId) },
+        payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(watchedSessionId),
+          targetBranch: job.target_branch, baseSha: job.base_sha },
       });
     });
     this.bootstrapping.add(sessionId);
@@ -135,6 +184,7 @@ export class AutonomousSessionService {
     }
     const settled = this.get(sessionId);
     return { session_id: sessionId, state: settled.state, job_id: job.id, mode,
+      target_branch: job.target_branch, base_sha: job.base_sha,
       watched: Boolean(watchedSessionId), ...(settled.outcome ? { outcome: settled.outcome } : {}) };
   }
 
@@ -188,6 +238,22 @@ export class AutonomousSessionService {
       throw new Error(`Session ${sessionId} is being terminally closed`);
     }
     if (typeof text !== "string" || !text.trim()) throw new Error("answer must be a non-empty string");
+    const boundJob = this.dispatcher.getJob(session.job_id);
+    // Checked BEFORE anything durable is written, so a refused answer leaves the session exactly as
+    // it was: still WAITING_FOR_HERMES, still bound, still an intact witness of the open question.
+    const conflict = conflictingWorldInAnswer(text, {
+      targetBranch: boundJob.target_branch,
+      baseSha: boundJob.base_sha,
+      repoPath: this.dispatcher.getProject(boundJob.project_id)?.repo_path ?? null,
+    });
+    if (conflict) {
+      throw new Error(
+        `Session ${sessionId} is bound to ${boundJob.target_branch}@${boundJob.base_sha.slice(0, 12)} `
+        + `and that binding is immutable; this answer names ${conflict.named}. A clarification cannot `
+        + `move a session to another ${conflict.kind === "base" ? "base" : "branch"}: fail this session `
+        + `and start a new one bound to the intended world.`,
+      );
+    }
     const open = this.db.prepare(
       `SELECT * FROM autonomous_session_messages
        WHERE session_id = ? AND direction = 'TO_HERMES' AND answered_by IS NULL
@@ -207,7 +273,8 @@ export class AutonomousSessionService {
       this.setState(sessionId, { state: "WORKING" });
       recordEvent(this.db, {
         kind: "AUTONOMOUS_SESSION_ANSWERED", entityType: "job", entityId: session.job_id,
-        payload: { sessionId, question: open.body.slice(0, 300), answer: text.slice(0, 300) },
+        payload: { sessionId, question: open.body.slice(0, 300), answer: text.slice(0, 300),
+          targetBranch: boundJob.target_branch, baseSha: boundJob.base_sha },
       });
     });
 
@@ -218,7 +285,9 @@ export class AutonomousSessionService {
     // purpose -- it holds the intent the question was derived from -- so an answer returns the run to
     // work rather than leaving it waiting for a person who has already been represented.
     this.manager.resumeFromEscalation(session.job_id, { reason: "answered by Hermes" });
-    return { session_id: sessionId, state: "WORKING" };
+    return { session_id: sessionId, state: "WORKING",
+      target_branch: boundJob.target_branch, base_sha: boundJob.base_sha,
+      binding_immutable: true };
   }
 
   // A typed terminal decision, never inferred from clarification prose. Fence the

@@ -185,21 +185,26 @@ export class Dispatcher {
   // Transaction-internal job insert. Callers MUST already hold a transaction; this exists so that
   // job creation can be committed atomically together with whatever authorized it.
   insertJobRow({
-    projectId, goal, mode, maxAttempts, baseSha, maximumCost = null, capabilityProfile = null,
+    projectId, goal, mode, maxAttempts, baseSha, targetBranch, maximumCost = null, capabilityProfile = null,
     strategy = "direct", parentJobId = null, internalKind = null,
   }) {
+    // The one place a job row is written, and therefore the one place worth enforcing that every
+    // job carries the branch it was rooted on. Nothing downstream is allowed to guess it.
+    if (typeof targetBranch !== "string" || !targetBranch) {
+      throw new Error("insertJobRow requires a resolved target_branch");
+    }
     const jobId = id("job");
     const timestamp = now();
     this.db.prepare(`INSERT INTO jobs(
-      id, project_id, goal, mode, status, base_sha, max_attempts, maximum_cost,
+      id, project_id, goal, mode, status, base_sha, target_branch, max_attempts, maximum_cost,
       capability_profile, strategy, parent_job_id, internal_kind, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      jobId, projectId, goal, mode, baseSha, maxAttempts, maximumCost,
+    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      jobId, projectId, goal, mode, baseSha, targetBranch, maxAttempts, maximumCost,
       capabilityProfile, strategy, parentJobId, internalKind, timestamp, timestamp,
     );
     recordEvent(this.db, {
       kind: "JOB_CREATED", entityType: "job", entityId: jobId,
-      payload: { baseSha, mode, strategy, parentJobId, internalKind },
+      payload: { baseSha, targetBranch, mode, strategy, parentJobId, internalKind },
     });
     return this.getJob(jobId);
   }
@@ -207,6 +212,7 @@ export class Dispatcher {
   async createJob({
     projectId, goal, mode = "write", maxAttempts = 2, maximumCost = null, capabilityProfile = null,
     strategy = "direct", parentJobId = null, internalKind = null,
+    targetBranch = null, expectedBaseSha = null,
   }) {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
@@ -250,14 +256,25 @@ export class Dispatcher {
     // This is also the premise assertAuthorizedBaseIntact() relies on when it skips children: they
     // are not independently authorized, so there is nothing of their own to re-check.
     const parent = parentJobId ? this.getJob(parentJobId) : null;
+    if (parent && (targetBranch !== null || expectedBaseSha !== null)) {
+      throw new Error("A child job inherits target_branch and base_sha; they may not be overridden");
+    }
+    // The project default applies at ROOT CREATION ONLY. A child inherits whatever its root was
+    // bound to; a root given no branch adopts the default once, and permanently.
+    const boundBranch = parent ? parent.target_branch : (targetBranch || project.integration_branch);
     const baseSha = parent
       ? parent.base_sha
-      : await resolveRevision(project.repo_path, project.integration_branch);
+      : await resolveRevision(project.repo_path, boundBranch);
+    if (!parent && expectedBaseSha !== null && expectedBaseSha !== baseSha) {
+      throw new Error(
+        `Branch ${boundBranch} is at ${baseSha} but expected_base_sha requires ${expectedBaseSha}`,
+      );
+    }
     // Validated at creation, so an unusable profile is refused when the job is described rather
     // than discovered when a worker is about to run.
     if (capabilityProfile) capabilityProfileSpec(capabilityProfile);
     return transaction(this.db, () => this.insertJobRow({
-      projectId, goal, mode, maxAttempts, baseSha, maximumCost, capabilityProfile,
+      projectId, goal, mode, maxAttempts, baseSha, targetBranch: boundBranch, maximumCost, capabilityProfile,
       strategy, parentJobId, internalKind,
     }));
   }
@@ -391,10 +408,10 @@ export class Dispatcher {
       "SELECT COUNT(*) AS count FROM attempts WHERE job_id = ?",
     ).get(job.id).count;
     if (previousAttempts > 0) return null;
-    const head = await resolveRevision(project.repo_path, project.integration_branch);
+    const head = await resolveRevision(project.repo_path, job.target_branch);
     if (head !== job.base_sha) {
       throw new Error(
-        `Job ${job.id} was authorized against ${job.base_sha.slice(0, 12)} but ${project.integration_branch} `
+        `Job ${job.id} was authorized against ${job.base_sha.slice(0, 12)} but ${job.target_branch} `
         + `is now at ${head.slice(0, 12)}; refusing to start paid work against a different base`,
       );
     }
@@ -479,9 +496,13 @@ export class Dispatcher {
       // The proposal's cost ceiling becomes the job's enforced ceiling: a bound Hermes stated is a
       // bound the scheduler keeps, not a note. Its strategy travels the same way -- a managed
       // proposal must produce a managed job, or the operator authorized one thing and got another.
+      // The proposal path has always been project-default-scoped: `baseSha` above was resolved
+      // from the project's integration branch, so that is the branch this job is bound to. Recorded
+      // explicitly rather than left null, because every read site now trusts the column.
       const job = this.insertJobRow({
         strategy: proposal.strategy ?? "direct",
         projectId: proposal.project_id, goal: proposal.goal, mode: proposal.mode, maxAttempts, baseSha,
+        targetBranch: project.integration_branch,
         maximumCost: proposal.maximum_cost,
       });
       this.db.prepare(`INSERT INTO work_proposal_decisions(
@@ -3045,14 +3066,17 @@ export class Dispatcher {
       : this.soleCandidate(jobId);
     if (!candidate.result_commit) throw new Error(`Candidate attempt ${candidate.id} has no result commit`);
     const project = this.getProject(job.project_id);
-    const expectedHead = await resolveRevision(project.repo_path, project.integration_branch);
+    // The job's bound branch, not the project's current default: advancing a branch the work was
+    // never based on is the same defect as starting the work there.
+    const targetBranch = job.target_branch;
+    const expectedHead = await resolveRevision(project.repo_path, targetBranch);
     const planCommands = parseValidationPlan(project.validation_json);
     const planJson = JSON.stringify(planCommands);
     const planDigest = this.planDigest(planCommands);
     const digest = this.actionDigest({
       projectId: project.id, jobId, attemptId: candidate.id,
       baseSha: job.base_sha, candidateCommit: candidate.result_commit,
-      integrationBranch: project.integration_branch, expectedHead, planDigest,
+      integrationBranch: targetBranch, expectedHead, planDigest,
     });
     return transaction(this.db, () => {
       const existing = this.db.prepare("SELECT * FROM integration_proposals WHERE attempt_id = ?").get(candidate.id);
@@ -3073,7 +3097,7 @@ export class Dispatcher {
         state, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)`).run(
         proposalId, project.id, jobId, candidate.id, job.base_sha, candidate.result_commit,
-        project.integration_branch, expectedHead, planJson, planDigest, digest, timestamp, timestamp,
+        targetBranch, expectedHead, planJson, planDigest, digest, timestamp, timestamp,
       );
       recordEvent(this.db, {
         kind: "INTEGRATION_PROPOSED", entityType: "proposal", entityId: proposalId,

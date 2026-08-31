@@ -98,7 +98,10 @@ export class SafeIntegrator {
 
   // Builds and proves the integrated tree, without going near the real branch.
   async prepare({ job, project, candidate, sessionId = null, attemptNumber = 1 }) {
-    const targetRef = project.integration_branch;
+    // The branch this job was bound to at creation, which every later step reads back off the
+    // staged row. Resolving the project's current default here would publish a session's work onto
+    // a branch it was never based on -- the failure this whole binding exists to make impossible.
+    const targetRef = job.target_branch;
     const observed = await resolveRevision(project.repo_path, targetRef);
 
     const attemptId = id("sint");

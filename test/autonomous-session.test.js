@@ -457,6 +457,61 @@ test("a mode is a permission envelope, and every mode has one", () => {
   assert.throws(() => modePolicy("NONSENSE"), /Unknown autonomy mode/);
 });
 
+test("session_start immutably binds an explicit branch and expected base", async (t) => {
+  const { boot, projectId, repo } = await world(t);
+  await runProcess("git", ["-C", repo, "checkout", "-b", "codex/live-work-ui"]);
+  fs.writeFileSync(path.join(repo, "feature.txt"), "feature\n");
+  await runProcess("git", ["-C", repo, "add", "feature.txt"]);
+  await runProcess("git", ["-C", repo, "commit", "-m", "feature"]);
+  const featureHead = (await runProcess("git", ["-C", repo, "rev-parse", "HEAD"])).stdout.trim();
+  await runProcess("git", ["-C", repo, "checkout", "main"]);
+
+  const { dispatcher, sessions } = boot([]);
+  const started = await sessions.start({
+    projectId, intent: "change the feature branch", mode: "MANUAL",
+    branch: "codex/live-work-ui", expectedBaseSha: featureHead,
+  });
+  const root = dispatcher.getJob(started.job_id);
+  assert.equal(root.target_branch, "codex/live-work-ui");
+  assert.equal(root.base_sha, featureHead);
+  assert.equal(started.target_branch, "codex/live-work-ui");
+  assert.equal(started.base_sha, featureHead);
+
+  const child = await dispatcher.createJob({
+    projectId, goal: "inspect bound world", mode: "read", parentJobId: root.id,
+    internalKind: "MANAGER_EXPLORATION",
+  });
+  assert.equal(child.target_branch, root.target_branch);
+  assert.equal(child.base_sha, root.base_sha);
+});
+
+test("session_start refuses an expected base mismatch before creating durable work", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, sessions } = boot([]);
+  const before = dispatcher.db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count;
+  await assert.rejects(
+    sessions.start({ projectId, intent: "wrong world", branch: "main", expectedBaseSha: "0".repeat(40) }),
+    /expected_base_sha requires/,
+  );
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count, before);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) AS count FROM autonomous_sessions").get().count, 0);
+});
+
+test("bound branch movement is refused before first paid work", async (t) => {
+  const { boot, projectId, repo } = await world(t);
+  const { dispatcher } = boot([]);
+  const job = await dispatcher.createJob({ projectId, goal: "bound work", targetBranch: "main" });
+  fs.writeFileSync(path.join(repo, "moved.txt"), "moved\n");
+  await runProcess("git", ["-C", repo, "add", "moved.txt"]);
+  await runProcess("git", ["-C", repo, "commit", "-m", "move main"]);
+  await assert.rejects(
+    dispatcher.assertAuthorizedBaseIntact(job, dispatcher.getProject(projectId)),
+    /refusing to start paid work/,
+  );
+  assert.equal(dispatcher.getJob(job.id).target_branch, "main");
+  assert.equal(dispatcher.getJob(job.id).base_sha, job.base_sha);
+});
+
 test("session_start returns immediately and does not wait for a worker", async (t) => {
   const { boot, projectId } = await world(t);
   const { sessions } = boot([]);
@@ -1122,4 +1177,52 @@ test("no session starves behind sessions that cannot progress", async (t) => {
   for (const id of ids) {
     assert.ok(reached.has(id), `${id} never reached a slot: it starved behind the others`);
   }
+});
+
+test("a clarification cannot rebase a session onto another world", async (t) => {
+  const { boot, projectId, repo } = await world(t);
+  const { dispatcher, sessions } = boot([
+    { action: "ESCALATE", reason: "the branch is ambiguous", question: "Which branch should this land on?" },
+    { action: "IMPLEMENT", reason: "proceeding on the bound branch", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  const started = await sessions.start({ projectId, intent: "Fix the export bug", mode: "AUTO" });
+  const asked = await sessions.tick(started.session_id);
+  assert.equal(asked.state, "waiting_for_hermes");
+  const job = dispatcher.getJob(started.job_id);
+  assert.equal(job.target_branch, "main");
+
+  // The exact shape of the incident: Hermes answers the branch question with a DIFFERENT branch,
+  // as though prose could move a session that was already rooted somewhere else.
+  assert.throws(
+    () => sessions.answer(started.session_id, "Use codex/live-work-ui for this, not the default."),
+    (error) => /bound to main@/.test(error.message) && /start a new one/.test(error.message),
+  );
+  // A commit that is not the bound base is the same claim in numbers.
+  assert.throws(
+    () => sessions.answer(started.session_id, `Base it on ${"f".repeat(40)} instead.`),
+    /bound to main@/,
+  );
+
+  // Refused BEFORE anything durable: the session is still the witness it was, still asking, with no
+  // answer recorded and nothing for the manager to resume from.
+  assert.equal(sessions.poll(started.session_id).state, "waiting_for_hermes");
+  assert.equal(
+    dispatcher.db.prepare(
+      "SELECT COUNT(*) AS count FROM autonomous_session_messages WHERE session_id = ? AND direction = 'FROM_HERMES'",
+    ).get(started.session_id).count,
+    0,
+  );
+  assert.equal(dispatcher.getJob(started.job_id).target_branch, job.target_branch);
+  assert.equal(dispatcher.getJob(started.job_id).base_sha, job.base_sha);
+
+  // And the guard stays narrow. A path-shaped token that names something the repository actually
+  // contains is ordinary prose about the code, not a branch, and must not block a real answer.
+  fs.mkdirSync(path.join(repo, "export", "layer"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "export", "layer", "index.js"), "// route Z\n");
+  sessions.answer(started.session_id, "Stay where you are. Take the export/layer route.");
+  assert.equal(sessions.poll(started.session_id).state, "working");
+  const clarifications = sessions.clarifications(started.session_id);
+  assert.equal(clarifications.length, 1);
+  assert.match(clarifications[0].answer, /export\/layer/);
 });

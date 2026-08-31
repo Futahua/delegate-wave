@@ -20,6 +20,9 @@ test("Hermes contracts reject control-plane work and route terminal intent throu
   assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /ESCALATE before\s+commissioning any worker/);
   assert.match(MANAGER_SYSTEM_INSTRUCTIONS, /Shell access is not an OS sandbox/);
   assert.match(tools.find((tool) => tool.name === "session_answer").description, /Clarification only.*session_fail/);
+  assert.match(tools.find((tool) => tool.name === "session_answer").description, /branch and base are immutable/);
+  assert.ok(start.inputSchema.properties.branch);
+  assert.ok(start.inputSchema.properties.expected_base_sha);
   const fail = tools.find((tool) => tool.name === "session_fail");
   assert.equal(fail.inputSchema.properties.reason.maxLength, 2000);
   assert.equal(fail.inputSchema.additionalProperties, false);
@@ -27,6 +30,19 @@ test("Hermes contracts reject control-plane work and route terminal intent throu
     { [CALLER_META_KEY]: "owner" }), { state: "FAILED" });
   assert.equal(calls[0][0], "/v1/sessions/s%2F1/fail");
   assert.deepEqual(calls[0][1], { reason: "prerequisites impossible", hermesSessionId: "owner" });
+});
+
+test("session_start carries structured branch and expected base through MCP", async () => {
+  const calls = [];
+  const adapter = new HermesMcpAdapter({ client: { post: async (...args) => { calls.push(args); return {}; } } });
+  await adapter.callTool("session_start", {
+    project_id: "p", intent: "change feature", mode: "MANUAL",
+    branch: "codex/live-work-ui", expected_base_sha: "a".repeat(40),
+  }, { [CALLER_META_KEY]: "owner" });
+  assert.deepEqual(calls[0][1], {
+    projectId: "p", intent: "change feature", mode: "MANUAL", maximumCost: null,
+    branch: "codex/live-work-ui", expectedBaseSha: "a".repeat(40), hermesSessionId: "owner",
+  });
 });
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

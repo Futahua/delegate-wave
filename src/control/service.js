@@ -253,6 +253,8 @@ export class ControlService {
         intent: args.intent,
         mode: args.mode || "AUTO",
         maximumCost: args.maximumCost ?? null,
+        branch: args.branch ?? null,
+        expectedBaseSha: args.expectedBaseSha ?? null,
         // The conversation to come back to when this finishes or gets stuck. Carried, never
         // invented: a caller with no conversation gets a session that nobody is waiting on, which is
         // the correct outcome rather than a degraded one.

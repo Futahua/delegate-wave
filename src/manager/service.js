@@ -433,6 +433,7 @@ export class ManagerService {
     const pack = buildPlanEvidence({
       objective: job.goal,
       baseSha: job.base_sha,
+      targetBranch: job.target_branch,
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       workerCapabilities: this.workerCapabilities(job),
@@ -705,6 +706,7 @@ export class ManagerService {
     const pack = buildPlanEvidence({
       objective: job.goal,
       baseSha: job.base_sha,
+      targetBranch: job.target_branch,
       validationCommands: JSON.parse(project.validation_json || "[]"),
       protectedPaths: JSON.parse(project.protected_json || "[]"),
       explorations: reports,
