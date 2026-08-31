@@ -97,6 +97,133 @@ async function world(t) {
   return { boot, projectId: project.id, repo, root };
 }
 
+test("manager bootstrap failure atomically closes session and root with evidence", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, manager, sessions } = boot([]);
+  manager.backend.startRun = async () => { throw new Error("invalid service_tier configuration"); };
+  const result = await sessions.start({ projectId, intent: "inspect this repository" });
+  assert.equal(result.state, "FAILED");
+  assert.match(result.outcome, /MANAGER_BOOTSTRAP_FAILED.*invalid service_tier/);
+  assert.equal(dispatcher.getJob(result.job_id).status, "FAILED");
+  assert.equal(manager.getRun(result.job_id), null);
+  await sessions.tick(result.session_id);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM attempts").get().c, 0);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM events WHERE kind = 'MANAGER_BOOTSTRAP_FAILED'").get().c, 1);
+});
+
+test("driver cannot advance a session while start is bootstrapping its manager", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { manager, sessions } = boot([]);
+  const original = manager.backend.startRun.bind(manager.backend);
+  let release;
+  let entered;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ready = new Promise((resolve) => { entered = resolve; });
+  let calls = 0;
+  manager.backend.startRun = async () => { calls += 1; entered(); await gate; return original(); };
+  const starting = sessions.start({ projectId, intent: "inspect" });
+  await ready;
+  try {
+    const session = sessions.db.prepare("SELECT * FROM autonomous_sessions").get();
+    await sessions.tick(session.id);
+    assert.equal(calls, 1);
+    assert.equal(sessions.db.prepare("SELECT COUNT(*) c FROM manager_turns").get().c, 0);
+  } finally { release(); }
+  assert.equal((await starting).state, "WORKING");
+});
+
+test("session_fail closes queued family and manager; later ticks and answers cannot resume", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, manager, sessions } = boot([
+    { action: "ESCALATE", reason: "prerequisites missing", question: "What now?" },
+  ]);
+  const started = await sessions.start({ projectId, intent: "inspect" });
+  const authority = { principal: "hermes", origin: "mcp" };
+  await assert.rejects(sessions.fail(started.session_id, "stop", authority), /WAITING_FOR_HERMES/);
+  await sessions.tick(started.session_id);
+  const children = [];
+  for (const goal of ["A", "B"]) children.push(await dispatcher.createJob({
+    projectId, goal, mode: "read", parentJobId: started.job_id, internalKind: "MANAGER_EXPLORATION",
+  }));
+  const run = manager.getRun(started.job_id);
+  dispatcher.commissionWork({ jobId: started.job_id, managerRunId: run.id, action: "IMPLEMENT" });
+  await assert.rejects(sessions.fail(started.session_id, " ", authority), /non-empty/);
+  await assert.rejects(sessions.fail(started.session_id, "stop"), /identity/);
+  const turns = manager.turns(run.id).length;
+  assert.equal((await sessions.fail(started.session_id, "prerequisites impossible", authority)).state, "FAILED");
+  assert.equal(dispatcher.getJob(started.job_id).status, "FAILED");
+  for (const child of children) assert.equal(dispatcher.getJob(child.id).status, "CANCELLED");
+  assert.equal(manager.getRun(started.job_id).status, "FAILED");
+  assert.equal(dispatcher.openCommission(started.job_id), null);
+  for (let tick = 0; tick < 3; tick += 1) await sessions.tick(started.session_id);
+  assert.equal(manager.turns(run.id).length, turns);
+  assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM attempts").get().c, 0);
+  assert.throws(() => sessions.answer(started.session_id, "continue"), /not waiting/);
+});
+
+test("session_fail fences a live family attempt and blocks clarification during cancellation", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, manager, sessions } = boot([
+    { action: "ESCALATE", reason: "blocked", question: "Proceed?" },
+  ]);
+  const started = await sessions.start({ projectId, intent: "inspect" });
+  await sessions.tick(started.session_id);
+  const child = await dispatcher.createJob({ projectId, goal: "read", mode: "read",
+    parentJobId: started.job_id, internalKind: "MANAGER_EXPLORATION" });
+  let release;
+  let entered;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ready = new Promise((resolve) => { entered = resolve; });
+  dispatcher.backend = new FakeBackend(async () => {
+    entered(); await gate; return { exitCode: 0, stdout: "late result", stderr: "" };
+  });
+  const running = dispatcher.runJob(child.id);
+  try {
+    await ready;
+    const failing = sessions.fail(started.session_id, "prerequisites impossible", { principal: "hermes", origin: "test" });
+    assert.throws(() => sessions.answer(started.session_id, "resume"), /terminally closed/);
+    await failing;
+    assert.equal(dispatcher.familyHasLiveAttempt(started.job_id), false);
+    assert.equal(dispatcher.getJob(child.id).status, "CANCELLED");
+    release();
+    await running;
+    assert.equal(dispatcher.db.prepare("SELECT terminal_state FROM attempts WHERE job_id = ?").get(child.id).terminal_state, "CANCELLED");
+    await sessions.tick(started.session_id);
+    assert.equal(manager.turns(manager.getRun(started.job_id).id).length, 1);
+    assert.equal(sessions.get(started.session_id).state, "FAILED");
+  } finally { release(); await running; }
+});
+
+test("nonterminal autonomous sessions block retirement regardless of root job status", async (t) => {
+  const { boot, projectId } = await world(t);
+  const { dispatcher, sessions } = boot([]);
+  const started = await sessions.start({ projectId, intent: "inspect" });
+  const args = { projectId, principal: "operator", origin: "test" };
+  assert.equal(dispatcher.getJob(started.job_id).status, "PENDING");
+  for (const state of ["WORKING", "WAITING_FOR_HERMES", "SEMANTICALLY_ACCEPTED"]) {
+    sessions.setState(started.session_id, { state });
+    assert.throws(() => dispatcher.retireProject(args), /autonomous session.*nonterminal/);
+  }
+  sessions.setState(started.session_id, { state: "FAILED" });
+  assert.equal(dispatcher.retireProject(args).retired, true);
+});
+
+test("registration reserves real repository identity including retired projects", async (t) => {
+  const { boot, projectId, repo } = await world(t);
+  const { dispatcher } = boot([]);
+  const alias = path.join(path.dirname(repo), "repo-alias");
+  fs.symlinkSync(repo, alias, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(dispatcher.addProject({ name: "alias", repoPath: alias }), /already registered/);
+  const args = { projectId, principal: "operator", origin: "test" };
+  dispatcher.retireProject(args);
+  await assert.rejects(dispatcher.addProject({ name: "clone", repoPath: repo }), /restore that retired project/);
+  if (process.platform === "win32") {
+    await assert.rejects(dispatcher.addProject({ name: "cased clone", repoPath: repo.toUpperCase() }), /restore that retired project/);
+  }
+  assert.equal(dispatcher.restoreProject(args).project.id, projectId);
+  assert.equal(dispatcher.listProjects().length, 1);
+});
+
 test("a mode is a permission envelope, and every mode has one", () => {
   // If a mode ever gains a "which step comes next" field, this is where it will show up.
   // Every field must be a PERMISSION -- something the session may or may not do. The day one is

@@ -35,6 +35,7 @@ export const ROUTES = Object.freeze([
   { method: "GET", pattern: /^\/v1\/sessions$/, command: "session.list", scope: SCOPES.READ },
   { method: "GET", pattern: /^\/v1\/sessions\/([^/]+)\/timeline$/, command: "session.timeline", params: ["sessionId"], scope: SCOPES.READ },
   { method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/answer$/, command: "session.answer", params: ["sessionId"], mutation: true, scope: SCOPES.SESSION },
+  { method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/fail$/, command: "session.fail", params: ["sessionId"], mutation: true, scope: SCOPES.SESSION },
   { method: "POST", pattern: /^\/v1\/sessions\/([^/]+)\/tick$/, command: "session.tick", params: ["sessionId"], mutation: true, scope: SCOPES.SESSION },
   { method: "GET", pattern: /^\/v1\/overview$/, command: "overview", scope: SCOPES.READ },
   { method: "GET", pattern: /^\/v1\/projects$/, command: "project.list", scope: SCOPES.READ },

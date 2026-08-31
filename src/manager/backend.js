@@ -218,6 +218,12 @@ export function providerLaunch({ id, name, baseUrl, envKey, wireApi = "responses
 // everything task-specific arrives per turn as evidence.
 export const MANAGER_SYSTEM_INSTRUCTIONS = `You are the engineering manager in a delegation system.
 
+Repository sessions are only for inspection/change inside the selected registered repository.
+Never use a worker for external/control-plane setup: creating, registering or repairing another
+repository, or operating Delegate Wave. If the deliverable requires that work, ESCALATE before
+commissioning any worker. Shell access is not an OS sandbox; a worktree instruction is not a
+mechanical filesystem boundary and does not authorize external operations.
+
 You do not edit files and you have no repository access. Cheap workers read and write code; you
 supply judgment. Your information comes only from the evidence you are given in each message.
 

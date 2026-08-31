@@ -10,6 +10,8 @@ import { FakeBackend } from "../src/backend.js";
 import { Dispatcher } from "../src/service.js";
 import { FakeManagerBackend } from "../src/manager/backend.js";
 import { ManagerService } from "../src/manager/service.js";
+import { AutonomousSessionService } from "../src/session/service.js";
+import { SessionDriver } from "../src/session/driver.js";
 import { runProcess } from "../src/process.js";
 
 async function command(name, args, cwd) {
@@ -86,6 +88,69 @@ async function fixture(t, script, options = {}) {
   });
   return { dispatcher, service, project, job, repo, received };
 }
+
+test("scheduler contention reconciles the same exploration round without spending turns", async (t) => {
+  const { dispatcher, service, project } = await fixture(t, [
+    { action: "EXPLORE", reason: "need evidence", explorations: [
+      { question: "A", deliver: ["files"] }, { question: "B", deliver: ["tests"] },
+    ] },
+    { action: "IMPLEMENT", reason: "evidence ready", brief: BRIEF() },
+    { action: "ACCEPT", reason: "done" },
+  ]);
+  const sessions = new AutonomousSessionService({ dispatcher, manager: service });
+  const session = await sessions.start({ projectId: project.id, intent: "add a totals file", mode: "MANUAL" });
+  const job = dispatcher.getJob(session.job_id);
+  const errors = [];
+  const driver = new SessionDriver({ sessions, onError: (error) => errors.push(error) });
+  const tick = async () => {
+    driver.pass();
+    const deadline = Date.now() + 10_000;
+    while (driver.inFlight.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(driver.inFlight.size, 0, "driver tick must yield after scheduler contention");
+    assert.deepEqual(errors, []);
+  };
+  const backend = dispatcher.backend;
+  let release;
+  let entered;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { entered = resolve; });
+  dispatcher.backend = new FakeBackend(async () => {
+    entered();
+    await gate;
+    return { exitCode: 0, stdout: "read complete", stderr: "" };
+  });
+  const blocker = await dispatcher.createJob({ projectId: project.id, goal: "unrelated read", mode: "read" });
+  const running = dispatcher.runJob(blocker.id);
+  try {
+    await started;
+    dispatcher.backend = backend;
+    const children = () => dispatcher.db.prepare("SELECT id FROM jobs WHERE parent_job_id = ? ORDER BY id").all(job.id);
+    await tick();
+    const original = children();
+    assert.equal(original.length, 2);
+    for (let pass = 0; pass < 2; pass += 1) await tick();
+    assert.deepEqual(children(), original);
+    const run = service.getRun(job.id);
+    assert.equal(run.status, "EXPLORING");
+    assert.equal(run.exploration_round, 1);
+    assert.equal(service.turns(run.id).length, 1);
+    for (const child of original) {
+      assert.equal(dispatcher.getJob(child.id).status, "PENDING");
+      assert.equal(dispatcher.db.prepare("SELECT COUNT(*) c FROM attempts WHERE job_id = ?").get(child.id).c, 0);
+      assert.throws(() => dispatcher.assertAdmissible(child.id), (error) => error.code === "SCHEDULER_BUSY" && error.retryable);
+    }
+    release();
+    await running;
+    await tick();
+    assert.deepEqual(children(), original);
+    assert.equal(service.getRun(job.id).status, "ACCEPTED");
+    assert.deepEqual(service.turns(run.id).map((turn) => turn.phase), ["PLAN", "SYNTHESIS", "REVIEW"]);
+    for (const child of original) assert.equal(dispatcher.getJob(child.id).status, "SUCCEEDED");
+  } finally {
+    release();
+    await running;
+  }
+});
 
 test("an exploration child inherits the root's authorized base, not the current branch", async (t) => {
   const { dispatcher, job, repo } = await fixture(t, []);

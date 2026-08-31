@@ -74,6 +74,26 @@ async function fixture(t, overrides = {}, root = null) {
   };
 }
 
+test("session.fail is session-scoped, identity-bound and idempotent over HTTP", async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  f.service.sessions = { fail: async (...args) => { calls.push(args); return { session_id: args[0], state: "FAILED" }; } };
+  const observer = new ControlClient({ baseUrl: f.url, token: f.observerToken });
+  await assert.rejects(observer.post("/v1/sessions/s1/fail", { reason: "stop" }, requestId()), /scope|forbidden/i);
+  const hermes = new ControlClient({ baseUrl: f.url, token: f.proposerToken });
+  const id = requestId();
+  const body = { reason: "prerequisites impossible" };
+  const first = await hermes.post("/v1/sessions/s1/fail", body, id);
+  assert.deepEqual(await hermes.post("/v1/sessions/s1/fail", body, id), first);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "s1");
+  assert.equal(calls[0][1], body.reason);
+  assert.ok(calls[0][2].principal);
+  assert.ok(calls[0][2].origin);
+  await assert.rejects(hermes.post("/v1/sessions/s1/fail", { ...body, principal: "operator" }, requestId()), /may not set principal/);
+  assert.equal(calls.length, 1);
+});
+
 test("duplicate and concurrent request IDs produce one durable side effect", async (t) => {
   let calls = 0;
   const f = await fixture(t, {

@@ -84,10 +84,12 @@ const TOOLS = Object.freeze([
   },
   {
     name: "session_start",
-    description: "Start an autonomous coding session and return immediately. delegate-wave "
+    description: "Start an autonomous coding session after manager initialization, without waiting for workers. delegate-wave "
       + "investigates, implements, validates, reviews and -- in the modes that permit it -- safely "
       + "integrates, on its own. Poll for progress; it may come back with a question only a person "
-      + "who knows the original request can answer.",
+      + "who knows the original request can answer. Only for inspection/change inside the selected "
+      + "registered repository. Never use it for external/control-plane setup: creating, registering "
+      + "or repairing another repository, or operating Delegate Wave. Report missing prerequisites instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -126,11 +128,22 @@ const TOOLS = Object.freeze([
   {
     name: "session_answer",
     description: "Answer the question a waiting session is asking, from the original conversation "
-      + "with the user. The answer becomes durable evidence and the work continues.",
+      + "with the user. The answer becomes durable evidence and the work continues. Clarification only: "
+      + "do not encode cancellation or terminal state in prose; use session_fail for terminal intent.",
     inputSchema: {
       type: "object",
       properties: { session_id: { type: "string" }, answer: { type: "string" } },
       required: ["session_id", "answer"],
+    },
+  },
+  {
+    name: "session_fail",
+    description: "Terminally fail a session only while it is WAITING_FOR_HERMES. Cancels/fences its "
+      + "job family and stops its manager; does not dispatch work or grant operational authority.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" }, reason: { type: "string", minLength: 1, maxLength: 2000 } },
+      required: ["session_id", "reason"], additionalProperties: false,
     },
   },
   {
@@ -238,6 +251,12 @@ export class HermesMcpAdapter {
         `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/answer`,
         { answer: requiredString(args, "answer") },
         `req_${randomUUID()}`,
+      );
+    }
+    if (name === "session_fail") {
+      return this.client.post(
+        `/v1/sessions/${encodeURIComponent(requiredString(args, "session_id"))}/fail`,
+        { reason: requiredString(args, "reason") }, `req_${randomUUID()}`,
       );
     }
     if (name === "propose_work") {

@@ -11,7 +11,7 @@ export const MUTATION_COMMANDS = new Set([
   "work.propose", "work.proposal.authorize", "work.proposal.reject", "job.cancel",
   "backup.create", "backup.restore", "restore.resolve", "integration.rollback", "job.advance", "integration.approve",
   "integration.decline", "project.retire", "project.restore",
-  "session.start", "session.answer", "session.tick",
+  "session.start", "session.answer", "session.fail", "session.tick",
 ]);
 
 function canonical(value) {
@@ -247,6 +247,9 @@ export class ControlService {
         hermesSessionId: args.hermesSessionId ?? null,
       }),
       "session.answer": () => this.sessions.answer(args.sessionId, args.answer),
+      "session.fail": () => this.sessions.fail(args.sessionId, args.reason, {
+        principal: context.principalId, origin: context.originChannel,
+      }),
       "session.tick": () => this.sessions.tick(args.sessionId),
       "backup.create": () => this.dispatcher.backup(args.label || "manual"),
       // Clears the unresolved-restore condition; only a person can say the truths agree again.

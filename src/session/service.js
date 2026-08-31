@@ -70,9 +70,10 @@ export class AutonomousSessionService {
     // Optional so the session layer can be exercised without any integration authority at all.
     this.integrator = integrator;
     this.db = dispatcher.db;
+    this.bootstrapping = new Set();
   }
 
-  // Accepts the task and returns. Nothing is waited for.
+  // Bootstrap configuration/thread before returning; never wait for worker execution.
   //
   // `hermesSessionId` is the conversation this request came from, and the only thread back to it.
   //
@@ -116,7 +117,25 @@ export class AutonomousSessionService {
         payload: { sessionId, mode, intent: intent.slice(0, 400), watched: Boolean(watchedSessionId) },
       });
     });
-    return { session_id: sessionId, state: "WORKING", job_id: job.id, mode, watched: Boolean(watchedSessionId) };
+    this.bootstrapping.add(sessionId);
+    try {
+      await this.manager.ensureRun(job.id);
+    } catch (error) {
+      transaction(this.db, () => {
+        const outcome = `MANAGER_BOOTSTRAP_FAILED: ${error.message}`;
+        this.db.prepare("UPDATE jobs SET status = 'FAILED', updated_at = ? WHERE id = ?").run(now(), job.id);
+        this.setState(sessionId, { state: "FAILED", outcome });
+        recordEvent(this.db, {
+          kind: "MANAGER_BOOTSTRAP_FAILED", entityType: "job", entityId: job.id,
+          payload: { sessionId, error: error.message },
+        });
+      });
+    } finally {
+      this.bootstrapping.delete(sessionId);
+    }
+    const settled = this.get(sessionId);
+    return { session_id: sessionId, state: settled.state, job_id: job.id, mode,
+      watched: Boolean(watchedSessionId), ...(settled.outcome ? { outcome: settled.outcome } : {}) };
   }
 
   get(sessionId) {
@@ -165,6 +184,9 @@ export class AutonomousSessionService {
     if (session.state !== "WAITING_FOR_HERMES") {
       throw new Error(`Session ${sessionId} is ${session.state} and is not waiting for an answer`);
     }
+    if (["FAILED", "CANCELLED"].includes(this.manager.getRun(session.job_id)?.status)) {
+      throw new Error(`Session ${sessionId} is being terminally closed`);
+    }
     if (typeof text !== "string" || !text.trim()) throw new Error("answer must be a non-empty string");
     const open = this.db.prepare(
       `SELECT * FROM autonomous_session_messages
@@ -199,6 +221,46 @@ export class AutonomousSessionService {
     return { session_id: sessionId, state: "WORKING" };
   }
 
+  // A typed terminal decision, never inferred from clarification prose. Fence the
+  // manager before awaiting process cancellation so an answer cannot restart it.
+  async fail(sessionId, reason, { principal, origin } = {}) {
+    const session = this.get(sessionId);
+    if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    if (session.state !== "WAITING_FOR_HERMES") throw new Error("session_fail requires WAITING_FOR_HERMES");
+    if (typeof reason !== "string" || !reason.trim() || reason.length > 2000) {
+      throw new Error("reason must be a non-empty string of at most 2000 characters");
+    }
+    if (!principal || !origin) throw new Error("Failing a session requires an authorizing identity");
+    const run = this.manager.getRun(session.job_id);
+    transaction(this.db, () => {
+      if (run) this.manager.setRun(run.id, { status: "CANCELLED" });
+      recordEvent(this.db, {
+        kind: "AUTONOMOUS_SESSION_FAIL_REQUESTED", entityType: "job", entityId: session.job_id,
+        payload: { sessionId, reason, principal, origin },
+      });
+    });
+    // cancelJob fences/kills all live family attempts. Also close queued children,
+    // which have no attempt for the family cancellation code to discover.
+    for (const jobId of this.dispatcher.familyJobIds(session.job_id)) {
+      await this.dispatcher.cancelJob({ jobId, principal, origin, reason });
+    }
+    if (this.dispatcher.familyHasLiveAttempt(session.job_id)) throw new Error("Session family is still settling");
+    transaction(this.db, () => {
+      for (const jobId of this.dispatcher.familyJobIds(session.job_id)) {
+        this.db.prepare(`UPDATE work_commissions SET state = 'FAILED', outcome = ?, updated_at = ?
+          WHERE job_id = ? AND state IN ('PENDING', 'CLAIMED')`).run(reason, now(), jobId);
+      }
+      if (run) this.manager.setRun(run.id, { status: "FAILED" });
+      this.db.prepare("UPDATE jobs SET status = 'FAILED', updated_at = ? WHERE id = ?").run(now(), session.job_id);
+      this.setState(sessionId, { state: "FAILED", outcome: reason });
+      recordEvent(this.db, {
+        kind: "AUTONOMOUS_SESSION_FAILED", entityType: "job", entityId: session.job_id,
+        payload: { sessionId, reason, principal, origin },
+      });
+    });
+    return { session_id: sessionId, state: "FAILED", outcome: reason };
+  }
+
   // The clarifications the manager should reason from, oldest first.
   //
   // Read from the ledger rather than carried, so a fresh manager thread sees exactly what an
@@ -224,6 +286,7 @@ export class AutonomousSessionService {
   async tick(sessionId) {
     const session = this.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    if (this.bootstrapping.has(sessionId)) return this.poll(sessionId);
     if (["WAITING_FOR_HERMES", "COMPLETED", "FAILED"].includes(session.state)) {
       return this.poll(sessionId);
     }

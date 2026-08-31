@@ -395,7 +395,9 @@ export class ManagerService {
         else if (run.status === "SYNTHESIZING") {
           await this.synthesize(run, run.exploration_round, this.roundPlanOrEmpty(run, run.exploration_round));
         }
-        else if (run.status === "EXPLORING") await this.explore(run);
+        else if (run.status === "EXPLORING") {
+          if ((await this.explore(run))?.waiting) break;
+        }
         else if (run.status === "IMPLEMENTING") await this.implement(run);
         else if (run.status === "REVIEWING") await this.review(run);
         else break;
@@ -544,6 +546,7 @@ export class ManagerService {
     const plan = this.readRoundPlan(run, round);
 
     const pending = [];
+    let waiting = false;
     for (const exploration of plan) {
       // Resumable by identity rather than by position: a child is found by the question it was
       // created for, so a crash between creating a child and recording anything about it resumes
@@ -564,6 +567,10 @@ export class ManagerService {
       }
       // Already finished on an earlier pass; do not pay for it again.
       if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(child.status)) continue;
+      if (this.dispatcher.liveAttemptFor(child.id)) {
+        waiting = true;
+        continue;
+      }
       pending.push({ exploration, child });
     }
 
@@ -592,6 +599,10 @@ export class ManagerService {
         instruction: renderExploration({ objective: job.goal, exploration }),
         reservationRequest: share,
       }).catch((error) => {
+        if (error?.code === "SCHEDULER_BUSY" && error.retryable) {
+          waiting = true;
+          return;
+        }
         recordEvent(this.db, {
           kind: "MANAGER_EXPLORATION_FAILED", entityType: "job", entityId: run.job_id,
           payload: { runId: run.id, round, childJobId: child.id, error: String(error?.message ?? error) },
@@ -600,6 +611,11 @@ export class ManagerService {
       })));
     }
 
+    // Queueing is not evidence. Reconcile the same persisted plan on the next
+    // driver tick without buying a synthesis turn or commissioning another round.
+    if (waiting) return { waiting: true };
+    if (["FAILED", "CANCELLED"].includes(this.getRun(run.job_id)?.status)
+      || this.dispatcher.getJob(run.job_id).status === "CANCELLED") return { waiting: true };
     return this.synthesize(run, round, plan);
   }
 

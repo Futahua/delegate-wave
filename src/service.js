@@ -31,6 +31,16 @@ import {
   readRestoreMarker, clearRestoreMarker,
 } from "./recovery.js";
 import { buildJobPresentation } from "./presentation/job-presentation.js";
+import { repositoryPathIdentity } from "./repository-path.js";
+
+export class SchedulerBusy extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SchedulerBusy";
+    this.code = "SCHEDULER_BUSY";
+    this.retryable = true;
+  }
+}
 
 const ROOTS_ONLY = "parent_job_id IS NULL";
 
@@ -134,7 +144,7 @@ export class Dispatcher {
     // Checked here rather than only at run time, so a plan that can never execute is rejected while
     // someone is looking at it -- not mid-run, against a candidate it would then appear to condemn.
     for (const command of validation) assertNotShellComposed(command);
-    const resolvedPath = path.resolve(repoPath);
+    const resolvedPath = fs.realpathSync.native(path.resolve(repoPath));
     await assertRepository(resolvedPath);
     const integrationBranch = branch === "HEAD"
       ? await git(resolvedPath, ["branch", "--show-current"])
@@ -143,6 +153,16 @@ export class Dispatcher {
     await resolveRevision(resolvedPath, integrationBranch);
     const projectId = safeProjectId(name);
     return transaction(this.db, () => {
+      const identity = repositoryPathIdentity(resolvedPath);
+      const existing = this.listProjects().find((project) => {
+        let registeredPath = project.repo_path;
+        try { registeredPath = fs.realpathSync.native(registeredPath); } catch { /* Retired/missing paths still reserve identity. */ }
+        return repositoryPathIdentity(registeredPath) === identity;
+      });
+      if (existing) {
+        throw new Error(`Repository already registered as ${existing.id}`
+          + (existing.retired_at ? "; restore that retired project instead of registering a clone" : ""));
+      }
       this.db.prepare(`INSERT INTO projects(
         id, name, repo_path, integration_branch, validation_json, protected_json, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
@@ -1430,25 +1450,28 @@ export class Dispatcher {
   // project mid-attempt would hide something that is still running.
   retireProject({ projectId, principal, origin }) {
     if (!principal || !origin) throw new Error("Retiring a project requires an authorizing identity");
-    const project = this.getProject(projectId);
-    if (!project) throw new Error(`Unknown project: ${projectId}`);
-    if (project.retired_at) return { retired: false, reason: "already retired", project };
-
-    // Only genuinely running work blocks retirement. A candidate awaiting a decision is safe to
-    // retire: nothing is executing, nothing is destroyed, and restoring the project brings it back.
-    // Requiring every pending candidate be declined first would be friction that pushes people back
-    // to editing SQLite, which is the thing this exists to prevent.
-    const running = this.db.prepare(
-      "SELECT id FROM jobs WHERE project_id = ? AND status = 'RUNNING' LIMIT 1",
-    ).get(projectId);
-    if (running) {
-      throw new Error(
-        `Refusing to retire ${project.name}: job ${running.id} is still running. `
-        + "Cancel it first, or wait for it to finish.",
-      );
-    }
-
     return transaction(this.db, () => {
+      const project = this.getProject(projectId);
+      if (!project) throw new Error(`Unknown project: ${projectId}`);
+      if (project.retired_at) return { retired: false, reason: "already retired", project };
+
+      const session = this.db.prepare(`SELECT id FROM autonomous_sessions WHERE project_id = ?
+        AND (state IN ('WORKING', 'WAITING_FOR_HERMES')
+          OR (state = 'SEMANTICALLY_ACCEPTED' AND mode IN ('AUTO', 'ACCEPT_EDITS', 'BYPASS')))
+        LIMIT 1`).get(projectId);
+      if (session) throw new Error(`Refusing to retire ${project.name}: autonomous session ${session.id} is nonterminal`);
+
+      // Settled MANUAL/PLAN candidates may be retired. Unfinished sessions and
+      // running direct jobs may not. Check and write under the same transaction.
+      const running = this.db.prepare(
+        "SELECT id FROM jobs WHERE project_id = ? AND status = 'RUNNING' LIMIT 1",
+      ).get(projectId);
+      if (running) {
+        throw new Error(
+          `Refusing to retire ${project.name}: job ${running.id} is still running. `
+          + "Cancel it first, or wait for it to finish.",
+        );
+      }
       const timestamp = now();
       this.db.prepare("UPDATE projects SET retired_at = ? WHERE id = ?").run(timestamp, projectId);
       recordEvent(this.db, {
@@ -2434,7 +2457,7 @@ export class Dispatcher {
         && isParallelExploration(other)
         && this.budgetRootJobId(other.job_id) === root;
       if (!compatible) {
-        throw new Error(
+        throw new SchedulerBusy(
           `Bootstrap scheduler already has live attempt ${other.id}`
           + (incomingParallel ? " that is not a sibling investigation of the same root" : ""),
         );
