@@ -39,6 +39,45 @@ test("session.list paginates beyond forty without borrowing overview bounds", (t
   assert.equal(third.has_more, false);
 });
 
+test("session.list merges external ChatGPT turns without breaking cursor pagination", (t) => {
+  const { db } = ledger(t);
+  for (let index = 0; index < 4; index += 1) addSession(db, index);
+  const externalSessions = [
+    {
+      id: "chatgpt:new",
+      intent: "Newest ChatGPT turn",
+      mode: "CHATGPT_LOCAL",
+      state: "live",
+      origin_hermes_session_id: "chatgpt-local",
+      origin_hermes_session_title: "ChatGPT Local",
+      started_at: "2026-01-01T03:30:00.000Z",
+      updated_at: "2026-01-01T03:31:00.000Z",
+    },
+    {
+      id: "chatgpt:old",
+      intent: "Older ChatGPT turn",
+      mode: "CHATGPT_LOCAL",
+      state: "settled",
+      origin_hermes_session_id: "chatgpt-local",
+      origin_hermes_session_title: "ChatGPT Local",
+      started_at: "2026-01-01T01:30:00.000Z",
+      updated_at: "2026-01-01T01:31:00.000Z",
+      settled_at: "2026-01-01T01:31:00.000Z",
+    },
+  ];
+
+  const first = listSessionPresentations(db, { limit: 3, externalSessions });
+  const second = listSessionPresentations(db, { limit: 3, cursor: first.next_cursor, externalSessions });
+  const all = [...first.sessions, ...second.sessions];
+
+  assert.equal(first.sessions.length, 3);
+  assert.equal(second.sessions.length, 3);
+  assert.equal(new Set(all.map((item) => item.id)).size, 6, "combined cursor pages must not duplicate virtual turns");
+  assert.equal(first.sessions[0].id, "chatgpt:new");
+  assert.ok(all.some((item) => item.id === "chatgpt:old"));
+  assert.equal(second.has_more, false);
+});
+
 test("origin is the first Hermes watch and a later watcher cannot move it", (t) => {
   const { db } = ledger(t);
   const { id } = addSession(db, 1);

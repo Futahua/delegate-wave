@@ -20,6 +20,7 @@ import { HermesGateway } from "../session/hermes-gateway.js";
 import { HermesExternalTurns } from "../session/hermes-external-turns.js";
 import { SafeIntegrator } from "../integration/safe.js";
 import { providerForModel } from "../manager/provider.js";
+import { createChatGptLocalActivityProvider } from "../presentation/chatgpt-local-activity.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -280,7 +281,8 @@ export async function startControlServer({
     if (typeof deliveryTimer.unref === "function") deliveryTimer.unref();
   }
 
-  const service = new ControlService({ dispatcher, sessions });
+  const chatgptActivity = createChatGptLocalActivityProvider();
+  const service = new ControlService({ dispatcher, sessions, chatgptActivity });
   const server = createControlServer({
     service, token, principalId, observerToken, observerPrincipalId, proposerToken, proposerPrincipalId,
   });

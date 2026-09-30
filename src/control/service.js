@@ -36,11 +36,12 @@ function rejectIdentity(args) {
 }
 
 export class ControlService {
-  constructor({ dispatcher, sessions = null, pendingWaitMs = 5000 }) {
+  constructor({ dispatcher, sessions = null, chatgptActivity = null, pendingWaitMs = 5000 }) {
     this.dispatcher = dispatcher;
     // Injected rather than constructed here: an autonomous session needs a manager backend, and
     // which one that is belongs to whoever assembled the runtime, not to the HTTP layer.
     this.sessions = sessions;
+    this.chatgptActivity = chatgptActivity;
     this.pendingWaitMs = pendingWaitMs;
     // request_ids this process is executing right now.
     //
@@ -83,11 +84,21 @@ export class ControlService {
       "work.proposal.get": () => this.dispatcher.getWorkProposal(args.proposalId),
       "approval.list": () => this.dispatcher.listApprovals(args.proposalId || null),
       "session.poll": () => this.sessions.poll(args.sessionId),
-      "session.list": () => listSessionPresentations(this.db, { limit: args.limit, cursor: args.cursor }),
-      "session.timeline": () => buildSessionTimeline({
-        db: this.db, paths: this.dispatcher.paths, sessionId: args.sessionId,
-        streamSpanId: args.streamSpanId || null, before: args.before || null, streamLimit: args.limit,
+      "session.list": async () => listSessionPresentations(this.db, {
+        limit: args.limit,
+        cursor: args.cursor,
+        externalSessions: this.chatgptActivity ? await this.chatgptActivity.list() : [],
       }),
+      "session.timeline": async () => {
+        if (this.chatgptActivity && String(args.sessionId || "").startsWith("chatgpt:")) {
+          const external = await this.chatgptActivity.timeline(args.sessionId);
+          if (external) return external;
+        }
+        return buildSessionTimeline({
+          db: this.db, paths: this.dispatcher.paths, sessionId: args.sessionId,
+          streamSpanId: args.streamSpanId || null, before: args.before || null, streamLimit: args.limit,
+        });
+      },
       attention: () => this.dispatcher.attention(),
       briefing: () => this.dispatcher.briefing(),
     };

@@ -72,7 +72,7 @@ function sessionRecord(session, hermesTitles = new Map()) {
   };
 }
 
-export function listSessionPresentations(db, { limit, cursor } = {}) {
+export function listSessionPresentations(db, { limit, cursor, externalSessions = [] } = {}) {
   const pageLimit = boundedInteger(limit, DEFAULT_SESSION_PAGE, MAX_SESSION_PAGE);
   const decoded = decodeCursor(cursor);
   const rows = db.prepare(`SELECT s.id, s.job_id, s.intent, s.mode, s.state, s.created_at, s.updated_at,
@@ -84,14 +84,25 @@ export function listSessionPresentations(db, { limit, cursor } = {}) {
       decoded?.createdAt ?? null, decoded?.createdAt ?? null,
       decoded?.createdAt ?? null, decoded?.id ?? null, pageLimit + 1,
     );
-  const hasMore = rows.length > pageLimit;
-  const visible = rows.slice(0, pageLimit);
+  const hermesTitles = readHermesSessionTitles(rows.map((row) => row.origin_hermes_session_id));
+  const databaseSessions = rows.map((row) => sessionRecord(row, hermesTitles));
+  const external = Array.isArray(externalSessions)
+    ? externalSessions.filter((session) => {
+      if (!session || typeof session.id !== "string" || typeof session.started_at !== "string") return false;
+      if (!decoded) return true;
+      return session.started_at < decoded.createdAt
+        || (session.started_at === decoded.createdAt && session.id < decoded.id);
+    })
+    : [];
+  const combined = [...databaseSessions, ...external]
+    .sort((a, b) => b.started_at.localeCompare(a.started_at) || b.id.localeCompare(a.id));
+  const hasMore = combined.length > pageLimit;
+  const visible = combined.slice(0, pageLimit);
   const last = visible.at(-1);
-  const hermesTitles = readHermesSessionTitles(visible.map((row) => row.origin_hermes_session_id));
   return {
-    sessions: visible.map((row) => sessionRecord(row, hermesTitles)),
+    sessions: visible,
     has_more: hasMore,
-    next_cursor: hasMore && last ? encodeCursor({ createdAt: last.created_at, id: last.id }) : null,
+    next_cursor: hasMore && last ? encodeCursor({ createdAt: last.started_at, id: last.id }) : null,
   };
 }
 

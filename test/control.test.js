@@ -146,6 +146,45 @@ test("dedicated session reads are independently routed and require only read sco
   assert.deepEqual(timeline.spans, []);
 });
 
+test("existing session reads expose ChatGPT local activity without a new route", async (t) => {
+  const f = await fixture(t);
+  const external = {
+    id: "chatgpt:abc123",
+    intent: "Parallel local work",
+    mode: "CHATGPT_LOCAL",
+    state: "live",
+    origin_hermes_session_id: "chatgpt-local",
+    origin_hermes_session_title: "ChatGPT Local",
+    started_at: "2026-10-01T00:00:00.000Z",
+    updated_at: "2026-10-01T00:00:01.000Z",
+  };
+  const timeline = {
+    schema: 2,
+    session: external,
+    spans: [{
+      id: "chatgpt-turn:abc123",
+      actor: "manager",
+      label: "ChatGPT",
+      state: "live",
+      started_at: external.started_at,
+      stream: [{ id: "activity:1", kind: "command", lifecycle: "completed", title: "run_command", occurred_at: external.updated_at, authority: "activity" }],
+      stream_bounds: { complete: true, has_earlier: false, cursor: null },
+    }],
+    revision: "external-revision",
+  };
+  f.service.chatgptActivity = {
+    list: async () => [external],
+    timeline: async (id) => id === external.id ? timeline : null,
+  };
+
+  const observer = new ControlClient({ baseUrl: f.url, token: f.observerToken });
+  const listed = await observer.get("/v1/sessions?limit=40");
+  assert.equal(listed.sessions.some((session) => session.id === external.id), true);
+  const projected = await observer.get(`/v1/sessions/${external.id}/timeline?limit=20`);
+  assert.equal(projected.revision, "external-revision");
+  assert.equal(projected.spans[0].stream[0].title, "run_command");
+});
+
 test("concurrent CLI processes with one request ID receive one job identity", async (t) => {
   let calls = 0;
   const f = await fixture(t, {
