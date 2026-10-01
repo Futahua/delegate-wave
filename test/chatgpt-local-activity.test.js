@@ -45,13 +45,34 @@ test("ChatGPT local activity groups many Local turns into one stable ChatGPT wor
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].intent, "First user turn", "workstream title stays stable across later Local turns");
   assert.equal(sessions[0].state, "live");
+  assert.equal(sessions[0].source, "chatgpt_local");
+  assert.equal(sessions[0].source_title, "ChatGPT Local");
+  assert.equal("origin_hermes_session_id" in sessions[0], false);
 
   const timeline = await provider.timeline(sessions[0].id);
   assert.equal(timeline.spans.length, 2);
   assert.deepEqual(timeline.spans.map((span) => span.label), ["First user turn", "Second user turn"]);
   assert.deepEqual(timeline.spans.map((span) => span.state), ["completed", "live"]);
+  assert.deepEqual(timeline.spans.map((span) => span.actor), ["chatgpt", "chatgpt"]);
   assert.equal(timeline.spans[1].stream.some((item) => item.title === "run_command" && item.detail === "npm test"), true);
   assert.equal(JSON.stringify(timeline).includes(streamA), false, "raw workstream token must not leak through Wave");
+});
+
+test("a later Local turn supersedes an abandoned earlier turn in the same ChatGPT workstream", async () => {
+  const entries = [
+    started("a1", "2026-10-01T00:00:00.000Z", turnA, streamA, "Interrupted turn"),
+    started("b1", "2026-10-01T00:03:00.000Z", turnB, streamA, "Current turn"),
+  ];
+  const provider = createChatGptLocalActivityProvider({
+    cacheTtlMs: 0,
+    now: () => Date.parse("2026-10-01T00:03:30.000Z"),
+    fetchImpl: async () => ({ ok: true, json: async () => ({ entries }) }),
+  });
+
+  const [session] = await provider.list();
+  const timeline = await provider.timeline(session.id);
+  assert.deepEqual(timeline.spans.map((span) => span.state), ["cancelled", "live"]);
+  assert.equal(timeline.spans[0].finished_at, "2026-10-01T00:03:00.000Z");
 });
 
 test("ChatGPT local activity prefers the durable workstream journal and falls back to the legacy activity window", async () => {

@@ -156,9 +156,16 @@ function project(entries, nowMs = Date.now()) {
       const started = turnOrdered.find((entry) => entry.kind === "session" && entry.action === "turn_started");
       if (!started) continue;
       const ended = [...turnOrdered].reverse().find((entry) => entry.kind === "session" && entry.action === "turn_ended");
+      const supersedingStart = startedEvents.find((entry) => compareTime(entry, started) > 0);
       const lastAt = Date.parse(turnOrdered.at(-1)?.time || started.time || 0);
       const fresh = Number.isFinite(lastAt) && nowMs - lastAt <= LIVE_ACTIVITY_WINDOW_MS;
-      const state = ended ? "completed" : fresh ? "live" : "waiting";
+      // One ChatGPT conversation runs Local turns serially. If a later turn exists,
+      // an unended prior turn was interrupted/superseded; it is not waiting for Hermes
+      // and must not remain a permanent attention card.
+      const state = ended ? "completed" : supersedingStart ? "cancelled" : fresh ? "live" : "waiting";
+      const idleFinishedAt = !ended && !supersedingStart && !fresh
+        ? (turnOrdered.at(-1)?.time || started.time)
+        : null;
       if (state === "live") anyLive = true;
       if (state === "waiting") anyWaiting = true;
       const stream = turnOrdered.flatMap((entry, index) => {
@@ -167,11 +174,17 @@ function project(entries, nowMs = Date.now()) {
       });
       spans.push({
         id: `chatgpt-turn:${crypto.createHash("sha256").update(turn).digest("hex").slice(0, 24)}`,
-        actor: "manager",
-        label: boundedText(started.summary, 240) || "ChatGPT turn",
+        actor: "chatgpt",
+        label: boundedText(started.summary, 240) || "Local GPT turn",
         state,
         started_at: started.time,
-        ...(ended ? { finished_at: ended.time } : {}),
+        ...(ended
+          ? { finished_at: ended.time }
+          : supersedingStart
+            ? { finished_at: supersedingStart.time }
+            : idleFinishedAt
+              ? { finished_at: idleFinishedAt }
+              : {}),
         stream,
         stream_bounds: { complete: true, has_earlier: false, cursor: null },
       });
@@ -186,9 +199,9 @@ function project(entries, nowMs = Date.now()) {
       id,
       intent: boundedText(firstStarted.summary, 240) || "ChatGPT workstream",
       mode: "CHATGPT_LOCAL",
+      source: "chatgpt_local",
       state: sessionState,
-      origin_hermes_session_id: "chatgpt-local",
-      origin_hermes_session_title: "ChatGPT",
+      source_title: "ChatGPT Local",
       started_at: startedAt,
       updated_at: updatedAt,
       ...(sessionState === "settled" ? { settled_at: updatedAt } : {}),
