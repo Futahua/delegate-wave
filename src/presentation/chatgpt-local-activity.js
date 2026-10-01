@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 
 const DEFAULT_ADMIN_URL = "http://127.0.0.1:3001";
-const DEFAULT_LIMIT = 500;
+const DEFAULT_LIMIT = 20_000;
+const LEGACY_LIMIT = 500;
 const MAX_WORKSTREAMS = 40;
 const DEFAULT_CACHE_TTL_MS = 500;
 const LIVE_ACTIVITY_WINDOW_MS = 90_000;
@@ -218,6 +219,26 @@ export function createChatGptLocalActivityProvider({
   const origin = normalizeBaseUrl(baseUrl);
   let cache = { fetchedAt: 0, snapshot: { sessions: [], timelines: new Map() } };
   let inFlight = null;
+  let durableEntries = [];
+  let durableCursor = null;
+
+  function mergeDurable(incoming, reset) {
+    if (reset || !durableCursor) {
+      durableEntries = [...incoming];
+    } else if (incoming.length) {
+      const seen = new Set(durableEntries.map((entry) => entry?.id).filter(Boolean));
+      for (const entry of incoming) {
+        if (!entry?.id || seen.has(entry.id)) continue;
+        seen.add(entry.id);
+        durableEntries.push(entry);
+      }
+    }
+    durableEntries.sort(compareTime);
+    if (durableEntries.length > DEFAULT_LIMIT) {
+      durableEntries = durableEntries.slice(-DEFAULT_LIMIT);
+    }
+    return durableEntries;
+  }
 
   async function refresh() {
     const current = now();
@@ -225,21 +246,45 @@ export function createChatGptLocalActivityProvider({
     if (inFlight) return inFlight;
     inFlight = (async () => {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 750);
-        timeout.unref?.();
-        let response;
-        try {
-          response = await fetchImpl(`${origin}/api/activity?limit=${DEFAULT_LIMIT}`, {
-            signal: controller.signal,
-            headers: { accept: "application/json" },
-          });
-        } finally {
-          clearTimeout(timeout);
+        let entries = null;
+        const durableUrl = new URL(`${origin}/api/activity/workstreams`);
+        durableUrl.searchParams.set("limit", String(DEFAULT_LIMIT));
+        if (durableCursor) durableUrl.searchParams.set("since", durableCursor);
+        const sources = [
+          { url: durableUrl.toString(), durable: true },
+          { url: `${origin}/api/activity?limit=${LEGACY_LIMIT}`, durable: false },
+        ];
+        for (const source of sources) {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 750);
+          timeout.unref?.();
+          try {
+            const response = await fetchImpl(source.url, {
+              signal: controller.signal,
+              headers: { accept: "application/json" },
+            });
+            if (!response?.ok) continue;
+            const body = await response.json();
+            if (Array.isArray(body?.entries)) {
+              if (source.durable) {
+                entries = mergeDurable(body.entries, body.reset === true);
+                if (typeof body.latest_id === "string" && body.latest_id) {
+                  durableCursor = body.latest_id;
+                } else if (body.entries.length) {
+                  durableCursor = body.entries.at(-1)?.id ?? durableCursor;
+                }
+              } else {
+                entries = body.entries;
+              }
+              break;
+            }
+          } catch {
+            // A pre-durable Local Coder may not expose the first endpoint.
+          } finally {
+            clearTimeout(timeout);
+          }
         }
-        if (!response?.ok) throw new Error(`Local Coder activity HTTP ${response?.status ?? "unknown"}`);
-        const body = await response.json();
-        const entries = Array.isArray(body?.entries) ? body.entries : [];
+        if (!entries) throw new Error("Local Coder activity is unavailable");
         const snapshot = project(entries, current);
         cache = { fetchedAt: current, snapshot };
         return snapshot;

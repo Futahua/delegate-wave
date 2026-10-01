@@ -54,6 +54,70 @@ test("ChatGPT local activity groups many Local turns into one stable ChatGPT wor
   assert.equal(JSON.stringify(timeline).includes(streamA), false, "raw workstream token must not leak through Wave");
 });
 
+test("ChatGPT local activity prefers the durable workstream journal and falls back to the legacy activity window", async () => {
+  const entries = [
+    started("a1", "2026-10-01T00:00:01.000Z", turnA, streamA, "Durable chat"),
+  ];
+  const requested = [];
+  const provider = createChatGptLocalActivityProvider({
+    cacheTtlMs: 0,
+    fetchImpl: async (url) => {
+      requested.push(String(url));
+      if (String(url).includes("/api/activity/workstreams")) {
+        return { ok: false, status: 404, json: async () => ({}) };
+      }
+      return { ok: true, status: 200, json: async () => ({ entries }) };
+    },
+  });
+  const sessions = await provider.list();
+  assert.equal(sessions.length, 1);
+  assert.equal(requested[0].includes("/api/activity/workstreams?limit=20000"), true);
+  assert.equal(requested[1].includes("/api/activity?limit=500"), true);
+});
+
+test("ChatGPT local activity advances the durable cursor instead of refetching the whole history", async () => {
+  const tool = event("a2", "2026-10-01T00:00:02.000Z", {
+    kind: "mcp",
+    action: "tools/call",
+    tool: "run_command",
+    summary: "npm test",
+    details: { turn_token: turnA },
+  });
+  const requested = [];
+  let durableCalls = 0;
+  const provider = createChatGptLocalActivityProvider({
+    cacheTtlMs: 0,
+    now: () => Date.parse("2026-10-01T00:00:30.000Z"),
+    fetchImpl: async (url) => {
+      requested.push(String(url));
+      durableCalls += 1;
+      if (durableCalls === 1) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            entries: [started("a1", "2026-10-01T00:00:01.000Z", turnA, streamA, "Cursor chat")],
+            latest_id: "a1",
+            reset: false,
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ entries: [tool], latest_id: "a2", reset: false }),
+      };
+    },
+  });
+
+  const [session] = await provider.list();
+  const timeline = await provider.timeline(session.id);
+  assert.equal(requested[0].includes("limit=20000"), true);
+  assert.equal(requested[0].includes("since="), false);
+  assert.equal(requested[1].includes("since=a1"), true);
+  assert.equal(timeline.spans[0].stream.some((item) => item.title === "run_command"), true);
+});
+
 test("parallel ChatGPT workstreams stay separate and inactive unended turns become waiting instead of falsely live", async () => {
   const entries = [
     started("a1", "2026-10-01T00:00:00.000Z", turnA, streamA, "Chat A"),
