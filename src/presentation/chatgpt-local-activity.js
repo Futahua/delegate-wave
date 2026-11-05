@@ -58,13 +58,21 @@ function boundedText(value, max = 4000) {
   return text.length <= max ? text : text.slice(0, max - 1) + "…";
 }
 
-function streamItem(entry, index) {
+function streamItem(entry, index, turnStartedAt) {
   const details = entry?.details && typeof entry.details === "object" ? entry.details : {};
   const id = `chatgpt-activity:${entry.id || index}`;
   const occurredAt = typeof entry.time === "string" ? entry.time : new Date(0).toISOString();
 
   if (entry.kind === "mcp" && entry.action === "tools/call" && typeof entry.tool === "string") {
-    const detail = boundedText(entry.summary, 800);
+    const summary = boundedText(entry.summary, 800);
+    const elapsed = Date.parse(occurredAt) - Date.parse(turnStartedAt);
+    const elapsedText = Number.isFinite(elapsed) && elapsed >= 30000
+      ? "Turn elapsed " + Math.floor(elapsed / 60000) + "m " + String(Math.floor((elapsed % 60000) / 1000)).padStart(2, "0") + "s"
+      : null;
+    const throughput = Number.isFinite(elapsed) && elapsed >= 30000
+      ? "At this pace ≤" + Math.floor(3600000 / elapsed) + " turns/hour"
+      : null;
+    const detail = [summary, elapsedText, throughput].filter(Boolean).join(" · ");
     return {
       id,
       kind: toolKind(entry.tool),
@@ -73,6 +81,34 @@ function streamItem(entry, index) {
       ...(detail ? { detail } : {}),
       occurred_at: occurredAt,
       authority: "activity",
+    };
+  }
+
+  if (entry.kind === "mcp" && entry.action === "tool_executed" && typeof entry.tool === "string") {
+    const duration = Number.isFinite(entry.duration_ms) ? Math.max(0, Math.round(entry.duration_ms)) : null;
+    const elapsed = Date.parse(occurredAt) - Date.parse(turnStartedAt);
+    const elapsedText = Number.isFinite(elapsed) && elapsed >= 0
+      ? "Turn elapsed " + Math.floor(elapsed / 60000) + "m " + String(Math.floor((elapsed % 60000) / 1000)).padStart(2, "0") + "s"
+      : null;
+    const throughput = Number.isFinite(elapsed) && elapsed >= 30000
+      ? "At this pace ≤" + Math.floor(3600000 / elapsed) + " turns/hour"
+      : null;
+    const detail = [duration === null ? null : "Executed in " + duration + " ms", elapsedText, throughput].filter(Boolean).join(" · ");
+    return {
+      id, kind: toolKind(entry.tool), lifecycle: "completed",
+      title: entry.tool + " completed", ...(detail ? { detail } : {}),
+      occurred_at: occurredAt, authority: "activity",
+    };
+  }
+
+  if (entry.kind === "mcp" && entry.action === "gate_rejected" && typeof entry.tool === "string") {
+    const code = boundedText(details.gate_code, 100);
+    const description = boundedText(entry.summary, 800);
+    const detail = description || code;
+    return {
+      id, kind: toolKind(entry.tool), lifecycle: "failed",
+      title: entry.tool + " blocked", ...(detail ? { detail } : {}),
+      occurred_at: occurredAt, authority: "activity",
     };
   }
 
@@ -169,7 +205,7 @@ function project(entries, nowMs = Date.now()) {
       if (state === "live") anyLive = true;
       if (state === "waiting") anyWaiting = true;
       const stream = turnOrdered.flatMap((entry, index) => {
-        const item = streamItem(entry, index);
+        const item = streamItem(entry, index, started.time);
         return item ? [item] : [];
       });
       spans.push({

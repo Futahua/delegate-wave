@@ -21,6 +21,58 @@ function started(id, time, turn, workstream, summary) {
   });
 }
 
+test("Pencilcase timeline includes actual tool execution, throughput and guard failures", async () => {
+  const entries = [
+    started("pace-start", "2026-10-01T00:00:00.000Z", turnA, streamA, "Fix one view"),
+    event("pace-exec", "2026-10-01T00:00:45.000Z", {
+      kind: "mcp", action: "tool_executed", tool: "run_command", duration_ms: 318,
+      details: { turn_token: turnA, phase: "tool_executed" },
+    }),
+    event("pace-reject", "2026-10-01T00:00:47.000Z", {
+      kind: "mcp", action: "gate_rejected", tool: "read_text_file", status: "blocked",
+      summary: "TURN_TOKEN_UNKNOWN: This token is not active.",
+      details: { turn_token: turnA, gate_code: "TURN_TOKEN_UNKNOWN" },
+    }),
+  ];
+  const provider = createChatGptLocalActivityProvider({
+    now: () => Date.parse("2026-10-01T00:00:50.000Z"),
+    cacheTtlMs: 0,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ entries }) }),
+  });
+  const [session] = await provider.list();
+  const timeline = await provider.timeline(session.id);
+  const stream = timeline.spans[0].stream;
+  const executed = stream.find((item) => item.title === "run_command completed");
+  assert.equal(executed.lifecycle, "completed");
+  assert.match(executed.detail, /Executed in 318 ms/);
+  assert.match(executed.detail, /Turn elapsed 0m 45s/);
+  assert.match(executed.detail, /≤80 turns\/hour/);
+  const blocked = stream.find((item) => item.title === "read_text_file blocked");
+  assert.equal(blocked.lifecycle, "failed");
+  assert.match(blocked.detail, /TURN_TOKEN_UNKNOWN/);
+  assert.equal(JSON.stringify(timeline).includes(streamA), false);
+});
+
+test("Legacy tools/call activity exposes real elapsed time and throughput without new event types", async () => {
+  const entries = [
+    started("old-start", "2026-10-01T00:00:00.000Z", turnA, streamA, "Old-style Local Coder"),
+    event("old-call", "2026-10-01T00:00:45.000Z", {
+      kind: "mcp", action: "tools/call", tool: "run_command", summary: "npm test",
+      duration_ms: 350, details: { turn_token: turnA },
+    }),
+  ];
+  const provider = createChatGptLocalActivityProvider({
+    now: () => Date.parse("2026-10-01T00:00:50.000Z"), cacheTtlMs: 0,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ entries }) }),
+  });
+  const [session] = await provider.list();
+  const timeline = await provider.timeline(session.id);
+  const call = timeline.spans[0].stream.find((item) => item.title === "run_command");
+  assert.match(call.detail, /npm test/);
+  assert.match(call.detail, /Turn elapsed 0m 45s/);
+  assert.match(call.detail, /≤80 turns\/hour/);
+});
+
 test("ChatGPT local activity groups many Local turns into one stable ChatGPT workstream", async () => {
   const entries = [
     started("a1", "2026-10-01T00:00:01.000Z", turnA, streamA, "First user turn"),
